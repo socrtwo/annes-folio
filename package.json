@@ -13,6 +13,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "e2e": "node tests/e2e/smoke.mjs",
+    "e2e:touch": "node tests/e2e/touch-print.mjs",
     "catalog": "vite-node scripts/gen-catalog.ts",
     "notices": "node scripts/gen-notices.mjs",
     "cap:sync": "npx cap sync android",
