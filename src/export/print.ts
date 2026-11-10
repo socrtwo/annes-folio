@@ -5,7 +5,7 @@
 import type { App } from '../app';
 import { openDialog, toast } from '../ui/dialog';
 import { pagesFromRange, rangeField, pageImage } from '../commands/util';
-import { isNative, printDocument } from '../platform/native';
+import { isNative, printDocument, printUiClosed } from '../platform/native';
 
 export interface PrintOptions { pages?: number[]; dpi?: number; scale?: 'fit' | 'actual'; booklet?: boolean; nUp?: 1 | 2 | 4; grayscale?: boolean; annotations?: boolean }
 
@@ -39,15 +39,19 @@ export async function printPages(app: App, o: PrintOptions = {}): Promise<void> 
   const cleanup = () => { setTimeout(() => { frame.remove(); for (const u of urls) URL.revokeObjectURL(u); }, 1500); };
   if (isNative() && !(window as any).quillDesktop) {
     // Android: the native plugin prints the current WebView; show the sheets in the page instead of a hidden frame.
+    // printDocument resolves when the print UI has closed, so the frame is still there for every preview refresh.
     frame.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;border:0;background:#fff;z-index:99999';
     try { await printDocument(app.tab.displayName); } finally { cleanup(); }
     return;
   }
   const w = frame.contentWindow!;
-  w.onafterprint = cleanup;
   w.focus();
+  const started = Date.now();
   w.print();
-  setTimeout(cleanup, 60000);
+  // Keep the frame until the print UI has closed: a phone browser returns from print() at once and
+  // goes on laying the frame out for its preview.
+  await printUiClosed(started, w);
+  cleanup();
 }
 
 /** Sheet order for a saddle-stitched booklet printed two-up: [last, first, second, second-to-last, …]. */

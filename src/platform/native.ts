@@ -195,9 +195,46 @@ export async function readUri(uri: string): Promise<OpenedFile | null> {
   }
 }
 
+/**
+ * Opens the system print UI and resolves once it has closed (printed or cancelled), so callers can
+ * keep their print-only content in the page until then. The print UI lays the live page out again
+ * whenever it refreshes its preview (always on Android, and after any change of paper, orientation
+ * or page range), so content that is removed on a timer makes the preview fall back to the app's
+ * own screen.
+ * - Android app: the plugin resolves when the print job's document adapter finishes.
+ * - Desktop app: resolves from the print callback.
+ * - Browsers: see printUiClosed().
+ */
 export async function printDocument(jobName: string): Promise<void> {
   if (isNative()) { await Native.print({ jobName }); return; }
+  const started = Date.now();
   window.print();
+  await printUiClosed(started);
+}
+
+/**
+ * Resolves when a print UI opened by `win.print()` at `startedAt` is gone. Desktop browsers block
+ * inside print() until then. Mobile browsers return at once and report `afterprint` early, so there
+ * it waits for the page to come back to the foreground or for the next touch or key press.
+ */
+export function printUiClosed(startedAt: number, win: Window = window): Promise<void> {
+  if (Date.now() - startedAt >= 400) return Promise.resolve();
+  const mobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+  return new Promise((resolve) => {
+    let wasHidden = document.hidden;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = () => {
+      clearTimeout(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+      for (const t of ['pointerdown', 'keydown']) window.removeEventListener(t, finish, true);
+      win.removeEventListener('afterprint', finish);
+      resolve();
+    };
+    const onVisible = () => { if (document.hidden) wasHidden = true; else if (wasHidden) finish(); };
+    document.addEventListener('visibilitychange', onVisible);
+    for (const t of ['pointerdown', 'keydown']) window.addEventListener(t, finish, true);
+    if (!mobile) { win.addEventListener('afterprint', finish); timer = setTimeout(finish, 60000); }
+  });
 }
 
 export async function shareFile(blob: Blob, name: string, title?: string): Promise<void> {

@@ -386,9 +386,41 @@ public class QuillNativePlugin extends Plugin {
                     call.reject("Printing is not available on this device");
                     return;
                 }
-                PrintDocumentAdapter adapter = webView.createPrintDocumentAdapter(jobName);
+                // The print UI asks the WebView to lay the page out again each time its preview
+                // refreshes, so the page must keep its print content until the job is over: resolve
+                // from onFinish (printed or cancelled), not as soon as the print UI opens.
+                final PrintDocumentAdapter inner = webView.createPrintDocumentAdapter(jobName);
+                PrintDocumentAdapter adapter = new PrintDocumentAdapter() {
+                    private boolean done;
+
+                    @Override
+                    public void onStart() {
+                        inner.onStart();
+                    }
+
+                    @Override
+                    public void onLayout(PrintAttributes oldAttributes, PrintAttributes newAttributes, android.os.CancellationSignal cancellationSignal, LayoutResultCallback callback, android.os.Bundle extras) {
+                        inner.onLayout(oldAttributes, newAttributes, cancellationSignal, callback, extras);
+                    }
+
+                    @Override
+                    public void onWrite(android.print.PageRange[] pages, android.os.ParcelFileDescriptor destination, android.os.CancellationSignal cancellationSignal, WriteResultCallback callback) {
+                        inner.onWrite(pages, destination, cancellationSignal, callback);
+                    }
+
+                    @Override
+                    public void onFinish() {
+                        try {
+                            inner.onFinish();
+                        } finally {
+                            if (!done) {
+                                done = true;
+                                call.resolve();
+                            }
+                        }
+                    }
+                };
                 printManager.print(jobName, adapter, new PrintAttributes.Builder().build());
-                call.resolve();
             } catch (Throwable e) {
                 call.reject("Could not start printing: " + e.getMessage(), asException(e));
             }

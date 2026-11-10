@@ -383,6 +383,15 @@ export class Viewer implements TabView {
     };
     el.addEventListener('pointerup', finish);
     el.addEventListener('pointercancel', () => { panStart = null; moveAnnot = null; this.drawing = null; this.drawOverlay(slot); });
+    // The page scrolls natively under a finger, which cancels the pointer after a few pixels. A
+    // touch that began (pointerdown runs first) a drawing stroke, a marquee or an annotation move
+    // or resize has to claim the gesture instead. Tools that place something with a tap (note,
+    // stamp, attachment, signature) still let the page scroll.
+    el.addEventListener('touchstart', (e) => {
+      if (e.touches.length !== 1 || !e.cancelable) return;
+      const dragging = !!moveAnnot || (!!this.drawing && this.drawing.page === slot.i && !['note', 'stamp', 'attach', 'sign'].includes(this._tool));
+      if (dragging) e.preventDefault();
+    }, { passive: false });
     el.addEventListener('dblclick', (e) => {
       const d = this.drawing;
       if (d && (this._tool === 'polygon' || this._tool === 'polyline' || this._tool === 'cloud')) {
