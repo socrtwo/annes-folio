@@ -36,6 +36,8 @@ export interface InflateOptions {
    * incomplete codes, which compressors of text do not emit but desynchronized decoding does.
    */
   strictBlocks?: boolean;
+  /** Stop after this many output bytes (the result is then flagged corrupt). For sniffing a header or bounding memory. */
+  maxOutput?: number;
   /** Called at the start of each decoded block (diagnostics). */
   onBlock?: (bitPos: number, outLen: number) => void;
 }
@@ -124,13 +126,13 @@ class Out {
   windowStart = 0;
   /** True once a resync has dropped data: references before windowStart become placeholders. */
   lossy = false;
-  constructor(public placeholder: number, initial: number) { this.data = new Uint8Array(Math.max(1024, Math.min(initial, 1 << 24))); }
+  constructor(public placeholder: number, initial: number, public limit = MAX_OUT) { this.data = new Uint8Array(Math.max(1024, Math.min(initial, 1 << 24, limit + 258))); }
   need(n: number): void {
+    if (this.len + n > this.limit) throw new Corrupt();
     if (this.len + n <= this.data.length) return;
-    if (this.len + n > MAX_OUT) throw new Corrupt();
     let size = this.data.length * 2;
     while (size < this.len + n) size *= 2;
-    const next = new Uint8Array(Math.min(size, MAX_OUT));
+    const next = new Uint8Array(Math.min(size, this.limit));
     next.set(this.data.subarray(0, this.len));
     this.data = next;
   }
@@ -225,7 +227,7 @@ function looksLikeText(u8: Uint8Array, from: number, to: number): boolean {
 }
 
 export function immortalInflate(input: Uint8Array, opts: InflateOptions = {}): InflateResult {
-  const o = new Out(opts.placeholder ?? 0x20, input.length * 4);
+  const o = new Out(opts.placeholder ?? 0x20, input.length * 4, Math.max(1, Math.min(MAX_OUT, opts.maxOutput ?? MAX_OUT)));
   let s = new Bits(input);
   let corrupted = false, gaps = 0;
   const totalBits = input.length * 8;

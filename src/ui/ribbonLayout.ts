@@ -135,7 +135,7 @@ export const DEFAULT_TABS: RibbonTab[] = [
   },
   {
     id: 'developer', label: 'Developer', groups: [
-      { id: 'code', label: 'Code', items: ['dev.macros', 'dev.recordMacro', 'dev.macroEditor', 'dev.macroSecurity', 'dev.javaScriptInfo'] },
+      { id: 'code', label: 'Code', items: ['dev.macros', 'dev.recordMacro', 'dev.pauseRecording', 'dev.stopRecording', 'dev.macroEditor', 'dev.macroSecurity', 'dev.javaScriptInfo'] },
       { id: 'data', label: 'Data', items: ['dev.exportStructure', 'view.inspector', 'dev.tags', 'dev.rawObject'] },
     ],
   },

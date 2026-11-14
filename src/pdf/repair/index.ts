@@ -9,7 +9,7 @@ import { Lexer } from '../lexer';
 import { latin1, bytesOf, concat } from '../objects';
 import { analyze, identifyAt, scan, recommend, S2Program } from '../../io/recover/fileid';
 import { scanZipBytes } from '../../io/recover/salvage';
-import { makeTextPdf, addTextPages } from '../build';
+import { addTextPages } from '../build';
 import { pageText } from '../ops/extract';
 import { readAttachments } from '../structure';
 
@@ -86,7 +86,8 @@ export function repairPdf(input: Uint8Array | ArrayBuffer, fileName: string, opt
     const d = PdfDocument.load(buf0, { password: opts.password });
     pagesBefore = d.pageCount;
     if (!d.report.reconstructed && d.report.warnings.length === 0) {
-      const r = consider(d, buf0);
+      // A clean open wins a tie against the rebuilt candidates below: the file needs no repair.
+      const r = consider(d, buf0, false, 20);
       add({ id: 'open', name: 'Normal open', status: 'success', detail: `Opened without repair: ${plural(r.pages, 'page')}.`, pages: r.pages, words: r.words });
     } else {
       const r = consider(d, buf0, false, 10);
@@ -134,10 +135,11 @@ export function repairPdf(input: Uint8Array | ArrayBuffer, fileName: string, opt
   // f. ZIP salvage: a PDF inside a damaged ZIP / portfolio package.
   if (buf0[0] === 0x50 && buf0[1] === 0x4b) {
     try {
-      const entries = scanZipBytes(buf0);
+      // Only entries that are PDFs by name or by content are decoded; the rest of the archive is left alone.
+      const entries = scanZipBytes(buf0, { want: (name, head) => /\.pdf$/i.test(name) || latin1(head, 0, 5) === '%PDF-' });
       let got = 0;
-      for (const [name, e] of entries) if (/\.pdf$/i.test(name) || latin1(e.data, 0, 5) === '%PDF-') { try { const d = PdfDocument.load(e.data, { repair: true }); const r = consider(d, e.data); if (r.pages) got++; } catch { /* */ } }
-      add({ id: 'zip', name: 'ZIP salvage', status: got ? 'success' : 'failed', detail: `${entries.size} entries read from the archive's local headers; ${got} PDF(s) opened.` });
+      for (const [, e] of entries) { try { const d = PdfDocument.load(e.data, { repair: true, password: opts.password }); const r = consider(d, e.data); if (r.pages) got++; } catch { /* this entry is not a usable PDF */ } }
+      add({ id: 'zip', name: 'ZIP salvage', status: got ? 'success' : 'failed', detail: `${entries.size} PDF entr${entries.size === 1 ? 'y' : 'ies'} read from the archive's local headers; ${got} opened.` });
     } catch (e: any) { add({ id: 'zip', name: 'ZIP salvage', status: 'failed', detail: String(e?.message || e) }); }
   } else add({ id: 'zip', name: 'ZIP salvage', status: 'skipped', detail: 'Not a ZIP archive.' });
 
@@ -148,25 +150,35 @@ export function repairPdf(input: Uint8Array | ArrayBuffer, fileName: string, opt
 
   // h. Text scan: content streams found by signature when the structure is gone.
   if (!best || (best as any).score < 1000) {
-    const text = textScan(buf0);
+    let text = '';
+    try { text = textScan(buf0); } catch { /* nothing readable */ }
+    let done = false;
     if (text.trim().length > 20) {
-      const bytes = makeTextPdf([]); void bytes;
-      const d = PdfDocument.create();
-      addTextPages(d, `Recovered text from ${fileName}\n\n${text}`, { title: `${fileName} (recovered text)` });
-      const out = d.save({ incremental: false });
-      const r = consider(PdfDocument.load(out), out, true);
-      add({ id: 'text', name: 'Text scan', status: 'partial', detail: `${plural(r.words, 'word')} of text found in decoded streams; rebuilt as a text-only PDF.`, pages: r.pages, words: r.words });
-    } else add({ id: 'text', name: 'Text scan', status: 'failed', detail: 'No readable text in the streams.' });
+      try {
+        const d = PdfDocument.create();
+        addTextPages(d, `Recovered text from ${fileName}\n\n${text}`, { title: `${fileName} (recovered text)` });
+        const out = d.save({ incremental: false });
+        const r = consider(PdfDocument.load(out), out, true);
+        add({ id: 'text', name: 'Text scan', status: 'partial', detail: `${plural(r.words, 'word')} of text found in decoded streams; rebuilt as a text-only PDF.`, pages: r.pages, words: r.words });
+        done = true;
+      } catch { /* fall through to "failed" */ }
+    }
+    if (!done) add({ id: 'text', name: 'Text scan', status: 'failed', detail: 'No readable text in the streams.' });
     // i. Strings
     const strings = stringsScan(buf0);
     const usable = !!best && (best as any).doc.pageCount > 0;
+    done = false;
     if (!usable && strings.length > 40) {
-      const d = PdfDocument.create();
-      addTextPages(d, `Readable strings from ${fileName}\n\n${strings}`, { title: `${fileName} (strings)` });
-      const out = d.save({ incremental: false });
-      consider(PdfDocument.load(out), out, true);
-      add({ id: 'strings', name: 'Strings scan', status: 'partial', detail: 'Only loose readable text could be recovered.' });
-    } else add({ id: 'strings', name: 'Strings scan', status: 'skipped', detail: best ? 'Not needed.' : 'Nothing readable.' });
+      try {
+        const d = PdfDocument.create();
+        addTextPages(d, `Readable strings from ${fileName}\n\n${strings}`, { title: `${fileName} (strings)` });
+        const out = d.save({ incremental: false });
+        consider(PdfDocument.load(out), out, true);
+        add({ id: 'strings', name: 'Strings scan', status: 'partial', detail: 'Only loose readable text could be recovered.' });
+        done = true;
+      } catch { /* fall through */ }
+    }
+    if (!done) add({ id: 'strings', name: 'Strings scan', status: 'skipped', detail: best ? 'Not needed.' : 'Nothing readable.' });
   } else {
     add({ id: 'text', name: 'Text scan', status: 'skipped', detail: 'Not needed: the structure was recovered.' });
     add({ id: 'strings', name: 'Strings scan', status: 'skipped', detail: 'Not needed.' });
@@ -182,12 +194,14 @@ export function repairPdf(input: Uint8Array | ArrayBuffer, fileName: string, opt
 /** Readable text from every Flate stream that holds text operators, in file order. */
 export function textScan(buf: Uint8Array): string {
   const out: string[] = [];
-  const text = latin1(buf);
+  // One code unit per byte, decoded natively: a character-by-character conversion of a large file takes minutes and gigabytes.
+  const text = new TextDecoder('latin1').decode(buf);
   const re = /stream\r?\n/g;
   let m: RegExpExecArray | null;
   let guard = 0;
   const { inflateZlib } = requireFilters();
   while ((m = re.exec(text)) && guard++ < 20000) {
+    if (text.startsWith('end', m.index - 3)) continue; // "endstream": what follows is not stream data
     const start = m.index + m[0].length;
     const end = text.indexOf('endstream', start);
     const data = buf.subarray(start, end < 0 ? Math.min(buf.length, start + 2_000_000) : end);

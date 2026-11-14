@@ -2,15 +2,18 @@
  * Interactive forms (ISO 32000-1 §12.7): filling fields with regenerated appearances, creating and
  * deleting fields, calculation and tab order, reset, flattening, and FDF/XFDF/CSV/JSON data exchange.
  */
-import { Dict, Name, PdfObj, PdfStream, PdfString, Ref, latin1 } from '../objects';
+import { Dict, Name, PdfObj, PdfStream, PdfString, Ref, concat } from '../objects';
 import { flateStream } from '../filters';
 import { PdfDocument, PageInfo } from '../document';
-import { fmtNum } from '../writer';
+import { Parser } from '../lexer';
+import { fmtNum, serialize } from '../writer';
 import { ensureAcroForm, readFields, touchAcroForm, FieldInfo, FieldType, addAnnotation, removeAnnotation } from '../structure';
 import { stdFontRef, lit } from '../build';
 import { textWidth, winAnsiBytes, wrapText, type StdFont } from '../stdfonts';
 import { flattenAnnotations } from './annots';
 import { bytesOf } from '../objects';
+import { parseXml, esc as xmlEsc } from '../../io/xml';
+import { detachWidget } from './shared';
 
 type RGB = [number, number, number];
 type Rect = [number, number, number, number];
@@ -22,23 +25,34 @@ export function parseDA(da: string): { font: string; size: number; color: string
   return { font: f ? f[1] : 'Helv', size: f ? +f[2] : 0, color: rg ? `${rg[1]} ${rg[2]} ${rg[3]} rg` : g ? `${g[1]} g` : '0 g' };
 }
 
-function fieldFont(doc: PdfDocument, resName: string): { name: string; ref: Ref; std: StdFont } {
+/** True when every character has a WinAnsi code (what the generated appearances can show). */
+export const canWinAnsi = (s: string): boolean => { const b = winAnsiBytes(s); let i = 0; for (const ch of s) { if (b[i++] === 63 && ch !== '?') return false; } return true; };
+
+/**
+ * The font to draw a field appearance with. The /DR font named by /DA is used when it is a simple
+ * WinAnsi font; a composite or custom-encoded font cannot take WinAnsi bytes, so Helvetica stands in
+ * (under a name that lives in the appearance's own resources only).
+ */
+function fieldFont(doc: PdfDocument, resName: string): { name: string; ref: PdfObj; std: StdFont } {
   const af = ensureAcroForm(doc);
-  let dr = doc.getDict(af, 'DR');
-  if (!dr) { dr = new Dict(); af.set('DR', dr); }
-  let fonts = doc.getDict(dr, 'Font');
-  if (!fonts) { fonts = new Dict(); dr.set('Font', fonts); }
-  const existing = fonts.get(resName);
-  if (existing instanceof Ref) {
-    const fd = doc.resolve<Dict | null>(existing);
-    const base = fd instanceof Dict ? doc.getName(fd, 'BaseFont') : '';
-    const std = (/Cour/i.test(base) ? 'Courier' : /Times|Tiro/i.test(base) ? 'Times-Roman' : 'Helvetica') as StdFont;
-    return { name: resName, ref: existing, std };
+  const dr = doc.getDict(af, 'DR');
+  const fonts = dr ? doc.getDict(dr, 'Font') : null;
+  const existing = fonts && resName ? fonts.get(resName) : undefined;
+  const fd = doc.resolve<PdfObj>(existing);
+  if (fd instanceof Dict && existing !== undefined) {
+    const base = doc.getName(fd, 'BaseFont'), sub = doc.getName(fd, 'Subtype'), enc = doc.get<PdfObj>(fd, 'Encoding');
+    const simple = (sub === 'Type1' || sub === 'TrueType' || sub === 'MMType1') && !/Symbol|Dingbat|Wingding/i.test(base);
+    const winAnsi = (enc instanceof Name && enc.name === 'WinAnsiEncoding') || (enc == null && !doc.getDict(fd, 'FontDescriptor'));
+    if (simple && winAnsi) return { name: resName, ref: existing, std: (/Cour/i.test(base) ? 'Courier' : /Times|Tiro/i.test(base) ? 'Times-Roman' : 'Helvetica') as StdFont };
+    return { name: 'QFHelv', ref: stdFontRef(doc, 'Helvetica'), std: 'Helvetica' };
   }
+  // The name is not in /DR yet: add Helvetica under it (on copies, so shared or indirect dictionaries are not edited behind the document's back).
   const ref = stdFontRef(doc, 'Helvetica');
-  fonts.set(resName === 'Helv' || !resName ? 'Helv' : resName, ref);
+  const name = resName || 'Helv';
+  const ndr = dr ? dr.clone() : new Dict(), nfonts = fonts ? fonts.clone() : new Dict();
+  nfonts.set(name, ref); ndr.set('Font', nfonts); af.set('DR', ndr);
   touchAcroForm(doc);
-  return { name: resName || 'Helv', ref, std: 'Helvetica' };
+  return { name, ref, std: 'Helvetica' };
 }
 
 function widgetStyle(doc: PdfDocument, w: Dict): { border: RGB | null; bg: RGB | null; width: number } {
@@ -51,18 +65,26 @@ function widgetStyle(doc: PdfDocument, w: Dict): { border: RGB | null; bg: RGB |
 /** Builds and stores the appearance stream of a text/choice widget for its current value. */
 export function regenerateAppearance(doc: PdfDocument, f: FieldInfo, w: FieldInfo['widgets'][number]): void {
   const r = w.rect;
-  const width = r[2] - r[0], height = r[3] - r[1];
-  const da = parseDA(f.defaultAppearance || doc.getText(ensureAcroForm(doc), 'DA'));
+  // A widget turned by /MK /R is laid out in its own upright box; the appearance matrix turns it into the Rect.
+  const mk = doc.getDict(w.dict, 'MK');
+  const rot = (((mk ? doc.getNum(mk, 'R', 0) : 0) % 360) + 360) % 360;
+  const width = rot % 180 ? r[3] - r[1] : r[2] - r[0], height = rot % 180 ? r[2] - r[0] : r[3] - r[1];
+  const af = ensureAcroForm(doc);
+  const da = parseDA(f.defaultAppearance || doc.getText(af, 'DA'));
   const font = fieldFont(doc, da.font);
   const style = widgetStyle(doc, w.dict);
   let ops = '/Tx BMC q ';
   if (style.bg) ops += `${style.bg.map(fmtNum).join(' ')} rg 0 0 ${fmtNum(width)} ${fmtNum(height)} re f `;
   if (style.border) ops += `${style.border.map(fmtNum).join(' ')} RG ${fmtNum(style.width)} w ${fmtNum(style.width / 2)} ${fmtNum(style.width / 2)} ${fmtNum(width - style.width)} ${fmtNum(height - style.width)} re S `;
   const pad = 2 + style.width;
-  const values = f.type === 'list' ? f.options.map((o) => o.label || o.value) : [typeof f.value === 'string' ? f.value : Array.isArray(f.value) ? f.value.join(', ') : ''];
-  const text = f.password ? '*'.repeat(values[0].length) : values[0];
+  // A choice shows the option's label; the export value is what /V holds.
+  const labelOf = (v: string) => { const o = f.options.find((x) => x.value === v); return o ? o.label || o.value : v; };
+  const value = typeof f.value === 'string' ? (f.type === 'combo' ? labelOf(f.value) : f.value) : Array.isArray(f.value) ? f.value.map(labelOf).join(', ') : '';
+  const text = f.password ? '*'.repeat(value.length) : value;
   let size = da.size;
-  const q = doc.getNum(f.dict, 'Q', 0);
+  const qOf = (d: Dict | null) => (d && d.has('Q') ? doc.getNum(d, 'Q', 0) : null);
+  const q = qOf(w.dict) ?? qOf(f.dict) ?? qOf(af) ?? 0;
+  const alignX = (tw: number) => (q === 1 ? (width - tw) / 2 : q === 2 ? width - pad - tw : pad);
   const comb = f.type === 'text' && !!(f.flags & (1 << 24)) && f.maxLen > 0;
   ops += `BT ${da.color} `;
   if (f.type === 'list') {
@@ -79,7 +101,7 @@ export function regenerateAppearance(doc: PdfDocument, f: FieldInfo, w: FieldInf
     if (!size) size = 10;
     const lines = wrapText(text, font.std, size, width - pad * 2);
     ops += `/${font.name} ${fmtNum(size)} Tf `;
-    lines.forEach((l, i) => { const y = height - pad - size * 0.95 - i * size * 1.2; if (y > -size) ops += `1 0 0 1 ${fmtNum(pad)} ${fmtNum(y)} Tm ${lit(winAnsiBytes(l))} Tj `; });
+    lines.forEach((l, i) => { const y = height - pad - size * 0.95 - i * size * 1.2; if (y > -size) ops += `1 0 0 1 ${fmtNum(alignX(textWidth(l, font.std, size)))} ${fmtNum(y)} Tm ${lit(winAnsiBytes(l))} Tj `; });
   } else if (comb) {
     if (!size) size = Math.min(height * 0.7, (width / f.maxLen) * 1.2);
     const cell = width / f.maxLen;
@@ -87,20 +109,17 @@ export function regenerateAppearance(doc: PdfDocument, f: FieldInfo, w: FieldInf
     [...text].slice(0, f.maxLen).forEach((ch, i) => { const cw = textWidth(ch, font.std, size); ops += `1 0 0 1 ${fmtNum(i * cell + (cell - cw) / 2)} ${fmtNum((height - size * 0.7) / 2)} Tm ${lit(winAnsiBytes(ch))} Tj `; });
   } else {
     if (!size) { size = Math.min(12, height * 0.66); while (size > 4 && textWidth(text, font.std, size) > width - pad * 2) size *= 0.92; }
-    const tw = textWidth(text, font.std, size);
-    const x = q === 1 ? (width - tw) / 2 : q === 2 ? width - pad - tw : pad;
-    ops += `/${font.name} ${fmtNum(size)} Tf 1 0 0 1 ${fmtNum(x)} ${fmtNum((height - size * 0.7) / 2)} Tm ${lit(winAnsiBytes(text))} Tj `;
+    ops += `/${font.name} ${fmtNum(size)} Tf 1 0 0 1 ${fmtNum(alignX(textWidth(text, font.std, size)))} ${fmtNum((height - size * 0.7) / 2)} Tm ${lit(winAnsiBytes(text))} Tj `;
   }
   ops += 'ET Q EMC';
   const res = new Dict({ Font: new Dict({ [font.name]: font.ref }) });
   const s = flateStream(bytesOf(ops), { Type: Name.get('XObject'), Subtype: Name.get('Form'), BBox: [0, 0, width, height], Resources: res });
-  const ap = doc.getDict(w.dict, 'AP') || new Dict();
-  const old = ap.get('N');
-  if (old instanceof Ref) doc.update(old, s); else ap.set('N', doc.register(s));
+  if (rot === 90) s.dict.set('Matrix', [0, 1, -1, 0, height, 0]); else if (rot === 180) s.dict.set('Matrix', [-1, 0, 0, -1, width, height]); else if (rot === 270) s.dict.set('Matrix', [0, -1, 1, 0, 0, width]);
+  // Always a new stream object: producers share one blank appearance between many fields, and
+  // writing into it would show this value in all of them.
+  const ap = (doc.getDict(w.dict, 'AP') || new Dict()).clone();
+  ap.set('N', doc.register(s));
   w.dict.set('AP', ap);
-  // Rotation of the widget (MK/R) is kept through the Matrix.
-  const mk = doc.getDict(w.dict, 'MK'); const rot = mk ? doc.getNum(mk, 'R', 0) : 0;
-  if (rot) { const a = (rot * Math.PI) / 180; s.dict.set('Matrix', [Math.cos(a), Math.sin(a), -Math.sin(a), Math.cos(a), rot === 90 ? width : rot === 180 ? width : 0, rot === 180 ? height : rot === 270 ? height : 0]); s.dict.set('BBox', rot % 180 ? [0, 0, height, width] : [0, 0, width, height]); }
   doc.touch(w.ref);
 }
 
@@ -112,40 +131,47 @@ export function setFieldValue(doc: PdfDocument, f: FieldInfo, value: string | st
     const states = f.widgets.map((w) => w.onState || 'Yes');
     if (f.type === 'radio') {
       // value: the export name (on state) to select, or true for the first widget
-      const want = typeof value === 'string' ? value : on ? states[0] : null;
-      f.dict.set('V', want ? Name.get(want) : Name.get('Off'));
-      f.widgets.forEach((w) => { w.dict.set('AS', Name.get(w.onState === want ? w.onState! : 'Off')); doc.touch(w.ref); });
+      const want = typeof value === 'string' ? (on ? value : '') : on ? states[0] : '';
+      if (want && !states.includes(want)) throw new Error(`${f.name} has no option "${want}".`);
+      f.dict.set('V', Name.get(want || 'Off'));
+      f.widgets.forEach((w) => { w.dict.set('AS', Name.get(want && w.onState === want ? want : 'Off')); doc.touch(w.ref); });
+      f.value = want;
     } else {
       f.dict.set('V', Name.get(on ? states[0] : 'Off'));
       f.widgets.forEach((w, i) => { w.dict.set('AS', Name.get(on ? states[i] : 'Off')); doc.touch(w.ref); });
+      f.value = on;
     }
     doc.update(f.ref, f.dict);
-    f.value = on;
     return;
   }
+  let shown = '';
   if (f.type === 'text') {
     let text = Array.isArray(value) ? value.join('\n') : String(value === true ? 'Yes' : value === false ? '' : value);
     if (f.maxLen > 0) text = text.slice(0, f.maxLen);
     f.dict.set('V', PdfString.fromText(text));
-    f.value = text;
+    f.dict.delete('RV'); // a stale rich-text value would be shown instead of the new one
+    f.value = text; shown = text;
   } else if (f.type === 'combo' || f.type === 'list') {
     const vals = Array.isArray(value) ? value : [String(value)];
     const toExport = vals.map((v) => f.options.find((o) => o.label === v || o.value === v)?.value ?? v);
     f.dict.set('V', toExport.length > 1 ? toExport.map((v) => PdfString.fromText(v)) : PdfString.fromText(toExport[0] || ''));
     f.value = toExport.length > 1 ? toExport : toExport[0] || '';
-    if (f.type === 'list') f.dict.set('I', toExport.map((v) => f.options.findIndex((o) => o.value === v)).filter((i) => i >= 0));
+    if (f.type === 'list') f.dict.set('I', toExport.map((v) => f.options.findIndex((o) => o.value === v)).filter((i) => i >= 0).sort((x, y) => x - y)); else f.dict.delete('I');
+    shown = f.options.map((o) => o.label || o.value).concat(toExport).join('');
   } else return;
   doc.update(f.ref, f.dict);
   for (const w of f.widgets) regenerateAppearance(doc, f, w);
-  // Tell readers not to regenerate (we did) but allow it for fonts we lack.
-  const af = ensureAcroForm(doc); af.set('NeedAppearances', false); touchAcroForm(doc);
+  // The appearances drawn here are WinAnsi text. Text beyond that is in /V, and readers are asked to
+  // draw it themselves; otherwise an existing request to regenerate is left as the document had it.
+  if (!canWinAnsi(shown)) { const af = ensureAcroForm(doc); af.set('NeedAppearances', true); touchAcroForm(doc); }
 }
 
 export function resetForm(doc: PdfDocument, fields = readFields(doc)): void {
   for (const f of fields) {
     if (f.readOnly) continue;
     const dv = doc.get(f.dict, 'DV');
-    if (f.type === 'checkbox' || f.type === 'radio') setFieldValue(doc, f, dv instanceof Name ? dv.name !== 'Off' : false);
+    if (f.type === 'checkbox') setFieldValue(doc, f, dv instanceof Name ? dv.name !== 'Off' : false);
+    else if (f.type === 'radio') { const name = dv instanceof Name && dv.name !== 'Off' && f.widgets.some((w) => w.onState === dv.name) ? dv.name : ''; setFieldValue(doc, f, name); }
     else if (f.type === 'text' || f.type === 'combo' || f.type === 'list') setFieldValue(doc, f, dv instanceof PdfString ? dv.toText() : Array.isArray(dv) ? dv.map((x) => (x instanceof PdfString ? x.toText() : '')) : '');
   }
 }
@@ -168,14 +194,31 @@ export function addField(doc: PdfDocument, spec: NewField): Ref {
   if (spec.border) mk.set('BC', spec.border); if (spec.background) mk.set('BG', spec.background);
   if (spec.type === 'checkbox' || spec.type === 'radio') mk.set('CA', PdfString.fromText({ check: '4', circle: 'l', cross: '8', square: 'n' }[spec.checkStyle || (spec.type === 'radio' ? 'circle' : 'check')]));
   const widget = new Dict({ Type: Name.get('Annot'), Subtype: Name.get('Widget'), Rect: spec.rect, F: 4, MK: mk, BS: new Dict({ W: 1, S: Name.get('S') }) });
-  if (spec.type === 'radio' && existing && existing.type === 'radio') {
-    // Another option of an existing radio group.
-    widget.set('Parent', existing.ref);
-    const on = spec.exportValue || `Choice${existing.widgets.length + 1}`;
-    widget.set('AP', new Dict({ N: new Dict({ [on]: checkAppearance(doc, spec.rect, 'circle', true, mk), Off: checkAppearance(doc, spec.rect, 'circle', false, mk) }) }));
-    widget.set('AS', Name.get('Off'));
+  if (spec.type === 'radio') {
+    // A radio group is a field without a widget of its own; every button is a kid widget.
+    const style = spec.checkStyle || 'circle';
+    let group: Ref, gd: Dict;
+    if (existing && existing.type === 'radio') {
+      group = existing.ref; gd = existing.dict;
+      if (doc.getName(gd, 'Subtype') === 'Widget') ({ group, gd } = splitMergedRadio(doc, existing.ref, gd));
+    } else {
+      gd = new Dict({ FT: Name.get('Btn'), T: PdfString.fromText(spec.name), Ff: flags, V: Name.get('Off'), Kids: [] });
+      if (spec.tooltip) gd.set('TU', PdfString.fromText(spec.tooltip));
+      group = doc.register(gd);
+      af.set('Fields', [...(doc.getArray(af, 'Fields') || []), group]); touchAcroForm(doc);
+    }
+    const kids = (doc.getArray(gd, 'Kids') || []).slice();
+    const taken = new Set(kids.map((k) => { const n = doc.getDict(doc.getDict(doc.resolve<Dict | null>(k), 'AP'), 'N'); return n ? n.keys().find((x) => x !== 'Off') : undefined; }));
+    let on = spec.exportValue || `Choice${kids.length + 1}`;
+    for (let k = 2; taken.has(on); k++) on = `${spec.exportValue || 'Choice'}${k}`;
+    widget.set('Parent', group);
+    widget.set('AP', new Dict({ N: new Dict({ [on]: checkAppearance(doc, spec.rect, style, true, mk), Off: checkAppearance(doc, spec.rect, style, false, mk) }) }));
+    widget.set('AS', Name.get(spec.value === true ? on : 'Off'));
+    if (spec.tooltip) widget.set('TU', PdfString.fromText(spec.tooltip));
     const ref = addAnnotation(doc, page, widget);
-    const kids = (doc.getArray(existing.dict, 'Kids') || []).slice(); kids.push(ref); existing.dict.set('Kids', kids); doc.update(existing.ref, existing.dict);
+    kids.push(ref); gd.set('Kids', kids);
+    if (spec.value === true) { gd.set('V', Name.get(on)); for (const k of kids.slice(0, -1)) { const kd = doc.resolve<Dict | null>(k); if (kd instanceof Dict && k instanceof Ref) { kd.set('AS', Name.get('Off')); doc.touch(k); } } }
+    doc.update(group, gd);
     return ref;
   }
   const field = widget; // merged field/widget dictionary
@@ -187,9 +230,9 @@ export function addField(doc: PdfDocument, spec: NewField): Ref {
   field.set('DA', PdfString.fromText(`/Helv ${fmtNum(spec.fontSize ?? 0)} Tf 0 g`));
   fieldFont(doc, 'Helv');
   if (spec.options) field.set('Opt', spec.options.map((o) => PdfString.fromText(o)));
-  if (spec.type === 'checkbox' || spec.type === 'radio') {
+  if (spec.type === 'checkbox') {
     const on = spec.exportValue || 'Yes';
-    const style = spec.checkStyle || (spec.type === 'radio' ? 'circle' : 'check');
+    const style = spec.checkStyle || 'check';
     field.set('AP', new Dict({ N: new Dict({ [on]: checkAppearance(doc, spec.rect, style, true, mk), Off: checkAppearance(doc, spec.rect, style, false, mk) }) }));
     field.set('AS', Name.get(spec.value === true ? on : 'Off'));
     field.set('V', Name.get(spec.value === true ? on : 'Off'));
@@ -205,6 +248,26 @@ export function addField(doc: PdfDocument, spec: NewField): Ref {
     if (f) setFieldValue(doc, f, spec.value);
   } else if (spec.type === 'text' || spec.type === 'combo' || spec.type === 'list') { const f = readFields(doc).find((x) => x.ref.num === ref.num); if (f) for (const w of f.widgets) regenerateAppearance(doc, f, w); }
   return ref;
+}
+
+/**
+ * A radio group whose first button was written as a merged field/widget with /Kids (documents made
+ * by earlier versions): the field entries move to a new parent and the button becomes its first kid.
+ */
+function splitMergedRadio(doc: PdfDocument, ref: Ref, d: Dict): { group: Ref; gd: Dict } {
+  const gd = new Dict();
+  for (const k of ['FT', 'T', 'TU', 'TM', 'Ff', 'V', 'DV', 'DA', 'Opt']) if (d.has(k)) { gd.set(k, d.get(k)!); d.delete(k); }
+  const oldKids = doc.getArray(d, 'Kids') || [];
+  d.delete('Kids');
+  const group = doc.register(gd);
+  gd.set('Kids', [ref, ...oldKids]);
+  d.set('Parent', group);
+  doc.update(ref, d);
+  for (const k of oldKids) { const kd = doc.resolve<Dict | null>(k); if (kd instanceof Dict && k instanceof Ref) { kd.set('Parent', group); doc.touch(k); } }
+  const af = ensureAcroForm(doc);
+  for (const key of ['Fields', 'CO']) { const a = doc.getArray(af, key); if (a) af.set(key, a.map((r) => (r instanceof Ref && r.num === ref.num ? group : r))); }
+  touchAcroForm(doc);
+  return { group, gd };
 }
 
 function checkAppearance(doc: PdfDocument, rect: Rect, style: string, on: boolean, mk: Dict): Ref {
@@ -233,11 +296,10 @@ function buttonAppearance(doc: PdfDocument, rect: Rect, caption: string, mk: Dic
 }
 
 export function deleteField(doc: PdfDocument, f: FieldInfo): void {
-  const af = doc.getDict(doc.catalog, 'AcroForm');
-  for (const w of f.widgets) { const p = doc.pages[w.page]; if (p) removeAnnotation(doc, p, w.ref); }
-  if (af) { af.set('Fields', (doc.getArray(af, 'Fields') || []).filter((r) => !(r instanceof Ref && r.num === f.ref.num))); touchAcroForm(doc); }
-  const parent = f.dict.get('Parent');
-  if (parent instanceof Ref) { const pd = doc.resolve<Dict>(parent); pd.set('Kids', (doc.getArray(pd, 'Kids') || []).filter((r) => !(r instanceof Ref && r.num === f.ref.num))); doc.touch(parent); }
+  // The field leaves /Fields, /CO and its parent's /Kids (a parent left empty goes too), then its widgets leave their pages.
+  detachWidget(doc, f.ref);
+  const pages = doc.pages;
+  for (const w of f.widgets) { const p = pages[w.page]; if (p) removeAnnotation(doc, p, w.ref); else doc.remove(w.ref); }
   doc.remove(f.ref);
 }
 
@@ -253,7 +315,12 @@ export function setFieldProps(doc: PdfDocument, f: FieldInfo, props: { name?: st
   if (props.fontSize !== undefined) { const da = parseDA(f.defaultAppearance); f.dict.set('DA', PdfString.fromText(`/${da.font} ${fmtNum(props.fontSize)} Tf ${da.color}`)); f.defaultAppearance = `/${da.font} ${props.fontSize} Tf ${da.color}`; }
   if (props.defaultValue !== undefined) f.dict.set('DV', PdfString.fromText(props.defaultValue));
   doc.update(f.ref, f.dict);
-  f.flags = flags;
+  // The appearance is drawn from the field as it is now, not as it was read.
+  f.flags = flags; f.required = !!(flags & 2); f.readOnly = !!(flags & 1); f.multiline = !!(flags & (1 << 12));
+  if (props.maxLen !== undefined) f.maxLen = Math.max(0, props.maxLen);
+  if (props.options) f.options = props.options.map((o) => ({ value: o, label: o }));
+  if (props.tooltip !== undefined) f.tooltip = props.tooltip;
+  if (props.name !== undefined) { const dot = f.name.lastIndexOf('.'); f.name = (dot >= 0 ? f.name.slice(0, dot + 1) : '') + props.name; }
   if (f.type === 'text' || f.type === 'combo' || f.type === 'list') for (const w of f.widgets) regenerateAppearance(doc, f, w);
 }
 
@@ -277,11 +344,35 @@ export function setTabOrder(doc: PdfDocument, p: PageInfo, mode: 'rows' | 'colum
   if (p.ref) doc.touch(p.ref);
 }
 
+/**
+ * Draws every form field into its page and removes the form. Fields whose appearance is missing
+ * (forms that rely on NeedAppearances) are drawn from their values first, so no value is lost; widgets
+ * with nothing to draw (hidden ones, unchecked boxes without an off appearance) are removed as well.
+ */
 export function flattenForm(doc: PdfDocument): number {
   let n = 0;
-  for (const p of doc.pages) n += flattenAnnotations(doc, p, (a) => a.subtype === 'Widget');
   const af = doc.getDict(doc.catalog, 'AcroForm');
-  if (af) { doc.catalog.delete('AcroForm'); doc.update(doc.catalogRef, doc.catalog); }
+  const need = !!af && doc.get(af, 'NeedAppearances') === true;
+  for (const f of readFields(doc)) {
+    for (const w of f.widgets) {
+      const ap = doc.getDict(w.dict, 'AP');
+      const has = !!ap && ap.has('N') && doc.get<PdfObj>(ap, 'N') != null;
+      if ((f.type === 'text' || f.type === 'combo' || f.type === 'list') && (need || !has)) regenerateAppearance(doc, f, w);
+      else if ((f.type === 'checkbox' || f.type === 'radio') && !has) {
+        // No appearances at all: draw the state the value names.
+        const v = doc.get<PdfObj>(f.dict, 'V'), as = doc.getName(w.dict, 'AS') || (v instanceof Name ? v.name : 'Off');
+        const mk = doc.getDict(w.dict, 'MK') || new Dict();
+        const style = f.type === 'radio' ? 'circle' : 'check';
+        if (as !== 'Off') { w.dict.set('AP', new Dict({ N: new Dict({ [as]: checkAppearance(doc, w.rect, style, true, mk), Off: checkAppearance(doc, w.rect, style, false, mk) }) })); w.dict.set('AS', Name.get(as)); doc.touch(w.ref); }
+      }
+    }
+  }
+  doc.invalidatePages();
+  for (const p of doc.pages) {
+    n += flattenAnnotations(doc, p, (a) => a.subtype === 'Widget');
+    for (const a of doc.getArray(p.dict, 'Annots') || []) { const d = doc.resolve<Dict | null>(a); if (a instanceof Ref && d instanceof Dict && doc.getName(d, 'Subtype') === 'Widget') removeAnnotation(doc, p, a); }
+  }
+  if (doc.catalog.has('AcroForm')) { doc.catalog.delete('AcroForm'); doc.update(doc.catalogRef, doc.catalog); }
   return n;
 }
 
@@ -298,10 +389,12 @@ export function applyFormData(doc: PdfDocument, data: Record<string, unknown>): 
   let n = 0;
   const fields = readFields(doc);
   for (const [k, v] of Object.entries(data)) {
-    const f = fields.find((x) => x.name === k || x.name.endsWith('.' + k));
+    // The exact name first; a partial name only when it fits exactly one field.
+    let f = fields.find((x) => x.name === k);
+    if (!f) { const tail = fields.filter((x) => x.name.endsWith('.' + k)); if (tail.length === 1) f = tail[0]; }
     if (!f || f.readOnly) continue;
     try {
-      if (f.type === 'checkbox') setFieldValue(doc, f, v === true || v === 'true' || v === 'Yes' || v === 'On' || v === 1 || v === '1' || (typeof v === 'string' && v !== '' && v !== 'Off' && v !== 'false'));
+      if (f.type === 'checkbox') setFieldValue(doc, f, v === true || v === 1 || (typeof v === 'string' && (/^(true|yes|on|1|x|checked)$/i.test(v.trim()) || f.widgets.some((w) => w.onState === v))));
       else if (f.type === 'radio') setFieldValue(doc, f, typeof v === 'string' ? v : !!v);
       else setFieldValue(doc, f, Array.isArray(v) ? v.map(String) : String(v ?? ''));
       n++;
@@ -309,8 +402,6 @@ export function applyFormData(doc: PdfDocument, data: Record<string, unknown>): 
   }
   return n;
 }
-
-const xmlEsc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
 
 export function exportFormXfdf(doc: PdfDocument, fileName = ''): string {
   const fields = readFields(doc).filter((f) => f.type !== 'button' && f.type !== 'signature');
@@ -322,7 +413,8 @@ export function exportFormXfdf(doc: PdfDocument, fileName = ''): string {
 }
 
 export function importFormXfdf(doc: PdfDocument, xml: string): number {
-  const dom = new DOMParser().parseFromString(xml, 'application/xml');
+  const dom = parseXml(xml);
+  if (!dom) throw new Error('The XFDF file is not well-formed XML; nothing was imported.');
   const data: Record<string, unknown> = {};
   const walk = (el: Element, prefix: string) => {
     for (const c of [...el.children]) {
@@ -338,39 +430,63 @@ export function importFormXfdf(doc: PdfDocument, xml: string): number {
 /** FDF (the older binary-ish form data format): a minimal writer and reader. */
 export function exportFormFdf(doc: PdfDocument, fileName = ''): Uint8Array {
   const fields = readFields(doc).filter((f) => f.type !== 'button' && f.type !== 'signature');
-  const fdf = PdfDocument.create();
   const items = fields.map((f) => {
     const d = new Dict({ T: PdfString.fromText(f.name) });
-    if (f.type === 'checkbox' || f.type === 'radio') d.set('V', Name.get(f.value ? f.widgets[0]?.onState || 'Yes' : 'Off'));
+    if (f.type === 'radio') d.set('V', Name.get(typeof f.value === 'string' && f.value ? f.value : 'Off')); // the selected option, not the first one
+    else if (f.type === 'checkbox') d.set('V', Name.get(f.value ? f.widgets[0]?.onState || 'Yes' : 'Off'));
     else d.set('V', Array.isArray(f.value) ? f.value.map((v) => PdfString.fromText(v)) : PdfString.fromText(String(f.value)));
     return d;
   });
   const fdfDict = new Dict({ Fields: items });
   if (fileName) fdfDict.set('F', PdfString.fromText(fileName));
-  fdf.catalog.set('FDF', fdfDict);
-  fdf.catalog.delete('Pages');
-  fdf.update(fdf.catalogRef, fdf.catalog);
-  const out = fdf.save({ incremental: false, keepUnused: true });
-  return bytesOf(latin1(out).replace('%PDF-1.7', '%FDF-1.2'));
+  // The plain FDF layout (ISO 32000-1 §12.7.7): one object holding the /FDF dictionary and a trailer naming it.
+  return concat([bytesOf('%FDF-1.2\n%\xe2\xe3\xcf\xd3\n1 0 obj\n'), serialize(new Dict({ FDF: fdfDict })), bytesOf('\nendobj\ntrailer\n<</Root 1 0 R>>\n%%EOF\n')]);
 }
 
+/**
+ * The /FDF dictionary of an FDF file with a resolver for its references. FDF files usually have no
+ * cross-reference table and their root is not a PDF catalog, so the objects are found by scanning
+ * rather than through the PDF loader.
+ */
+function readFdf(bytes: Uint8Array): { fdf: Dict; resolve: (o: PdfObj | undefined) => PdfObj } | null {
+  const text = new TextDecoder('latin1').decode(bytes);
+  const offsets = new Map<number, number>();
+  for (const m of text.matchAll(/(?:^|[^0-9])(\d{1,10})\s+\d{1,5}\s+obj\b/g)) offsets.set(+m[1], m.index! + m[0].indexOf(m[1]));
+  const objs = new Map<number, PdfObj>();
+  const fetch = (n: number): PdfObj => {
+    if (objs.has(n)) return objs.get(n)!;
+    objs.set(n, null); // a reference loop resolves to null
+    const off = offsets.get(n);
+    if (off != null) { try { const r = new Parser(bytes, off, resolve).parseIndirect(); if (r) objs.set(n, r.obj); } catch { /* damaged object */ } }
+    return objs.get(n)!;
+  };
+  const resolve = (o: PdfObj | undefined): PdfObj => { let v: PdfObj = o ?? null; for (let i = 0; i < 32 && v instanceof Ref; i++) v = fetch(v.num); return v; };
+  let fdf: Dict | null = null;
+  for (const n of offsets.keys()) { const o = fetch(n); const d = o instanceof Dict ? o : o instanceof PdfStream ? o.dict : null; const f = d ? resolve(d.get('FDF')) : null; if (f instanceof Dict) fdf = f; }
+  return fdf ? { fdf, resolve } : null;
+}
+
+/** Applies the field values of an FDF file. Throws when the bytes hold no FDF data. */
 export function importFormFdf(doc: PdfDocument, bytes: Uint8Array): number {
-  const text = latin1(bytes).replace('%FDF-', '%PDF-');
-  const fdf = PdfDocument.load(bytesOf(text));
-  const root = fdf.catalog;
-  const fd = fdf.getDict(root, 'FDF');
+  const file = readFdf(bytes);
+  if (!file) throw new Error('This file holds no FDF form data.');
+  const { fdf, resolve } = file;
   const data: Record<string, unknown> = {};
-  const walk = (list: PdfObj[], prefix: string) => {
+  const seen = new Set<Dict>();
+  const walk = (list: PdfObj, prefix: string, depth: number) => {
+    if (!Array.isArray(list) || depth > 32) return;
     for (const it of list) {
-      const d = fdf.resolve<Dict | null>(it);
-      if (!(d instanceof Dict)) continue;
-      const name = (prefix ? prefix + '.' : '') + fdf.getText(d, 'T');
-      const v = fdf.get(d, 'V');
-      if (v instanceof PdfString) data[name] = v.toText(); else if (v instanceof Name) data[name] = v.name; else if (Array.isArray(v)) data[name] = v.map((x) => { const r = fdf.resolve(x); return r instanceof PdfString ? r.toText() : ''; });
-      const kids = fdf.getArray(d, 'Kids'); if (kids) walk(kids, name);
+      const d = resolve(it);
+      if (!(d instanceof Dict) || seen.has(d)) continue;
+      seen.add(d);
+      const t = resolve(d.get('T'));
+      const name = (prefix ? prefix + '.' : '') + (t instanceof PdfString ? t.toText() : '');
+      const v = resolve(d.get('V'));
+      if (v instanceof PdfString) data[name] = v.toText(); else if (v instanceof Name) data[name] = v.name; else if (Array.isArray(v)) data[name] = v.map((x) => { const r = resolve(x); return r instanceof PdfString ? r.toText() : ''; });
+      walk(resolve(d.get('Kids')), name, depth + 1);
     }
   };
-  if (fd) walk(fdf.getArray(fd, 'Fields') || [], '');
+  walk(resolve(fdf.get('Fields')), '', 0);
   return applyFormData(doc, data);
 }
 

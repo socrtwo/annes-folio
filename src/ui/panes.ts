@@ -11,7 +11,7 @@ import { readOutlines, readAttachments, readLayers, setLayerVisible, pageAnnotat
 import { Dict, PdfStream, PdfString, Ref, Name, PdfObj, isName } from '../pdf/objects';
 import { serialize } from '../pdf/writer';
 import type { CheckItem } from '../pdf/ops/optimize';
-import { PdfDocument } from '../pdf/document';
+import { PdfDocument, PasswordNeeded } from '../pdf/document';
 
 export interface PaneDef {
   id: string;
@@ -118,7 +118,8 @@ registerPane({
   render(app, el) { this.update!(app, el, {}); },
   update(app, el) {
     const sel = app.tab.ui.selectedAnnot;
-    const sig = docSig(app) + ':' + (sel ? sel.num : '') + ':' + app.page;
+    // Not the current page: the list does not depend on it, and re-reading every annotation on each page turn is slow.
+    const sig = docSig(app) + ':' + (sel ? `${sel.page}.${sel.num}` : '');
     if (!sigOf(el, sig) || typingIn(el)) return;
     clear(el);
     const filter = h('input', { class: 'ql-input', placeholder: 'Filter comments…', 'aria-label': 'Filter' }) as HTMLInputElement;
@@ -216,9 +217,16 @@ registerPane({
     const results = h('div', { class: 'ql-nav-list' });
     const status = h('p', { class: 'ql-help' }, 'Type to search every page.');
     let timer: any;
+    let seq = 0;
     const run = async () => {
       const q = input.value;
-      const counts = await app.tab.ui.search(q, { caseSensitive: cs.checked, wholeWord: ww.checked });
+      const my = ++seq;
+      const tab = app.tab;
+      let counts: { page: number; count: number }[];
+      try { counts = await tab.ui.search(q, { caseSensitive: cs.checked, wholeWord: ww.checked }); }
+      catch (e: any) { if (my === seq) status.textContent = `The search stopped: ${e?.message || e}`; return; }
+      // Only the latest query fills the list: an older one that was still reading pages is dropped.
+      if (my !== seq || app.tab !== tab) return;
       clear(results);
       const total = counts.reduce((n, c) => n + c.count, 0);
       status.textContent = q ? (total ? `${total} match${total === 1 ? '' : 'es'} on ${counts.length} page${counts.length === 1 ? '' : 's'}` : 'No matches') : 'Type to search every page.';
@@ -300,21 +308,62 @@ registerPane({
     el.appendChild(h('button', { class: 'ql-btn', onclick: async () => { await app.exec('file.snapshot'); el.dataset.sig = ''; } }, icon('add_a_photo'), ' Take Snapshot'));
     const list = h('div', { class: 'ql-nav-list' });
     el.appendChild(list);
+    const tab = app.tab;
     void (async () => {
-      const { docKey } = await import('../commands/file');
-      const keys = (await kvKeys(`snap:${docKey(app.tab)}:`)).sort().reverse();
-      if (!keys.length) list.appendChild(h('p', { class: 'ql-help' }, 'No snapshots yet.'));
-      for (const k of keys) {
-        const v = await kvGet(k);
-        if (!v) continue;
-        list.appendChild(h('div', { class: 'ql-nav-item' },
-          icon('history'), h('span', null, v.label), h('span', { class: 'ql-help' }, new Date(v.when).toLocaleString()),
-          h('button', { class: 'ql-iconbtn ql-sm', title: 'Open as a copy', 'aria-label': 'Open as a copy', onclick: async () => { try { const bytes = new Uint8Array(v.bytes); const d = PdfDocument.load(bytes, { password: v.password }); app.createTab(d, { title: `${v.name} (${new Date(v.when).toLocaleString()})`, password: v.password || '' }, bytes); } catch (e: any) { toast(`Could not open the snapshot: ${e?.message || e}`); } } }, icon('open_in_new')),
-          h('button', { class: 'ql-iconbtn ql-sm', title: 'Delete', 'aria-label': 'Delete snapshot', onclick: async () => { await kvDel(k); el.dataset.sig = ''; this.update!(app, el, {}); } }, icon('delete'))));
+      try {
+        const { docKey } = await import('../commands/file');
+        const prefix = `snap:${docKey(tab)}:`;
+        const keys = (await kvKeys(prefix)).sort((a, b) => (+b.slice(prefix.length) || 0) - (+a.slice(prefix.length) || 0));
+        if (!keys.length) list.appendChild(h('p', { class: 'ql-help' }, 'No snapshots yet.'));
+        for (const k of keys) {
+          const m = await snapshotLabel(k, prefix);
+          if (!m) continue;
+          list.appendChild(h('div', { class: 'ql-nav-item' },
+            icon('history'), h('span', null, m.label), h('span', { class: 'ql-help' }, m.when ? new Date(m.when).toLocaleString() : ''),
+            h('button', { class: 'ql-iconbtn ql-sm', title: 'Open as a copy', 'aria-label': 'Open as a copy', onclick: () => void openSnapshot(app, k) }, icon('open_in_new')),
+            h('button', { class: 'ql-iconbtn ql-sm', title: 'Delete', 'aria-label': 'Delete snapshot', onclick: async () => {
+              try { await kvDel(k); await kvDel('snapmeta:' + k.slice(5)); }
+              catch (e: any) { toast(`The snapshot could not be deleted: ${e?.message || e}`); return; }
+              el.dataset.sig = ''; this.update!(app, el, {});
+            } }, icon('delete'))));
+        }
+      } catch (e: any) {
+        list.appendChild(h('p', { class: 'ql-help' }, `The snapshots stored on this device could not be read: ${e?.message || e}`));
       }
     })();
   },
 });
+
+/**
+ * Label and time of a snapshot for the list. The pane keeps no snapshot bytes: a small `snapmeta:` record
+ * is used when there is one; otherwise the snapshot is read once for its label and let go at once, and
+ * the time comes from the key. The bytes are read again only when the snapshot is opened.
+ */
+async function snapshotLabel(key: string, prefix: string): Promise<{ label: string; when: number } | null> {
+  const when = +key.slice(prefix.length) || 0;
+  const meta = await kvGet('snapmeta:' + key.slice(5)).catch(() => undefined);
+  if (meta && typeof meta.label === 'string') return { label: meta.label, when: meta.when || when };
+  const v = await kvGet(key).catch(() => undefined);
+  return v ? { label: String(v.label || 'Snapshot'), when: v.when || when } : null;
+}
+
+async function openSnapshot(app: App, key: string): Promise<void> {
+  const v = await kvGet(key).catch(() => undefined);
+  if (!v?.bytes) { toast('That snapshot is no longer stored on this device.'); return; }
+  const bytes = new Uint8Array(v.bytes);
+  const title = `${v.name || 'Snapshot'} (${new Date(v.when || Date.now()).toLocaleString()})`;
+  // Snapshots hold no password (older ones may): try the open document's, then ask.
+  let password: string = v.password || app.tab?.password || '';
+  for (;;) {
+    try { app.createTab(PdfDocument.load(bytes, { password: password || undefined }), { title, password }, bytes); return; }
+    catch (e: any) {
+      if (!(e instanceof PasswordNeeded)) { toast(`Could not open the snapshot: ${e?.message || e}`); return; }
+      const pw = await promptDialog('Password', `${v.name || 'This snapshot'} is encrypted. Enter its password:`, '', { type: 'password' });
+      if (pw == null) return;
+      password = pw;
+    }
+  }
+}
 
 // ------------------------------------------------------------------------------------------
 // Report pane (checks, preflight, accessibility, statistics)

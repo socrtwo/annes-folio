@@ -1,6 +1,8 @@
 /** Dialogs, prompts, menus, toasts and color pickers. */
 import { h, icon, clear, isPhone } from './dom';
 import type { MenuEntry } from '../commands/registry';
+import { sanitizeHtml } from '../util/sanitize';
+import { openExternal } from '../platform/native';
 
 // ------------------------------------------------------------------------------------------
 // Toast
@@ -53,7 +55,10 @@ export interface Field {
   placeholder?: string;
   rows?: number;
   multiple?: boolean;
+  /** For `info` fields. Shown through the allow-list in util/sanitize.ts: formatting, lists, tables and links only. */
   html?: string;
+  /** `autocomplete` of the input (password fields default to "new-password" so saved site passwords are not offered). */
+  autocomplete?: string;
   width?: string;
   half?: boolean;
   visibleIf?: (v: Record<string, any>) => boolean;
@@ -68,7 +73,8 @@ export interface DialogControl {
   values(): Record<string, any>;
   close(result?: any): void;
   body: HTMLElement;
-  setPreview(html: string): void;
+  /** A string goes through the same allow-list as `Field.html`; pass an element (for example an SVG built with the DOM) for anything else. */
+  setPreview(html: string | Node): void;
   rebuild(fields: Field[]): void;
 }
 
@@ -93,12 +99,69 @@ let dialogDepth = 0;
 /** Open dialogs, innermost last: only the top one handles Escape and Enter. */
 const dialogStack: HTMLElement[] = [];
 
+/** Everything behind the top dialog is inert: not focusable, not clickable, not read by screen readers. */
+function syncModal(): void {
+  const top = dialogStack[dialogStack.length - 1];
+  document.querySelector('.ql-app')?.toggleAttribute('inert', dialogStack.length > 0);
+  for (const o of dialogStack) o.toggleAttribute('inert', o !== top);
+}
+
+function focusables(box: HTMLElement): HTMLElement[] {
+  const laidOut = box.getClientRects().length > 0; // false without layout (tests): then only inline hiding counts
+  return [...box.querySelectorAll<HTMLElement>('button, a[href], input, select, textarea, summary, [tabindex]:not([tabindex="-1"])')].filter((el) => {
+    if ((el as HTMLButtonElement).disabled || (el as HTMLInputElement).type === 'hidden') return false;
+    for (let n: HTMLElement | null = el; n && n !== box; n = n.parentElement) if (n.hidden || n.style.display === 'none') return false;
+    return !laidOut || el.getClientRects().length > 0;
+  });
+}
+
+/** Tab and Shift+Tab stay inside the dialog (menus opened from it handle their own keys). */
+function trapTab(e: KeyboardEvent, box: HTMLElement): void {
+  const cur = document.activeElement as HTMLElement | null;
+  if (cur?.closest?.('.ql-menu')) return;
+  const f = focusables(box);
+  if (!f.length) { e.preventDefault(); box.focus(); return; }
+  const first = f[0], last = f[f.length - 1];
+  if (!cur || !box.contains(cur) || cur === box) { e.preventDefault(); (e.shiftKey ? last : first).focus(); }
+  else if (e.shiftKey && cur === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && cur === last) { e.preventDefault(); first.focus(); }
+}
+
+/**
+ * Makes an overlay that is not an openDialog dialog (the command palette) modal in the same way: the app
+ * behind it is inert, Tab stays in `box`, Escape (also the Android Back button, through inDialog) calls
+ * `onEscape`. Returns the function that ends it and gives the focus back.
+ */
+export function openModal(overlay: HTMLElement, box: HTMLElement, onEscape: () => void): () => void {
+  const prevFocus = document.activeElement as HTMLElement | null;
+  dialogDepth++;
+  dialogStack.push(overlay);
+  syncModal();
+  const onKey = (e: KeyboardEvent) => {
+    if (dialogStack[dialogStack.length - 1] !== overlay) return;
+    if (e.key === 'Escape' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey) { e.preventDefault(); e.stopImmediatePropagation(); if (!escapeMenu()) onEscape(); }
+    else if (e.key === 'Tab') trapTab(e, box);
+  };
+  document.addEventListener('keydown', onKey, true);
+  let done = false;
+  return () => {
+    if (done) return;
+    done = true;
+    dialogDepth--;
+    const at = dialogStack.indexOf(overlay);
+    if (at >= 0) dialogStack.splice(at, 1);
+    syncModal();
+    document.removeEventListener('keydown', onKey, true);
+    prevFocus?.focus?.();
+  };
+}
+
 export function openDialog(opts: DialogOptions): Promise<Record<string, any> | null> {
   return new Promise((resolve) => {
     dialogDepth++;
     const prevFocus = document.activeElement as HTMLElement | null;
     const overlay = h('div', { class: 'ql-overlay' });
-    const box = h('div', { class: 'ql-dialog' + (opts.wide ? ' ql-wide' : '') + (opts.full ? ' ql-full' : ''), role: 'dialog', 'aria-modal': 'true', 'aria-label': opts.title });
+    const box = h('div', { class: 'ql-dialog' + (opts.wide ? ' ql-wide' : '') + (opts.full ? ' ql-full' : ''), role: 'dialog', 'aria-modal': 'true', 'aria-label': opts.title, tabindex: '-1' });
     const body = h('div', { class: 'ql-dialog-body' });
     const previewEl = opts.preview ? h('div', { class: 'ql-dialog-preview', style: opts.previewStyle || '' }, typeof opts.preview === 'string' ? opts.preview : '') : null;
     const inputs = new Map<string, { el: HTMLElement; field: Field; row: HTMLElement }>();
@@ -116,7 +179,7 @@ export function openDialog(opts: DialogOptions): Promise<Record<string, any> | n
       values,
       close(result) { finish(result === undefined ? null : result); },
       body,
-      setPreview(html) { if (previewEl) previewEl.innerHTML = html; },
+      setPreview(html) { if (previewEl) previewEl.replaceChildren(typeof html === 'string' ? sanitizeHtml(html) : html); },
       rebuild(f) { fields = f; build(); },
     };
 
@@ -155,6 +218,7 @@ export function openDialog(opts: DialogOptions): Promise<Record<string, any> | n
       dialogDepth--;
       const at = dialogStack.indexOf(overlay);
       if (at >= 0) dialogStack.splice(at, 1);
+      syncModal();
       overlay.classList.add('ql-out');
       setTimeout(() => overlay.remove(), 120);
       document.removeEventListener('keydown', onKey, true);
@@ -163,13 +227,22 @@ export function openDialog(opts: DialogOptions): Promise<Record<string, any> | n
     }
     const onKey = (e: KeyboardEvent) => {
       if (dialogStack[dialogStack.length - 1] !== overlay) return;
-      // Shortcut capture boxes (Customize Keyboard) take Enter and modified keys themselves; plain Escape still closes.
+      const t = e.target as HTMLElement | null;
+      // Shortcut capture boxes (Customize Keyboard) take Enter and modified keys themselves; plain Escape and Tab still work.
       const plainEsc = e.key === 'Escape' && !e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey;
-      if ((e.target as HTMLElement | null)?.closest?.('[data-capture-keys]') && !plainEsc) return;
-      if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); finish(null); }
-      if (e.key === 'Enter' && !(e.target instanceof HTMLTextAreaElement) && !(e.target instanceof HTMLButtonElement) && opts.ok !== false) {
-        e.preventDefault(); e.stopImmediatePropagation(); okClick();
-      }
+      const plainTab = e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey;
+      if (t?.closest?.('[data-capture-keys]') && !plainEsc && !plainTab) return;
+      if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); if (!escapeMenu()) finish(null); return; }
+      if (plainTab) { trapTab(e, box); return; }
+      if (e.key !== 'Enter' || opts.ok === false || e.isComposing || e.keyCode === 229) return; // 229: an input method is still composing
+      if (t && box.contains(t)) {
+        if (t.tagName === 'TEXTAREA' || t.tagName === 'BUTTON' || t.tagName === 'A' || t.tagName === 'SUMMARY' || t.isContentEditable || (t as HTMLInputElement).type === 'file') return;
+        // Enter confirms from the dialog's own fields. In a box that belongs to custom content (a filter, a
+        // search, a key field of a wizard) it is that content's key and must not close the dialog.
+        const typing = t.tagName === 'INPUT' || t.tagName === 'SELECT';
+        if (typing && !t.closest('[data-enter-ok]') && ![...inputs.values()].some(({ row }) => row.contains(t))) return;
+      } else if (t && /^(BUTTON|INPUT|TEXTAREA|SELECT|A)$/.test(t.tagName || '')) return; // a menu or toast control above the dialog
+      e.preventDefault(); e.stopImmediatePropagation(); okClick();
     };
     const okClick = () => {
       const v = values();
@@ -192,13 +265,18 @@ export function openDialog(opts: DialogOptions): Promise<Record<string, any> | n
     overlay.addEventListener('mousedown', (e) => { if (e.target === overlay && !isPhone()) finish(null); });
     document.body.appendChild(overlay);
     dialogStack.push(overlay);
+    syncModal();
     document.addEventListener('keydown', onKey, true);
     build();
     opts.onOpen?.(ctl);
     opts.onChange?.(values(), ctl, '');
-    // The field marked autofocus (else the first text field), unless the user already moved into the dialog.
-    const first = body.querySelector<HTMLElement>('[autofocus]') || body.querySelector<HTMLElement>('input:not([type=checkbox]):not([type=radio]), textarea, select');
-    setTimeout(() => { if (!box.contains(document.activeElement)) first?.focus(); }, 30);
+    // The field marked autofocus (else the first text field, else the main button), unless the user already
+    // moved into the dialog. The focus always lands inside: what is behind the dialog cannot take keys.
+    setTimeout(() => {
+      if (done || (box.contains(document.activeElement) && document.activeElement !== box)) return;
+      const first = body.querySelector<HTMLElement>('[autofocus]') || focusables(body).find((x) => (x.tagName === 'INPUT' && !/^(checkbox|radio|file|range|color)$/.test((x as HTMLInputElement).type)) || x.tagName === 'TEXTAREA' || x.tagName === 'SELECT');
+      (first || footer.querySelector<HTMLElement>('.ql-primary') || footer.querySelector<HTMLElement>('button') || box).focus();
+    }, 30);
   });
 }
 
@@ -211,8 +289,10 @@ function buildField(f: Field, ctl: DialogControl, changed: () => void): { row: H
       el = h('h3', { class: 'ql-field-heading' }, f.label || '');
       return { row: el, el };
     case 'info':
-      el = h('div', { class: 'ql-info', html: f.html ?? '' });
+      el = h('div', { class: 'ql-info', html: f.html ?? '' }); // h() rebuilds html from the allow-list
       if (!f.html && f.label) el.textContent = f.label;
+      // Links to the outside open in the system browser, never in the app's own window or WebView.
+      el.addEventListener('click', (e) => { const a = (e.target as HTMLElement).closest?.('a[href]') as HTMLAnchorElement | null; if (a && !(a.getAttribute('href') || '').startsWith('#')) { e.preventDefault(); openExternal(a.href); } });
       return { row: el, el };
     case 'button':
       el = h('button', { class: 'ql-btn', type: 'button', onclick: () => f.onClick?.(ctl.values(), ctl) }, f.label || '');
@@ -246,9 +326,9 @@ function buildField(f: Field, ctl: DialogControl, changed: () => void): { row: H
     }
     case 'radio': {
       const wrap = h('div', { class: 'ql-radios', id, role: 'radiogroup' });
-      for (const o of f.options || []) {
+      for (const [k, o] of (f.options || []).entries()) {
         const opt = typeof o === 'string' ? { value: o, label: o } : o;
-        const rid = id + '_' + String(opt.value).replace(/\W/g, '');
+        const rid = `${id}_${k}`;
         const r = h('input', { type: 'radio', name: id, id: rid, value: String(opt.value), checked: String(f.value) === String(opt.value) });
         r.addEventListener('change', changed);
         wrap.appendChild(h('label', { class: 'ql-radio', for: rid }, r, ' ', opt.label));
@@ -257,7 +337,7 @@ function buildField(f: Field, ctl: DialogControl, changed: () => void): { row: H
       break;
     }
     case 'list': {
-      const sel = h('select', { id, size: String(f.rows || 8), multiple: !!f.multiple, class: 'ql-listbox' }) as HTMLSelectElement;
+      const sel = h('select', { id, size: String(f.rows || 8), multiple: !!f.multiple, class: 'ql-listbox', 'data-key': f.key }) as HTMLSelectElement;
       for (const o of f.options || []) {
         const opt = typeof o === 'string' ? { value: o, label: o } : o;
         const oe = h('option', { value: String(opt.value) }, opt.label);
@@ -300,7 +380,8 @@ function buildField(f: Field, ctl: DialogControl, changed: () => void): { row: H
     }
     default: {
       const type = f.type === 'number' ? 'number' : f.type === 'date' ? 'date' : f.type === 'password' ? 'password' : f.type === 'time' ? 'time' : 'text';
-      const inp = h('input', { id, type, placeholder: f.placeholder || '', autocomplete: 'off' }) as HTMLInputElement;
+      // Browsers ignore autocomplete="off" on password fields and offer saved site passwords; "new-password" stops that.
+      const inp = h('input', { id, type, placeholder: f.placeholder || '', autocomplete: f.autocomplete || (f.type === 'password' ? 'new-password' : 'off') }) as HTMLInputElement;
       if (f.type === 'number') {
         inp.inputMode = 'decimal';
         if (f.min != null) inp.min = String(f.min);
@@ -355,7 +436,7 @@ function writeValue(el: HTMLElement, f: Field, v: any): void {
 }
 
 export function setListOptions(ctl: DialogControl, key: string, options: (string | { value: any; label: string; style?: string })[], selected?: string): void {
-  const sel = ctl.body.querySelector<HTMLSelectElement>(`select.ql-listbox[id^="f_${key}_"]`);
+  const sel = [...ctl.body.querySelectorAll<HTMLSelectElement>('select.ql-listbox')].find((s) => s.dataset.key === key);
   if (!sel) return;
   clear(sel);
   for (const o of options) {
@@ -464,6 +545,14 @@ function menuKey(ev: KeyboardEvent, menu: HTMLElement, level: number) {
   else if (ev.key === 'Escape' || ev.key === 'Tab') leave(ev);
 }
 function leave(ev: KeyboardEvent) { ev.preventDefault(); const back = menuReturn; closeMenus(); back?.focus?.(); }
+/** Escape with a menu open above a dialog closes the menu only. True when there was one. */
+function escapeMenu(): boolean {
+  if (!openMenus.length) return false;
+  const back = menuReturn;
+  closeMenus();
+  back?.focus?.();
+  return true;
+}
 
 export function showMenu(entries: MenuEntry[], opts: MenuOptions): HTMLElement {
   const prior = document.activeElement as HTMLElement | null;

@@ -1,4 +1,6 @@
 /** Tiny DOM helpers. */
+import { sanitizeHtml } from '../util/sanitize';
+
 type Child = Node | string | number | null | undefined | false | Child[];
 type Props = Record<string, any> & { class?: string; style?: string | Partial<CSSStyleDeclaration>; on?: Record<string, (e: any) => void> };
 
@@ -17,7 +19,10 @@ export function h(tag: string, props?: Props | null, ...children: Child[]): HTML
       } else if (k.startsWith('on') && typeof v === 'function') {
         el.addEventListener(k.slice(2).toLowerCase(), v);
       } else if (k === 'html') {
-        el.innerHTML = v;
+        // Never raw innerHTML: the string is rebuilt from an allow-list, so text from a document cannot become markup that runs.
+        el.replaceChildren(sanitizeHtml(v));
+      } else if (/^on/i.test(k)) {
+        continue; // an event handler is a function (handled above), never an attribute string
       } else if (k in el && typeof v !== 'string') {
         (el as any)[k] = v;
       } else if (v === true) {

@@ -15,9 +15,10 @@ export interface Op { op: string; args: PdfObj[]; /** Inline image data for BI�
 /** Tokenizes a content stream into operators. Unknown tokens are kept as operands. */
 export function parseContent(data: Uint8Array): Op[] {
   const ops: Op[] = [];
-  const p = new Parser(data, 0);
+  const p = new Parser(data, 0, undefined, false);
   let args: PdfObj[] = [];
-  for (let guard = 0; guard < 5e6; guard++) {
+  // No token limit: every token moves the position forward, and a truncated list would be written back short.
+  for (;;) {
     const t = p.lexer.next();
     if (t.t === 'eof') break;
     if (t.t === 'kw') {
@@ -33,18 +34,10 @@ export function parseContent(data: Uint8Array): Op[] {
           const v = p.parse();
           d.set(k.v, v && typeof v === 'object' && 'kw' in v ? null : (v as PdfObj));
         }
-        let start = p.lexer.pos + 1;
-        // Find "EI" preceded by whitespace and followed by whitespace/EOF.
-        let end = start;
-        for (;;) {
-          const e = Lexer.find(data, 'EI', end);
-          if (e < 0) { end = data.length; break; }
-          const before = data[e - 1], after = data[e + 2];
-          if ((before === 32 || before === 10 || before === 13 || before === 9) && (after === undefined || after === 32 || after === 10 || after === 13 || after === 9)) { end = e - 1; p.lexer.pos = e + 2; break; }
-          end = e + 2;
-        }
-        ops.push({ op: 'INLINE_IMAGE', args: [], inline: { dict: d, data: data.subarray(start, Math.max(start, end)) } });
-        if (end === data.length) p.lexer.pos = data.length;
+        const start = Math.min(data.length, p.lexer.pos + 1);
+        const end = inlineImageEnd(data, start, d);
+        ops.push({ op: 'INLINE_IMAGE', args: [], inline: { dict: d, data: data.subarray(start, end.dataEnd) } });
+        p.lexer.pos = end.next;
         args = [];
         continue;
       }
@@ -57,6 +50,52 @@ export function parseContent(data: Uint8Array): Op[] {
     args.push(v as PdfObj);
   }
   return ops;
+}
+
+const isSpace = (c: number | undefined): boolean => c === 32 || c === 10 || c === 13 || c === 9 || c === 12 || c === 0;
+
+/**
+ * Where an inline image's data ends (`dataEnd`) and where parsing resumes after its EI (`next`).
+ * Unfiltered data has a known length; ASCII-filtered data has its own end marker; otherwise the first
+ * "EI" between white space counts only when what follows reads like content rather than more image bytes.
+ */
+function inlineImageEnd(data: Uint8Array, start: number, d: Dict): { dataEnd: number; next: number } {
+  const get = (...keys: string[]): PdfObj | undefined => { for (const k of keys) if (d.has(k)) return d.get(k); return undefined; };
+  const eiAt = (at: number): number => { // position after an EI that follows optional white space at `at`, or -1
+    let q = at;
+    while (q < data.length && isSpace(data[q])) q++;
+    return data[q] === 0x45 && data[q + 1] === 0x49 && (q + 2 >= data.length || isSpace(data[q + 2])) ? q + 2 : -1;
+  };
+  const filter = get('Filter', 'F');
+  const first = filter instanceof Name ? filter.name : Array.isArray(filter) && filter[0] instanceof Name ? filter[0].name : '';
+  let from = start;
+  if (filter === undefined || filter === null || (Array.isArray(filter) && !filter.length)) {
+    const w = get('Width', 'W'), h = get('Height', 'H'), bpc = get('BitsPerComponent', 'BPC'), cs = get('ColorSpace', 'CS');
+    const mask = get('ImageMask', 'IM') === true;
+    const csName = cs instanceof Name ? cs.name : Array.isArray(cs) && cs[0] instanceof Name ? cs[0].name : '';
+    const comps = mask ? 1 : ({ G: 1, DeviceGray: 1, CalGray: 1, I: 1, Indexed: 1, RGB: 3, DeviceRGB: 3, CalRGB: 3, Lab: 3, CMYK: 4, DeviceCMYK: 4 } as Record<string, number>)[csName] || 0;
+    const bits = mask ? 1 : typeof bpc === 'number' ? bpc : 0;
+    if (typeof w === 'number' && typeof h === 'number' && w > 0 && h > 0 && comps && bits > 0) {
+      const len = h * Math.ceil((w * comps * bits) / 8);
+      const next = start + len <= data.length ? eiAt(start + len) : -1;
+      if (next >= 0) return { dataEnd: start + len, next };
+    }
+  } else if (first === 'ASCII85Decode' || first === 'A85') { const m = Lexer.find(data, '~>', start); if (m >= 0) from = m + 2; }
+  else if (first === 'ASCIIHexDecode' || first === 'AHx') { const m = Lexer.find(data, '>', start); if (m >= 0) from = m + 1; }
+  let fallback = -1;
+  for (let at = from; ;) {
+    const e = Lexer.find(data, 'EI', at);
+    if (e < 0) break;
+    at = e + 2;
+    if (!(e === start || isSpace(data[e - 1])) || !(e + 2 >= data.length || isSpace(data[e + 2]))) continue;
+    if (fallback < 0) fallback = e;
+    // Content follows an image's EI: the next bytes are white space or printable ASCII, not arbitrary binary.
+    let ok = true;
+    for (let i = e + 2; i < Math.min(data.length, e + 22); i++) { const c = data[i]; if (!(isSpace(c) || (c >= 0x20 && c <= 0x7e))) { ok = false; break; } }
+    if (ok) return { dataEnd: Math.max(start, e - 1), next: e + 2 };
+  }
+  if (fallback >= 0) return { dataEnd: Math.max(start, fallback - 1), next: fallback + 2 };
+  return { dataEnd: data.length, next: data.length };
 }
 
 export function serializeContent(ops: Op[]): Uint8Array {
@@ -127,6 +166,14 @@ export function unicodeToWinAnsi(ch: string): number {
   return -1;
 }
 const MAC_ROMAN_HI = 'ÄÅÇÉÑÖÜáàâäãåçéèêëíìîïñóòôöõúùûü†°¢£§•¶ß®©™´¨≠ÆØ∞±≤≥¥µ∂∑∏π∫ªºΩæø¿¡¬√ƒ≈∆«»… ÀÃÕŒœ–—“”‘’÷◊ÿŸ⁄€‹›ﬁﬂ‡·‚„‰ÂÊÁËÈÍÎÏÌÓÔÒÚÛÙıˆ˜¯˘˙˚¸˝˛ˇ';
+
+// StandardEncoding above 0x7E (ISO 32000-1 Annex D); below, it is ASCII except 0x27 quoteright and 0x60 quoteleft.
+const STANDARD_HI: Record<number, string> = {
+  0xa1: '¡', 0xa2: '¢', 0xa3: '£', 0xa4: '⁄', 0xa5: '¥', 0xa6: 'ƒ', 0xa7: '§', 0xa8: '¤', 0xa9: "'", 0xaa: '“', 0xab: '«', 0xac: '‹', 0xad: '›', 0xae: 'ﬁ', 0xaf: 'ﬂ',
+  0xb1: '–', 0xb2: '†', 0xb3: '‡', 0xb4: '·', 0xb6: '¶', 0xb7: '•', 0xb8: '‚', 0xb9: '„', 0xba: '”', 0xbb: '»', 0xbc: '…', 0xbd: '‰', 0xbf: '¿',
+  0xc1: '`', 0xc2: '´', 0xc3: 'ˆ', 0xc4: '˜', 0xc5: '¯', 0xc6: '˘', 0xc7: '˙', 0xc8: '¨', 0xca: '˚', 0xcb: '¸', 0xcd: '˝', 0xce: '˛', 0xcf: 'ˇ', 0xd0: '—',
+  0xe1: 'Æ', 0xe3: 'ª', 0xe8: 'Ł', 0xe9: 'Ø', 0xea: 'Œ', 0xeb: 'º', 0xf1: 'æ', 0xf5: 'ı', 0xf8: 'ł', 0xf9: 'ø', 0xfa: 'œ', 0xfb: 'ß',
+};
 
 /** Parses a ToUnicode CMap (bfchar / bfrange). */
 export function parseToUnicode(data: Uint8Array): Map<number, string> {
@@ -202,18 +249,30 @@ export function fontInfo(doc: PdfDocument, name: string, fd: Dict | null): FontI
   }
   // Encoding: base encoding + differences; names map through a small glyph list.
   const enc = doc.get(fd, 'Encoding');
-  let baseEnc = isName(enc) ? enc.name : enc instanceof Dict ? doc.getName(enc, 'BaseEncoding') : '';
-  if (!baseEnc) baseEnc = /Symbol|Dingbat|Wingding/i.test(base) ? 'Builtin' : 'StandardEncoding';
+  const fontDesc = doc.getDict(fd, 'FontDescriptor');
+  const embedded = !!fontDesc && (fontDesc.has('FontFile') || fontDesc.has('FontFile2') || fontDesc.has('FontFile3'));
+  const named = isName(enc) ? enc.name : enc instanceof Dict ? doc.getName(enc, 'BaseEncoding') : '';
+  // With no encoding named: a symbolic font uses its own; a TrueType font is read as WinAnsi (what its
+  // Windows cmap usually amounts to); any other simple font uses StandardEncoding.
+  let baseEnc = named;
+  if (!baseEnc) baseEnc = /Symbol|Dingbat|Wingding/i.test(base) || (fontDesc && doc.getNum(fontDesc, 'Flags', 0) & 4) ? 'Builtin' : info.subtype === 'TrueType' ? 'WinAnsiEncoding' : 'StandardEncoding';
+  if (baseEnc === 'MacExpertEncoding') baseEnc = 'Builtin';
   const codeMap = new Map<number, string>();
-  if (baseEnc !== 'Builtin') for (let c = 32; c < 256; c++) codeMap.set(c, baseEnc === 'MacRomanEncoding' && c >= 128 ? MAC_ROMAN_HI[c - 128] || '' : winAnsiToUnicode(c));
+  if (baseEnc === 'StandardEncoding') {
+    for (let c = 32; c < 127; c++) codeMap.set(c, c === 0x27 ? '’' : c === 0x60 ? '‘' : String.fromCharCode(c));
+    for (const [c, u] of Object.entries(STANDARD_HI)) codeMap.set(+c, u);
+  } else if (baseEnc !== 'Builtin') for (let c = 32; c < 256; c++) codeMap.set(c, baseEnc === 'MacRomanEncoding' && c >= 128 ? MAC_ROMAN_HI[c - 128] || '' : winAnsiToUnicode(c));
   if (enc instanceof Dict) {
     const diff = doc.getArray(enc, 'Differences') || [];
     let code = 0;
     for (const d of diff) { const v = doc.resolve<PdfObj>(d); if (typeof v === 'number') code = v; else if (isName(v)) { codeMap.set(code, glyphToUnicode(v.name)); code++; } }
   }
   for (const [c, u] of codeMap) if (!info.toUnicode.has(c) && u) info.toUnicode.set(c, u);
-  const embedded = (() => { const fdesc = doc.getDict(fd, 'FontDescriptor'); return !!fdesc && (fdesc.has('FontFile') || fdesc.has('FontFile2') || fdesc.has('FontFile3')); })();
-  info.editable = (info.subtype === 'Type1' || info.subtype === 'TrueType' || info.subtype === 'MMType1') && baseEnc !== 'Builtin' && !(enc instanceof Dict && doc.getArray(enc, 'Differences')?.length) && (!embedded || !!widths);
+  // New text can be encoded only when the code-to-character table is certain: an encoding the font names
+  // (WinAnsi or MacRoman), or the implied StandardEncoding of a Type 1 font that is not embedded. An
+  // embedded font without a named encoding may use any table of its own.
+  const certain = named === 'WinAnsiEncoding' || named === 'MacRomanEncoding' || (!named && !embedded && baseEnc === 'StandardEncoding');
+  info.editable = (info.subtype === 'Type1' || info.subtype === 'TrueType' || info.subtype === 'MMType1') && certain && !(enc instanceof Dict && doc.getArray(enc, 'Differences')?.length) && (!embedded || !!widths);
   if (info.editable) for (const [c, u] of codeMap) if (u && !info.fromUnicode.has(u)) info.fromUnicode.set(u, c);
   return info;
 }
@@ -226,8 +285,6 @@ export function glyphToUnicode(g: string): string {
   m = /^u([0-9A-Fa-f]{4,6})$/.exec(g); if (m) return String.fromCodePoint(parseInt(m[1], 16));
   m = /^(?:g|cid|c|G)(\d+)$/.exec(g); if (m) return '';
   m = /^([A-Za-z])(\d+)$/.exec(g); if (m) return '';
-  const letters: Record<string, string> = { a: 'a', b: 'b' };
-  void letters;
   return g.length <= 2 ? g : '';
 }
 
@@ -258,8 +315,15 @@ export function encodeString(font: FontInfo, text: string): PdfString | null {
 
 export interface PageText { runs: TextRun[]; images: ImageUse[]; ops: Op[] }
 
+/**
+ * Shared by one analysis and the forms it descends into: parsed form content, and how much work in forms
+ * is still allowed (in operators; the default is about 20,000 small forms, or twenty million operators).
+ * Forms drawn after that are skipped, so nested forms that multiply cannot stall the app.
+ */
+export interface FormWork { parsed: Map<PdfStream, Op[]>; opsLeft: number }
+
 /** Walks a page's content and reports where text strings and images are drawn (user space). */
-export function analyzeContent(doc: PdfDocument, ops: Op[], resources: Dict | null, depth = 0, ctm0: Matrix = IDENTITY): PageText {
+export function analyzeContent(doc: PdfDocument, ops: Op[], resources: Dict | null, depth = 0, ctm0: Matrix = IDENTITY, shared: FormWork = { parsed: new Map(), opsLeft: 2e7 }): PageText {
   const runs: TextRun[] = [];
   const images: ImageUse[] = [];
   const fonts = new Map<string, FontInfo>();
@@ -267,7 +331,8 @@ export function analyzeContent(doc: PdfDocument, ops: Op[], resources: Dict | nu
   const xobjRes = resources ? doc.getDict(resources, 'XObject') : null;
   const fontOf = (n: string): FontInfo => { let f = fonts.get(n); if (!f) { f = fontInfo(doc, n, fontRes ? doc.getDict(fontRes, n) : null); fonts.set(n, f); } return f; };
   let ctm: Matrix = ctm0;
-  const stack: Matrix[] = [];
+  // q/Q save and restore the whole graphics state, and the text state (font, size, spacing…) is part of it.
+  const stack: { ctm: Matrix; font: FontInfo | null; size: number; charSp: number; wordSp: number; hscale: number; leading: number; rise: number }[] = [];
   let tm: Matrix = IDENTITY, tlm: Matrix = IDENTITY;
   let font: FontInfo | null = null, size = 0, charSp = 0, wordSp = 0, hscale = 1, leading = 0, rise = 0;
   const n = (v: PdfObj, d = 0): number => (typeof v === 'number' && isFinite(v) ? v : d);
@@ -307,8 +372,8 @@ export function analyzeContent(doc: PdfDocument, ops: Op[], resources: Dict | nu
   ops.forEach((o, i) => {
     const a = o.args;
     switch (o.op) {
-      case 'q': stack.push(ctm); if (stack.length > 256) stack.shift(); break;
-      case 'Q': ctm = stack.pop() || ctm; break;
+      case 'q': stack.push({ ctm, font, size, charSp, wordSp, hscale, leading, rise }); if (stack.length > 256) stack.shift(); break;
+      case 'Q': { const s = stack.pop(); if (s) ({ ctm, font, size, charSp, wordSp, hscale, leading, rise } = s); break; }
       case 'cm': if (a.length >= 6) ctm = mul([n(a[0]), n(a[1]), n(a[2]), n(a[3]), n(a[4]), n(a[5])], ctm); break;
       case 'BT': tm = IDENTITY; tlm = IDENTITY; break;
       case 'Tf': if (isName(a[0])) { font = fontOf(a[0].name); size = n(a[1]); } break;
@@ -337,7 +402,14 @@ export function analyzeContent(doc: PdfDocument, ops: Op[], resources: Dict | nu
             const mtx = doc.getArray(x, 'Matrix');
             const fm: Matrix = mtx && mtx.length >= 6 ? (mtx.map((v) => n(doc.resolve(v))) as Matrix) : IDENTITY;
             try {
-              const inner = analyzeContent(doc, parseContent(doc.decoded(x)), doc.getDict(x, 'Resources') || resources, depth + 1, mul(fm, ctm));
+              // Parsed once however often the form is drawn; the work budget stops forms that draw each
+              // other many times over from multiplying without end.
+              let formOps = shared.parsed.get(x);
+              if (!formOps) { formOps = parseContent(doc.decoded(x)); shared.parsed.set(x, formOps); }
+              // Setting a form up costs about as much as walking a thousand of its operators.
+              shared.opsLeft -= formOps.length + 1000;
+              if (shared.opsLeft < 0) break;
+              const inner = analyzeContent(doc, formOps, doc.getDict(x, 'Resources') || resources, depth + 1, mul(fm, ctm), shared);
               for (const r of inner.runs) runs.push({ ...r, opIndex: i });
               for (const im of inner.images) images.push({ ...im, opIndex: i });
             } catch { /* damaged form */ }

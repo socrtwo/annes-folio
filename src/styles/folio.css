@@ -9,7 +9,10 @@
 .qf-thumb.qf-dragover { box-shadow: inset 0 3px 0 var(--accent); }
 .qf-thumb-img { width: 100%; max-width: 120px; min-height: 40px; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.25); display: block; }
 .qf-thumb-n { font-size: 11px; color: var(--muted); }
-.qf-scroll { flex: 1; overflow: auto; outline: none; position: relative; scroll-behavior: auto; -webkit-overflow-scrolling: touch; }
+/* touch-action: the page view zooms by itself on a pinch (viewer.ts), so the browser must not zoom the whole app as well.
+   overflow-anchor: the viewer keeps the point under the pointer in place when the zoom changes; the browser's own anchoring would move it twice.
+   scrollbar-gutter: the width for Fit Width does not change when the scroll bar appears, so the fit cannot flip back and forth. */
+.qf-scroll { flex: 1; overflow: auto; outline: none; position: relative; scroll-behavior: auto; -webkit-overflow-scrolling: touch; touch-action: pan-x pan-y; overflow-anchor: none; scrollbar-gutter: stable; }
 .qf-pages { display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 12px 20px 40px; min-height: 100%; }
 .qf-pages[data-mode="single"] { gap: 0; }
 .qf-pages[data-mode="single"] .qf-page { scroll-snap-align: start; }
@@ -17,14 +20,18 @@
 .qf-pages[data-mode="book"] .qf-page:first-child { margin-right: calc(50% - 6px); }
 .qf-pages[data-mode="facing"] .qf-page:nth-child(odd), .qf-pages[data-mode="book"] .qf-page:nth-child(even) { break-after: avoid; }
 .qf-page { position: relative; background: var(--page); box-shadow: var(--shadow); flex: none; overflow: hidden; }
-.qf-canvas { display: block; position: absolute; left: 0; top: 0; }
+/* The bitmap always fills the page box: while a new zoom level renders, the old bitmap is stretched instead of the page going blank. */
+.qf-canvas { display: block; position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
 .qf-overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
-.qf-overlay .qf-handle { pointer-events: all; fill: #fff; stroke: var(--accent); stroke-width: 1.5; cursor: nwse-resize; }
-.qf-overlay .qf-handle[data-handle="ne"], .qf-overlay .qf-handle[data-handle="sw"] { cursor: nesw-resize; }
+/* The frame of the selected annotation and its handles are HTML boxes that take the pointer themselves, so
+   a finger drags or resizes the annotation instead of scrolling the page (touch-action has no effect on SVG shapes). */
+.qf-sel { position: absolute; box-sizing: border-box; z-index: 3; background: rgba(166, 48, 59, .08); outline: 1.5px dashed var(--accent); touch-action: none; cursor: move; }
+.qf-handle { position: absolute; width: 10px; height: 10px; transform: translate(-50%, -50%); box-sizing: border-box; background: #fff; border: 1.5px solid var(--accent); touch-action: none; cursor: nwse-resize; }
+.qf-handle[data-handle="ne"], .qf-handle[data-handle="sw"] { cursor: nesw-resize; }
+@media (pointer: coarse) { .qf-handle { width: 20px; height: 20px; border-radius: 50%; } }
 .qf-hit { fill: rgba(255, 213, 0, .45); stroke: none; }
 .qf-hit-current { fill: rgba(255, 120, 0, .55); stroke: #d84315; stroke-width: 1; }
 .qf-field { fill: rgba(120, 170, 255, .22); stroke: rgba(60, 110, 220, .55); stroke-width: 1; }
-.qf-sel { fill: rgba(166, 48, 59, .08); stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 4 3; }
 .qf-draw { fill: rgba(166, 48, 59, .08); stroke: #c62828; stroke-width: 2; }
 .qf-draw-circle { rx: 50%; }
 .qf-draw-hl { fill: none; stroke: rgba(255, 235, 59, .6); stroke-width: 14; stroke-linecap: round; stroke-linejoin: round; }
@@ -36,6 +43,9 @@ polyline.qf-draw { fill: none; stroke-linecap: round; stroke-linejoin: round; }
 .qf-tool-hand .qf-page { cursor: grab; }
 .qf-tool-hand .qf-page:active { cursor: grabbing; }
 .qf-tool-draw .qf-page { cursor: crosshair; }
+/* With a drawing tool or the Hand tool a touch on the page is the tool's, not a scroll (the browser would cancel the stroke). */
+.qf-tool-draw .qf-page, .qf-tool-hand .qf-page { touch-action: none; }
+.qf-page.qf-over-link, .qf-page.qf-over-link .textLayer :is(span, br) { cursor: pointer; }
 .qf-viewer[data-tool="note"] .qf-page, .qf-viewer[data-tool="stamp"] .qf-page, .qf-viewer[data-tool="attach"] .qf-page, .qf-viewer[data-tool="sign"] .qf-page { cursor: copy; }
 .qf-viewer[data-tool="edit"] .qf-page { cursor: text; }
 .qf-viewer[data-tool="zoom"] .qf-page { cursor: zoom-in; }
@@ -43,6 +53,8 @@ polyline.qf-draw { fill: none; stroke-linecap: round; stroke-linejoin: round; }
 /* Display modes */
 .qf-night .qf-canvas, .qf-night .qf-thumb-img, .qf-night .qf-gthumb-img { filter: invert(1) hue-rotate(180deg); }
 .qf-night { background: #0b0d12; }
+/* A page that has not rendered yet is dark too (its canvas is inverted once it is there). */
+.qf-night .qf-page { background: #000; }
 .qf-gray .qf-canvas, .qf-gray .qf-thumb-img, .qf-gray .qf-gthumb-img { filter: grayscale(1); }
 .qf-night.qf-gray .qf-canvas { filter: invert(1) hue-rotate(180deg) grayscale(1); }
 /* Organize grid */
@@ -54,11 +66,21 @@ polyline.qf-draw { fill: none; stroke-linecap: round; stroke-linejoin: round; }
 .qf-gthumb.qf-dragover { box-shadow: inset 4px 0 0 var(--accent); }
 .qf-gthumb-img { width: 100%; min-height: 60px; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.25); display: block; }
 .qf-gthumb-n { font-size: 12px; color: var(--muted); }
-/* pdf.js text layer (positions come from the library; these rules make it selectable and invisible) */
-.textLayer { position: absolute; inset: 0; overflow: clip; opacity: 1; line-height: 1; text-size-adjust: none; forced-color-adjust: none; transform-origin: 0 0; caret-color: CanvasText; z-index: 0; --user-unit: 1; --total-scale-factor: calc(var(--scale-factor, 1) * var(--user-unit)); }
-.textLayer :is(span, br) { color: transparent; position: absolute; white-space: pre; cursor: text; transform-origin: 0% 0%; }
-.textLayer > :not(.markedContent), .textLayer .markedContent span:not(.markedContent) { z-index: 1; }
-.textLayer span.markedContent { top: 0; height: 0; }
+/* pdf.js text layer. The library puts --font-height, --scale-x and --rotate on every span and leaves it to
+   the style sheet to turn them into a font size and a transform; these rules follow pdfjs-dist's
+   web/pdf_viewer.css (.textLayer). Without them every span is the default 16px and the selection does not
+   cover the text. tests/e2e/smoke.mjs checks that a span is as wide as its text item. */
+.textLayer { position: absolute; left: 0; top: 0; text-align: initial; overflow: clip; opacity: 1; line-height: 1; letter-spacing: normal; word-spacing: normal; -webkit-text-size-adjust: none; text-size-adjust: none; forced-color-adjust: none; transform-origin: 0 0; caret-color: CanvasText; z-index: 0;
+  --user-unit: 1; --total-scale-factor: calc(var(--scale-factor, 1) * var(--user-unit)); --scale-round-x: 1px; --scale-round-y: 1px;
+  --min-font-size: 1; --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size)); --min-font-size-inv: calc(1 / var(--min-font-size)); }
+.textLayer :is(span, br) { color: transparent; position: absolute; white-space: pre; cursor: text; transform-origin: 0% 0%; -webkit-user-select: text; user-select: text; }
+.textLayer > :not(.markedContent), .textLayer .markedContent span:not(.markedContent) { z-index: 1; --font-height: 0; font-size: calc(var(--text-scale-factor) * var(--font-height)); --scale-x: 1; --rotate: 0deg; transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv)); }
+.textLayer .markedContent { display: contents; }
+.textLayer span[role="img"] { -webkit-user-select: none; user-select: none; cursor: default; }
+/* The layer keeps the page's unrotated size (viewer.ts sets it) and is turned with the page. */
+.textLayer[data-main-rotation="90"] { transform: rotate(90deg) translateY(-100%); }
+.textLayer[data-main-rotation="180"] { transform: rotate(180deg) translate(-100%, -100%); }
+.textLayer[data-main-rotation="270"] { transform: rotate(270deg) translateX(-100%); }
 .textLayer ::selection { background: rgba(60, 110, 220, .35); }
 .textLayer br::selection { background: transparent; }
 .textLayer .endOfContent { display: block; position: absolute; inset: 100% 0 0; z-index: 0; cursor: default; user-select: none; }

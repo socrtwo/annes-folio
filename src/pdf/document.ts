@@ -3,10 +3,10 @@
  * the page tree, and an overlay of changed objects that save() writes as an incremental update or
  * a full rewrite. Nothing is lost on a round trip: objects the app does not understand are kept.
  */
-import { Dict, Name, PdfObj, PdfStream, PdfString, Ref, dictOf, isName, latin1, pdfDate } from './objects';
+import { Dict, Name, PdfObj, PdfStream, PdfString, Ref, dictOf, isName, latin1, nameText, pdfDate } from './objects';
 import { Lexer, Parser } from './lexer';
 import { decodeStream, DecodeResult, flateStream } from './filters';
-import { parseXref, reconstructXref, XrefEntry, XrefResult } from './xref';
+import { parseXref, scanObjects, addObjectStream, finishScan, scanObjectHeaders, ObjectHeader, XrefEntry, XrefResult } from './xref';
 import { PasswordNeeded, SecurityHandler, SecurityInfo } from './crypt';
 import { writeFull, writeIncremental, SaveOptions } from './writer';
 
@@ -46,7 +46,11 @@ export class PdfDocument {
   private pageCache: PageInfo[] | null = null;
   private objStmCache = new Map<number, Map<number, PdfObj>>();
   private reconstructed = false;
-  /** Set when the file was modified in memory (save() clears it). */
+  /** Objects being parsed right now (a stream whose /Length leads back to itself must not recurse). */
+  private loading = new Set<number>();
+  /** Where each "n g obj" really is, built on the first object the cross-reference table misplaces. */
+  private huntIndex: Map<number, ObjectHeader> | null = null;
+  /** Set when the document was modified in memory. save() leaves it alone; whoever stores the bytes resets it. */
   dirty = false;
   password = '';
 
@@ -69,24 +73,32 @@ export class PdfDocument {
       try { xr = parseXref(buf, (o) => doc.resolve(o)); for (const w of xr.warnings) warn(w); }
       catch (e: any) { warn(`Cross-reference table unusable: ${e?.message || e}`); }
     }
+    const password = opts.password || '';
     if (xr) { doc.xref = xr.entries; doc.trailer = xr.trailer; doc.usesXrefStream = xr.usesXrefStream; doc.startxref = xr.startxref; }
-    if (!xr || !doc.validate()) {
-      doc.reconstruct(warn);
-    }
-    doc.setupSecurity(opts.password || '');
+    if (!xr || !doc.validate()) doc.reconstruct(warn, password);
+    else doc.setupSecurity(password);
     // Make sure the catalog and page tree resolve; otherwise rebuild.
     try {
       const cat = doc.catalog;
-      if (!cat || (!cat.has('Pages') && !cat.has('Type'))) throw new Error('no catalog');
+      if (!cat.has('Pages') && !cat.has('Type')) throw new Error('no catalog');
       doc.pages; // forces the walk
     } catch {
-      if (!doc.reconstructed) { doc.reconstruct(warn); doc.setupSecurity(opts.password || ''); }
+      if (!doc.reconstructed) doc.reconstruct(warn, password);
     }
+    // Never hand back a document whose catalog cannot be read: every later access would throw.
+    try { doc.catalog; } catch { throw new Error('This file has no readable document catalog, even after scanning it for objects, so there is nothing to open.'); }
     doc.pageCache = null;
-    const size = doc.trailer.get('Size');
-    doc.nextNum = Math.max(typeof size === 'number' ? size : 0, ...[...doc.xref.keys()].map((n) => n + 1), 1);
-    doc.password = opts.password || '';
+    doc.nextNum = Math.max(doc.nextNum, doc.sizeFromXref(), 1);
+    doc.password = password;
     return doc;
+  }
+
+  /** One more than the highest object number in the trailer's /Size and the cross-reference table. */
+  private sizeFromXref(): number {
+    const size = this.trailer.get('Size');
+    let n = typeof size === 'number' && isFinite(size) ? size : 0;
+    for (const k of this.xref.keys()) if (k >= n) n = k + 1;
+    return n;
   }
 
   /** A new, empty document with one catalog and an empty page tree. */
@@ -121,27 +133,53 @@ export class PdfDocument {
     return true;
   }
 
-  private reconstruct(warn: (w: string) => void): void {
+  /**
+   * Rebuilds the cross-reference table by scanning the file, and sets the security handler up on the
+   * way: an encrypted file's object streams (where its catalog and pages usually are) can only be
+   * listed once they can be decrypted.
+   */
+  private reconstruct(warn: (w: string) => void, password: string): void {
     this.reconstructed = true;
     this.report.reconstructed = true;
-    this.cache.clear(); this.objStmCache.clear(); this.pageCache = null;
-    const r = reconstructXref(this.buf, (o) => this.resolve(o));
-    for (const w of r.warnings) warn(w);
-    this.xref = r.entries;
-    this.usesXrefStream = r.usesXrefStream;
+    const scan = scanObjects(this.buf, (o) => this.resolve(o));
+    this.cache.clear(); this.objStmCache.clear(); this.pageCache = null; this.huntIndex = null;
+    this.xref = scan.entries;
     this.startxref = -1;
     const oldTrailer = this.trailer;
-    this.trailer = r.trailer;
+    this.trailer = scan.trailer;
     // Keep ID/Info/Encrypt from the original trailer if the scan did not find them.
     for (const k of ['ID', 'Info', 'Encrypt']) if (!this.trailer.has(k) && oldTrailer.has(k)) this.trailer.set(k, oldTrailer.get(k)!);
+    this.security = null;
+    this.setupSecurity(password);
+    for (const sn of scan.objStreams) {
+      try {
+        const s = this.fetch(new Ref(sn, scan.entries.get(sn)!.gen));
+        if (s instanceof PdfStream) addObjectStream(scan, sn, this.decoded(s), this.getNum(s, 'N'), this.getNum(s, 'First'));
+      } catch { /* damaged object stream */ }
+    }
+    // Listing the streams moved objects into them: nothing fetched under the earlier table may be kept.
+    this.cache.clear(); this.objStmCache.clear();
+    const r = finishScan(scan, (n, what) => {
+      const d = dictOf(this.fetch(new Ref(n, scan.entries.get(n)?.gen ?? 0)));
+      return !!d && (what === 'pages' || d.has('Pages') || isName(d.get('Type'), 'Catalog'));
+    });
+    for (const w of r.warnings) warn(w);
+    this.usesXrefStream = r.usesXrefStream;
+    // Before anything is registered: new objects must not take the numbers of objects in the file.
+    this.nextNum = Math.max(this.nextNum, this.sizeFromXref());
     if (r.catalogSynthesized) {
-      const pagesRoot: number | undefined = (r.trailer as any).__pagesRoot;
-      let pagesRef: Ref;
-      if (pagesRoot != null && this.xref.has(pagesRoot)) pagesRef = new Ref(pagesRoot, this.xref.get(pagesRoot)!.gen);
-      else {
+      const pagesRoot = r.pagesRoot;
+      let pagesRef: Ref | null = pagesRoot != null && this.xref.has(pagesRoot) ? new Ref(pagesRoot, this.xref.get(pagesRoot)!.gen) : null;
+      const catalog = new Dict({ Type: Name.get('Catalog') });
+      this.trailer.set('Root', this.register(catalog));
+      // A page tree root that leads to no page at all (its kids are damaged) is no better than none.
+      if (pagesRef) { catalog.set('Pages', pagesRef); this.pageCache = null; if (!this.pages.length) pagesRef = null; this.pageCache = null; }
+      if (!pagesRef) {
         // Collect every /Type /Page object in file order into a new Pages node.
         const kids: Ref[] = [];
-        const ordered = [...this.xref.entries()].sort((a, b) => (a[1].type === 2 ? a[1].offset * 1e6 + (a[1].idx || 0) : a[1].offset) - (b[1].type === 2 ? b[1].offset * 1e6 + (b[1].idx || 0) : b[1].offset));
+        // An object inside an object stream sorts at the stream's place in the file, then by its index there.
+        const where = (e: XrefEntry): number => (e.type === 2 ? (this.xref.get(e.offset)?.offset ?? 0) + ((e.idx || 0) + 1) / 1e6 : e.offset);
+        const ordered = [...this.xref.entries()].sort((a, b) => where(a[1]) - where(b[1]));
         for (const [n, e] of ordered) {
           try { const o = this.fetch(new Ref(n, e.gen)); if (o instanceof Dict && isName(o.get('Type'), 'Page')) kids.push(new Ref(n, e.gen)); } catch { /* */ }
         }
@@ -150,10 +188,9 @@ export class PdfDocument {
         this.report.pagesSynthesized = true;
         warn(`${kids.length} page object(s) were collected by scanning the file.`);
       }
-      this.trailer.set('Root', this.register(new Dict({ Type: Name.get('Catalog'), Pages: pagesRef })));
+      catalog.set('Pages', pagesRef);
     }
-    const size = this.trailer.get('Size');
-    this.nextNum = Math.max(this.nextNum, typeof size === 'number' ? size : 0, ...[...this.xref.keys()].map((n) => n + 1));
+    this.nextNum = Math.max(this.nextNum, this.sizeFromXref());
   }
 
   private setupSecurity(password: string): void {
@@ -195,19 +232,25 @@ export class PdfDocument {
   getArray(d: Dict | PdfStream | null | undefined, key: string): PdfObj[] | null { const v = this.get(d, key); return Array.isArray(v) ? v : null; }
   getNum(d: Dict | PdfStream | null | undefined, key: string, def = 0): number { const v = this.get(d, key); return typeof v === 'number' ? v : def; }
   getName(d: Dict | PdfStream | null | undefined, key: string): string { const v = this.get(d, key); return isName(v) ? v.name : ''; }
-  getText(d: Dict | PdfStream | null | undefined, key: string): string { const v = this.get(d, key); return v instanceof PdfString ? v.toText() : isName(v) ? v.name : ''; }
+  /** A text string's text, or a name as text (names are stored as bytes; UTF-8 is decoded for display). */
+  getText(d: Dict | PdfStream | null | undefined, key: string): string { const v = this.get(d, key); return v instanceof PdfString ? v.toText() : isName(v) ? nameText(v.name) : ''; }
 
   fetch(ref: Ref): PdfObj {
     if (this.changed.has(ref.num)) return this.changed.get(ref.num) ?? null;
     if (this.cache.has(ref.num)) return this.cache.get(ref.num)!;
+    // Asked for while it is being parsed (a stream's /Length that points back at the stream): no answer,
+    // and nothing cached, so the parse in progress falls back to searching for "endstream" once.
+    if (this.loading.has(ref.num)) return null;
     const e = this.xref.get(ref.num);
     let obj: PdfObj = null;
     if (e) {
+      this.loading.add(ref.num);
       try {
-        obj = e.type === 2 ? this.fromObjStm(e.offset, e.idx || 0, ref.num) : this.parseAt(e.offset, ref.num);
+        obj = e.type === 2 ? this.fromObjStm(e.offset, ref.num) : this.parseAt(e.offset, ref.num);
+        if (obj === undefined) obj = null;
+        if (e.type === 1 && this.security && !(this.encryptRef && this.encryptRef.num === ref.num)) obj = this.security.decryptObject(obj, new Ref(ref.num, e.gen));
       } catch { obj = null; }
-      if (obj === undefined) obj = null;
-      if (e.type === 1 && this.security && !(this.encryptRef && this.encryptRef.num === ref.num)) obj = this.security.decryptObject(obj, new Ref(ref.num, e.gen));
+      finally { this.loading.delete(ref.num); }
     }
     this.cache.set(ref.num, obj);
     return obj;
@@ -223,19 +266,17 @@ export class PdfDocument {
 
   /** The xref entry was wrong: look for "num gen obj" anywhere (and remember to rebuild later). */
   private hunt(num: number): PdfObj {
-    const text = latin1(this.buf);
-    const re = new RegExp(`(^|[^0-9])${num}\\s+(\\d+)\\s+obj\\b`, 'g');
-    let m: RegExpExecArray | null, last: RegExpExecArray | null = null;
-    while ((m = re.exec(text))) last = m;
-    if (!last) return null;
-    const at = last.index + last[1].length;
-    this.xref.set(num, { offset: at, gen: +last[2], type: 1 });
+    // One scan of the file serves every misplaced object (the last definition of a number wins).
+    if (!this.huntIndex) { this.huntIndex = new Map(); for (const h of scanObjectHeaders(this.buf)) this.huntIndex.set(h.num, h); }
+    const h = this.huntIndex.get(num);
+    if (!h) return null;
+    this.xref.set(num, { offset: h.offset, gen: h.gen, type: 1 });
     this.report.warnings.push(`Object ${num} was not where the cross-reference table said; it was found by searching.`);
-    const r = new Parser(this.buf, at, (o) => this.resolve(o)).parseIndirect();
+    const r = new Parser(this.buf, h.offset, (o) => this.resolve(o)).parseIndirect();
     return r?.obj ?? null;
   }
 
-  private fromObjStm(stmNum: number, idx: number, wantNum: number): PdfObj {
+  private fromObjStm(stmNum: number, wantNum: number): PdfObj {
     let table = this.objStmCache.get(stmNum);
     if (!table) {
       table = new Map();
@@ -252,7 +293,6 @@ export class PdfDocument {
         }
       }
     }
-    void idx;
     return table.get(wantNum) ?? null;
   }
 
@@ -296,7 +336,14 @@ export class PdfDocument {
     if (!c) throw new Error('The document has no catalog.');
     return c;
   }
-  get catalogRef(): Ref { const r = this.trailer.get('Root'); return r instanceof Ref ? r : this.register(this.catalog); }
+  get catalogRef(): Ref {
+    const r = this.trailer.get('Root');
+    if (r instanceof Ref) return r;
+    // A catalog written directly in the trailer: make it an object once, and point the trailer at it.
+    const ref = this.register(this.catalog);
+    this.trailer.set('Root', ref);
+    return ref;
+  }
   get info(): Dict | null { return dictOf(this.resolve(this.trailer.get('Info'))); }
   ensureInfo(): Dict {
     let d = this.info;
@@ -311,8 +358,11 @@ export class PdfDocument {
     if (this.pageCache) return this.pageCache;
     const out: PageInfo[] = [];
     const seen = new Set<string>();
-    const walk = (node: Dict, ref: Ref | null, inh: { mediaBox?: PdfObj; cropBox?: PdfObj; rotate?: PdfObj; resources?: PdfObj }, depth: number) => {
-      if (depth > 64) return;
+    type Inherited = { mediaBox?: PdfObj; cropBox?: PdfObj; rotate?: PdfObj; resources?: PdfObj };
+    // Depth first, in document order, on an explicit stack: a tree may be any depth (a reference is
+    // followed once, so a cycle ends), and a deep one must not overflow the call stack.
+    const stack: { node: Dict; ref: Ref | null; inh: Inherited }[] = [];
+    const visit = (node: Dict, ref: Ref | null, inh: Inherited) => {
       const inherit = { ...inh };
       if (node.has('MediaBox')) inherit.mediaBox = node.get('MediaBox');
       if (node.has('CropBox')) inherit.cropBox = node.get('CropBox');
@@ -332,15 +382,19 @@ export class PdfDocument {
         return;
       }
       if (!kids) return;
-      for (const k of kids) {
-        const kref = k instanceof Ref ? k : null;
-        if (kref) { if (seen.has(kref.key)) continue; seen.add(kref.key); }
+      for (let i = kids.length - 1; i >= 0; i--) {
+        const k = kids[i];
         const kd = dictOf(this.resolve(k));
-        if (kd) walk(kd, kref, inherit, depth + 1);
+        if (kd) stack.push({ node: kd, ref: k instanceof Ref ? k : null, inh: inherit });
       }
     };
     const root = this.pagesRoot;
-    if (root) walk(root, this.pagesRootRef, {}, 0);
+    if (root) stack.push({ node: root, ref: this.pagesRootRef, inh: {} });
+    while (stack.length) {
+      const f = stack.pop()!;
+      if (f.ref) { if (seen.has(f.ref.key)) continue; seen.add(f.ref.key); }
+      visit(f.node, f.ref, f.inh);
+    }
     this.pageCache = out;
     return out;
   }
@@ -391,9 +445,14 @@ export class PdfDocument {
   // ------------------------------------------------------------------------------------------
   // Saving
 
-  /** Writes the document. Incremental updates append to the original bytes; a full rewrite renumbers and drops unused objects. */
+  /**
+   * Writes the document. Incremental updates append to the original bytes; a full rewrite renumbers and
+   * drops unused objects. `incremental: true` is a preference: a document with no file behind it, one whose
+   * cross-reference table had to be rebuilt (there is no valid section for /Prev to name), and a change
+   * of encryption are always written in full.
+   */
   save(opts: SaveOptions = {}): Uint8Array {
-    const incremental = opts.incremental ?? (!!this.buf.length && !this.reconstructed && !opts.encrypt && opts.removeSecurity !== true);
+    const incremental = opts.incremental !== false && !!this.buf.length && !this.reconstructed && this.startxref >= 0 && !opts.encrypt && opts.removeSecurity !== true;
     this.ensureInfo().set('ModDate', pdfDate());
     const bytes = incremental ? writeIncremental(this, opts) : writeFull(this, opts);
     return bytes;

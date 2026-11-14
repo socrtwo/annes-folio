@@ -4,6 +4,7 @@ import { openDialog, toast } from './dialog';
 import type { RepairReport, MethodStatus } from '../pdf/repair';
 import type { PdfDocument } from '../pdf/document';
 import { saveAs, openExternal, platformName } from '../platform/native';
+import { sanitizeHtml } from '../util/sanitize';
 
 const STATUS: Record<MethodStatus, [string, string]> = {
   success: ['check_circle', 'Succeeded'],
@@ -46,7 +47,7 @@ export async function showRecoveryReport(r: RepairReport, actions: ReportActions
   await openDialog({ title: `Repair Report: ${r.fileName}`, content: body, wide: true, ok: 'Close', cancel: false, buttons });
 }
 
-const link = (url: string, text: string) => `<a href="${url}" data-external="1">${text}</a>`;
+const link = (url: string, text: string) => `<a href="${url}">${text}</a>`;
 
 /** Per-platform manual recovery guide for PDFs. */
 const MANUAL: Record<string, [string, string]> = {
@@ -113,8 +114,8 @@ export async function showManualRecovery(actions: ReportActions = {}): Promise<v
   const content = h('div', { class: 'ql-manual' });
   const pane = h('div', { class: 'ql-manual-body' });
   const tabs = h('div', { class: 'ql-seg' }, Object.entries(MANUAL).map(([k, [label]]) => h('button', { class: 'ql-seg-btn', 'data-k': k, onclick: () => show(k) }, label)));
-  const show = (k: string) => { pane.innerHTML = MANUAL[k][1]; tabs.querySelectorAll('button').forEach((b) => b.classList.toggle('ql-on', b.getAttribute('data-k') === k)); };
-  pane.addEventListener('click', (e) => { const a = (e.target as HTMLElement).closest('a[data-external]') as HTMLAnchorElement | null; if (a) { e.preventDefault(); openExternal(a.href); } });
+  const show = (k: string) => { pane.replaceChildren(sanitizeHtml(MANUAL[k][1])); tabs.querySelectorAll('button').forEach((b) => b.classList.toggle('ql-on', b.getAttribute('data-k') === k)); };
+  pane.addEventListener('click', (e) => { const a = (e.target as HTMLElement).closest('a[href]') as HTMLAnchorElement | null; if (a) { e.preventDefault(); openExternal(a.href); } });
   const intro = h('p', { class: 'ql-help' }, 'Anne\'s Folio can try every repair method on a damaged PDF, or on any file that may hold PDF data: pick it with "Repair a file…". The steps below find other copies of the file.');
   content.append(intro, tabs, pane);
   show(guess);

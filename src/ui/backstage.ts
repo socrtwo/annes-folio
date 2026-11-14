@@ -15,11 +15,12 @@ export function renderBackstage(app: App, root: HTMLElement, page: string): void
   clear(root);
   const nav = h('nav', { class: 'ql-bs-nav' }, h('button', { class: 'ql-bs-back', onclick: () => app.ui.hideBackstage(), 'aria-label': 'Back to document' }, icon('arrow_back'), ' Back'));
   for (const [id, label, ic] of PAGES) {
-    nav.appendChild(h('button', { class: 'ql-bs-item' + (id === page ? ' ql-on' : ''), onclick: () => {
+    nav.appendChild(h('button', { class: 'ql-bs-item' + (id === page ? ' ql-on' : ''), 'aria-label': label, 'aria-current': id === page ? 'page' : null, onclick: () => {
       if (id === 'save') { app.ui.hideBackstage(); app.exec('file.save'); return; }
       if (id === 'close') { app.exec('file.close'); return; }
       if (id === 'options') { app.exec('file.options'); return; }
       renderBackstage(app, root, id);
+      root.querySelector<HTMLElement>('.ql-bs-item.ql-on')?.focus(); // the page was rebuilt: keep the keyboard where it was
     } }, icon(ic), ' ', label));
   }
   const body = h('div', { class: 'ql-bs-body' });
@@ -66,7 +67,7 @@ export function renderBackstage(app: App, root: HTMLElement, page: string): void
         h('div', { class: 'ql-bs-cards' },
           card('Protect Document', sec ? `Encrypted (${sec.method.toUpperCase()}, ${sec.keyLength}-bit)` : 'Encrypt with a password and set permissions', 'shield_lock', () => app.exec('protect.encrypt')),
           card('Mark as Final', tab.readOnly ? 'The document is read-only here' : 'Make the document read-only in this app', 'verified', () => app.exec('protect.markFinal')),
-          card('Hidden Information', 'Find metadata, comments, attachments, scripts and earlier versions', 'policy', () => app.exec('protect.hiddenInfo')),
+          card('Hidden Information', 'Find metadata, comments, attachments, scripts and earlier versions', 'policy', () => { app.ui.hideBackstage(); app.exec('protect.hiddenInfo'); }),
           card('Check Accessibility', 'Title, language, tags, alt text and form tooltips', 'accessibility_new', () => { app.ui.hideBackstage(); app.exec('review.checkAccessibility'); }),
           card('Archival Check', 'What stands between this file and PDF/A', 'inventory', () => { app.ui.hideBackstage(); app.exec('review.archivalCheck'); }),
           card('Optimize', 'Drop unused objects, recompress streams', 'compress', () => app.exec('tools.optimize')),

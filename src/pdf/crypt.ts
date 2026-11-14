@@ -4,7 +4,7 @@
  * password the person enters as user or owner password. Saving re-encrypts new objects with the same key
  * (incremental updates) or encrypts everything with a new AES-256 dictionary (Protect ▸ Encrypt).
  */
-import { Dict, Name, PdfObj, PdfStream, PdfString, Ref, bytesOf, isName, latin1, nameObj } from './objects';
+import { Dict, Name, PdfObj, PdfStream, PdfString, Ref, bytesOf, isName, nameObj } from './objects';
 import { aesCbcDecrypt, aesCbcDecryptNoPad, aesCbcEncrypt, aesCbcEncryptNoPad, md5, randomBytes, rc4, sha256, sha384, sha512 } from './hash';
 
 const PAD = Uint8Array.from([0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41, 0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08, 0x2e, 0x2e, 0x00, 0xb6, 0xd0, 0x68, 0x3e, 0x80, 0x2f, 0x0c, 0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a]);
@@ -97,6 +97,8 @@ export class SecurityHandler {
   ownerAccess = false;
   identityStreams = false;
   identityStrings = false;
+  /** The method for embedded file streams when the dictionary names one (/EFF); null = the same as other streams. */
+  embeddedMethod: CryptMethod | null = null;
 
   constructor(public dict: Dict, private id0: Uint8Array, resolve: (o: PdfObj | undefined) => PdfObj) {
     const num = (k: string, d: number) => { const v = resolve(dict.get(k)); return typeof v === 'number' ? v : d; };
@@ -112,19 +114,20 @@ export class SecurityHandler {
         if (n === 'Identity') return 'none';
         const d = cf instanceof Dict ? resolve(cf.get(n)) : null;
         const cfm = d instanceof Dict ? resolve(d.get('CFM')) : null;
-        if (d instanceof Dict) { const l = resolve(d.get('Length')); if (typeof l === 'number') this.length = l <= 40 ? l * 8 : l; }
-        if (isName(cfm, 'AESV2')) return 'aesv2';
+        // A crypt filter's /Length is in bytes, but some writers give bits: below 40 it can only be bytes.
+        if (d instanceof Dict) { const l = resolve(d.get('Length')); if (typeof l === 'number' && l > 0) this.length = l < 40 ? l * 8 : l; }
+        if (isName(cfm, 'AESV2')) { this.length = 128; return 'aesv2'; } // AESV2 always has a 128-bit key
         if (isName(cfm, 'AESV3')) return 'aesv3';
         if (isName(cfm, 'V2')) return 'rc4';
         if (isName(cfm, 'None')) return 'none';
         return 'none';
       };
+      if (isName(resolve(dict.get('EFF')))) this.embeddedMethod = methodOf(nameOf('EFF'));
       this.method = methodOf(nameOf('StmF'));
       this.stringMethod = methodOf(nameOf('StrF'));
       this.identityStreams = this.method === 'none';
       this.identityStrings = this.stringMethod === 'none';
     }
-    void resolve;
   }
 
   /** Tries a password (as user, then as owner). Returns false when it does not open the file. */
@@ -137,20 +140,27 @@ export class SecurityHandler {
       const oValidation = O.subarray(32, 40), oKeySalt = O.subarray(40, 48);
       const UE = str('UE'), OE = str('OE');
       const eq = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
-      if (eq(hashR6(pw, uValidation, new Uint8Array(0), this.R), U.subarray(0, 32))) {
-        const ik = hashR6(pw, uKeySalt, new Uint8Array(0), this.R);
-        this.key = aesCbcDecryptNoPadZero(ik, UE);
-        this.ownerAccess = false;
-        this.method = this.method === 'none' ? 'none' : 'aesv3'; this.stringMethod = this.stringMethod === 'none' ? 'none' : 'aesv3';
+      if (U.length < 48 || O.length < 48) throw new Error('The encryption dictionary is damaged (/U or /O is too short), so no password can open this file.');
+      const opened = (owner: boolean): true => {
+        this.ownerAccess = owner;
+        const v3 = (m: CryptMethod): CryptMethod => (m === 'none' ? 'none' : 'aesv3');
+        this.method = v3(this.method); this.stringMethod = v3(this.stringMethod);
+        if (this.embeddedMethod) this.embeddedMethod = v3(this.embeddedMethod);
         return true;
-      }
+      };
+      // The file key is wrapped in /UE and /OE (32 bytes each); a right password is no use when they are damaged.
+      // The owner password is tried first (ISO 32000-2 algorithm 2.A): a file whose two passwords are the
+      // same must open with owner access, or its security could never be changed or removed.
+      let damaged = false;
       if (eq(hashR6(pw, oValidation, U.subarray(0, 48), this.R), O.subarray(0, 32))) {
-        const ik = hashR6(pw, oKeySalt, U.subarray(0, 48), this.R);
-        this.key = aesCbcDecryptNoPadZero(ik, OE);
-        this.ownerAccess = true;
-        this.method = this.method === 'none' ? 'none' : 'aesv3'; this.stringMethod = this.stringMethod === 'none' ? 'none' : 'aesv3';
-        return true;
+        if (OE.length >= 32) { this.key = aesCbcDecryptNoPadZero(hashR6(pw, oKeySalt, U.subarray(0, 48), this.R), OE); return opened(true); }
+        damaged = true;
       }
+      if (eq(hashR6(pw, uValidation, new Uint8Array(0), this.R), U.subarray(0, 32))) {
+        if (UE.length >= 32) { this.key = aesCbcDecryptNoPadZero(hashR6(pw, uKeySalt, new Uint8Array(0), this.R), UE); return opened(false); }
+        damaged = true;
+      }
+      if (damaged) throw new Error('The password is right, but the encryption dictionary is damaged (/UE or /OE is missing or too short), so the file key cannot be recovered.');
       return false;
     }
     const tryUser = (pw: Uint8Array): boolean => {
@@ -163,13 +173,13 @@ export class SecurityHandler {
       return true;
     };
     const pw = latinPw(password);
-    if (tryUser(pw)) { this.ownerAccess = false; return true; }
-    // As owner password: unwrap the user password from /O.
+    // As owner password first (see above): unwrap the user password from /O and check that.
     const ok = ownerKey(pw, this.R, this.length);
     let userPw: Uint8Array;
     if (this.R === 2) userPw = rc4(ok, O.subarray(0, 32));
     else { userPw = O.slice(0, 32); for (let i = 19; i >= 0; i--) userPw = rc4(ok.map((b) => b ^ i), userPw); }
     if (tryUser(userPw)) { this.ownerAccess = true; return true; }
+    if (tryUser(pw)) { this.ownerAccess = false; return true; }
     return false;
   }
 
@@ -188,16 +198,14 @@ export class SecurityHandler {
     return h.subarray(0, Math.min(16, this.key.length + 5));
   }
 
-  decryptBytes(data: Uint8Array, ref: Ref, isString: boolean): Uint8Array {
-    const m = isString ? this.stringMethod : this.method;
+  decryptBytes(data: Uint8Array, ref: Ref, isString: boolean, m: CryptMethod = isString ? this.stringMethod : this.method): Uint8Array {
     if (m === 'none') return data;
     if (m === 'rc4') return rc4(this.objectKey(ref, false), data);
     if (m === 'aesv2') return aesCbcDecrypt(this.objectKey(ref, true), data);
     return aesCbcDecrypt(this.key, data);
   }
 
-  encryptBytes(data: Uint8Array, ref: Ref, isString: boolean): Uint8Array {
-    const m = isString ? this.stringMethod : this.method;
+  encryptBytes(data: Uint8Array, ref: Ref, isString: boolean, m: CryptMethod = isString ? this.stringMethod : this.method): Uint8Array {
     if (m === 'none') return data;
     if (m === 'rc4') return rc4(this.objectKey(ref, false), data);
     if (m === 'aesv2') return aesCbcEncrypt(this.objectKey(ref, true), data);
@@ -209,15 +217,21 @@ export class SecurityHandler {
     if (obj instanceof PdfString) return new PdfString(this.decryptBytes(obj.bytes, ref, true), obj.hex);
     if (Array.isArray(obj)) return obj.map((o) => this.decryptObject(o, ref));
     if (obj instanceof PdfStream) {
-      const type = obj.dict.get('Type');
-      const isXref = isName(type, 'XRef');
-      const isMeta = isName(type, 'Metadata') && !this.encryptMetadata;
+      // A cross-reference stream is never encrypted, and neither are the strings in its dictionary (/ID).
+      if (isName(obj.dict.get('Type'), 'XRef')) return obj;
       const d = this.decryptObject(obj.dict, ref) as Dict;
-      const identity = this.hasIdentityCryptFilter(obj.dict);
-      return new PdfStream(d, isXref || isMeta || identity ? obj.raw : this.decryptBytes(obj.raw, ref, false));
+      return new PdfStream(d, this.streamInClear(obj.dict) ? obj.raw : this.decryptBytes(obj.raw, ref, false, this.streamMethod(obj.dict)));
     }
     if (obj instanceof Dict) { const d = new Dict(); for (const [k, v] of obj.map) d.map.set(k, this.decryptObject(v, ref)); return d; }
     return obj;
+  }
+
+  /** Streams whose bytes are stored unencrypted: metadata when /EncryptMetadata is false, and Identity crypt filters. */
+  private streamInClear(dict: Dict): boolean {
+    return (isName(dict.get('Type'), 'Metadata') && !this.encryptMetadata) || this.hasIdentityCryptFilter(dict);
+  }
+  private streamMethod(dict: Dict): CryptMethod {
+    return this.embeddedMethod !== null && isName(dict.get('Type'), 'EmbeddedFile') ? this.embeddedMethod : this.method;
   }
 
   private hasIdentityCryptFilter(dict: Dict): boolean {
@@ -235,7 +249,8 @@ export class SecurityHandler {
     if (obj instanceof PdfStream) {
       if (isName(obj.dict.get('Type'), 'XRef')) return obj;
       const d = this.encryptObject(obj.dict, ref) as Dict;
-      const raw = this.encryptBytes(obj.raw, ref, false);
+      // The same exceptions as in decryptObject, so that what is written is what will be read back.
+      const raw = this.streamInClear(obj.dict) ? obj.raw : this.encryptBytes(obj.raw, ref, false, this.streamMethod(obj.dict));
       d.set('Length', raw.length);
       return new PdfStream(d, raw);
     }
@@ -273,4 +288,3 @@ function aesCbcDecryptNoPadZero(key: Uint8Array, data: Uint8Array): Uint8Array {
 function aesEcbEncrypt(key: Uint8Array, block: Uint8Array): Uint8Array {
   return aesCbcEncryptNoPad(key, new Uint8Array(16), block);
 }
-export const latin = latin1;
