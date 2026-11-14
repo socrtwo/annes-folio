@@ -1,0 +1,8 @@
+{
+  "name": "nanoid-compat",
+  "version": "1.0.0",
+  "description": "Local replacement for nanoid 2 used only by hunspell-asm and emscripten-wasm-loader: same call shape (nanoid(size) -> url-safe id), built on crypto.getRandomValues, without the code paths of the nanoid advisories.",
+  "license": "MIT",
+  "private": true,
+  "main": "index.js"
+}

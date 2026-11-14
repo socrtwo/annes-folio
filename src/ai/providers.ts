@@ -2,7 +2,8 @@
  * AI provider registry: where to sign up, where keys live, what is free, how to call it.
  *
  * Facts were checked in October 2026 (provider docs, SDK sources, a live CORS test against the
- * Gemini API, and the models.dev catalog). Provider consoles move pages often; every entry also
+ * Gemini API, and the models.dev catalog); default model ids and base URLs were re-checked against
+ * each provider's own docs on 14 November 2026. Provider consoles move pages often; every entry also
  * has a docs link, and model lists are fetched live after a key is added, so stale defaults
  * correct themselves.
  *
@@ -146,7 +147,7 @@ export const PROVIDERS: ProviderDef[] = [
     keyPattern: /\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{40,}|\bsk-[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20}\b/,
     links: { signup: 'https://platform.openai.com/signup', keys: 'https://platform.openai.com/api-keys', billing: 'https://platform.openai.com/settings/organization/billing', docs: 'https://platform.openai.com/docs' },
     free: 'paid', freeNote: 'Prepaid credits; no free tier.',
-    keyViewable: false, models: { fast: 'gpt-6-luna', quality: 'gpt-6.1-sol' }, cors: 'yes', vision: true, images: 'gpt-image-1', completionTokens: true,
+    keyViewable: false, models: { fast: 'gpt-6-luna', quality: 'gpt-6.1-sol' }, cors: 'yes', vision: true, images: 'gpt-image-2', completionTokens: true,
   },
   {
     id: 'anthropic', name: 'Anthropic (Claude)', kind: 'anthropic', baseUrl: 'https://api.anthropic.com/v1', needsKey: true,
@@ -160,7 +161,7 @@ export const PROVIDERS: ProviderDef[] = [
     keyPattern: /\bsk-[a-f0-9]{32}\b/,
     links: { signup: 'https://platform.deepseek.com/', keys: 'https://platform.deepseek.com/api_keys', billing: 'https://platform.deepseek.com/top_up', docs: 'https://api-docs.deepseek.com/' },
     free: 'paid', freeNote: 'Low-cost prepaid credits.',
-    keyViewable: false, models: { fast: 'deepseek-chat', quality: 'deepseek-reasoner' }, cors: 'yes',
+    keyViewable: false, models: { fast: 'deepseek-flash', quality: 'deepseek-v4-pro' }, cors: 'yes',
   },
   {
     id: 'xai', name: 'xAI (Grok)', kind: 'openai', baseUrl: 'https://api.x.ai/v1', needsKey: true,
@@ -202,7 +203,7 @@ export const PROVIDERS: ProviderDef[] = [
     keyPattern: /\bsk-[A-Za-z0-9]{40,}\b/,
     links: { signup: 'https://platform.moonshot.ai/', keys: 'https://platform.moonshot.ai/console/api-keys', billing: 'https://platform.moonshot.ai/console/pay', docs: 'https://platform.moonshot.ai/docs' },
     free: 'paid', freeNote: '$1 minimum top-up. Keys from the China site do not work on the international API.',
-    keyViewable: false, models: { fast: 'kimi-k2.6', quality: 'kimi-k3' }, cors: 'unknown',
+    keyViewable: false, models: { fast: 'kimi-k3', quality: 'kimi-k3' }, cors: 'unknown',
   },
   {
     id: 'qwen', name: 'Alibaba Cloud Model Studio (Qwen)', kind: 'openai', baseUrl: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1', needsKey: true,
@@ -223,8 +224,8 @@ export const PROVIDERS: ProviderDef[] = [
     keyPattern: /\b[A-Za-z0-9_-]{40}\b/, weakKey: true,
     fields: [{ key: 'accountId', label: 'Account ID', placeholder: '32-character account ID', help: 'Shown on the right of the Cloudflare dashboard overview.' }],
     links: { signup: 'https://dash.cloudflare.com/sign-up', keys: 'https://dash.cloudflare.com/profile/api-tokens', docs: 'https://developers.cloudflare.com/workers-ai/' },
-    free: 'free', freeNote: 'Free plan: 10,000 Neurons per day. Create an API token with the Workers AI permission.',
-    keyViewable: false, models: { fast: '@cf/zai-org/glm-5.3-flash', quality: '@cf/zai-org/glm-5.3' }, cors: 'no', notes: 'Browsers cannot call this API directly; it works in the Android, iOS and desktop apps.',
+    free: 'free', freeNote: 'Free plan: 10,000 Neurons per day (the quality model, GLM-5.3, needs the Workers Paid plan). Create an API token with the Workers AI permission.',
+    keyViewable: false, models: { fast: '@cf/qwen/qwen3.8-27b', quality: '@cf/zai-org/glm-5.3' }, cors: 'no', notes: 'Browsers cannot call this API directly; it works in the Android, iOS and desktop apps.',
   },
   {
     id: 'azure', name: 'Azure OpenAI / AI Foundry', kind: 'openai', baseUrl: 'https://{resource}.openai.azure.com/openai/v1', needsKey: true,
@@ -241,7 +242,7 @@ export const PROVIDERS: ProviderDef[] = [
     fields: [{ key: 'region', label: 'Region', placeholder: 'us-east-1' }],
     links: { signup: 'https://aws.amazon.com/bedrock/', keys: 'https://console.aws.amazon.com/bedrock/home#/api-keys', docs: 'https://docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html' },
     free: 'paid', freeNote: 'Paid AWS account. Use a Bedrock API key (long-term keys start with ABSK).',
-    keyViewable: false, models: { fast: 'openai.gpt-oss-20b', quality: 'us.anthropic.claude-sonnet-5-5' }, cors: 'unknown',
+    keyViewable: false, models: { fast: 'openai.gpt-oss-20b-1:0', quality: 'openai.gpt-oss-120b-1:0' }, cors: 'unknown',
   },
   {
     id: 'custom', name: 'Other OpenAI-compatible service', kind: 'openai', baseUrl: '', needsKey: true,

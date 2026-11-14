@@ -641,6 +641,7 @@ def([
         { key: 'autosave', label: 'AutoSave drafts', type: 'checkbox', value: p.autosave, half: true },
         { key: 'autosaveSeconds', label: 'Every (seconds)', type: 'number', value: p.autosaveSeconds, half: true },
         { key: 'confirmClose', label: 'Ask to save when closing', type: 'checkbox', value: p.confirmClose, half: true },
+        { key: 'checkUpdates', label: 'Check for a newer version when the app starts (asks GitHub at most once a day)', type: 'checkbox', value: !!p.checkUpdates },
         { key: 'printDpi', label: 'Print resolution (dpi)', type: 'number', min: 72, max: 600, value: p.printDpi, half: true },
         { key: 'h5', type: 'heading', label: 'Proofing and OCR' },
         { key: 'spellDialect', label: 'English spelling', type: 'select', options: SPELL_DIALECTS, value: p.spellDialect || 'any', half: true },
@@ -657,7 +658,7 @@ def([
         author: r.author || 'Author', initials: r.initials || (r.author || 'A')[0], theme: r.theme, uiScale: parseFloat(r.uiScale), qatPosition: r.qatPosition, qatLabels: r.qatLabels,
         viewMode: r.viewMode, defaultZoom: r.defaultZoom, showThumbnails: r.showThumbnails, smoothScroll: r.smoothScroll, renderDpiCap: Math.max(1, Math.min(4, +r.renderDpiCap || 2)), highlightFields: r.highlightFields,
         highlightColor: r.highlightColor, penColor: r.penColor, penWidth: Math.max(0.5, +r.penWidth || 2), noteColor: r.noteColor, stampOpacity: +r.stampOpacity || 0.85, measureUnit: r.measureUnit,
-        saveMode: r.saveMode, autosave: r.autosave, autosaveSeconds: Math.max(3, r.autosaveSeconds || 10), confirmClose: r.confirmClose, printDpi: Math.max(72, +r.printDpi || 150),
+        saveMode: r.saveMode, autosave: r.autosave, autosaveSeconds: Math.max(3, r.autosaveSeconds || 10), confirmClose: r.confirmClose, checkUpdates: !!r.checkUpdates, printDpi: Math.max(72, +r.printDpi || 150),
         spellDialect: r.spellDialect, ocrLanguage: String(r.ocrLanguage || 'eng').trim() || 'eng',
       });
       app.savePrefs();

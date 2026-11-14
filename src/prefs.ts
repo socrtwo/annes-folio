@@ -40,6 +40,8 @@ export interface Prefs {
   language: string;
   spellDialect: 'any' | 'document' | 'en-US' | 'en-GB' | 'en-CA' | 'en-AU';
   confirmClose: boolean;
+  /** Look for a newer release on GitHub when the app starts (installed apps only, at most daily). Off by default. */
+  checkUpdates: boolean;
   defaultSaveFormat: string;
   readAloudRate: number;
   highContrastUI: boolean;
@@ -111,7 +113,7 @@ export function defaultPrefs(): Prefs {
     replacements: { ...DEFAULT_REPLACEMENTS }, autoCorrect: true, autoCapitalize: true, smartQuotes: true, autoLists: true,
     theme: 'system', ribbon: 'full', spellcheck: true,
     recent: [], macros: [], dictionary: [], ignoredWords: [],
-    language: 'en-US', spellDialect: 'any', confirmClose: true, defaultSaveFormat: 'pdf', readAloudRate: 1,
+    language: 'en-US', spellDialect: 'any', confirmClose: true, checkUpdates: false, defaultSaveFormat: 'pdf', readAloudRate: 1,
     highContrastUI: false, uiScale: 1, pinnedCommands: [], firstRun: true, touchMode: false, miniToolbar: true,
     viewMode: 'continuous', defaultZoom: 'fit-width', showThumbnails: false, smoothScroll: true, nightMode: false, grayscale: false, renderDpiCap: 3,
     highlightColor: '#FFEB3B', penColor: '#E53935', penWidth: 2, noteColor: '#FFD54F', stampOpacity: 0.85, measureUnit: 'in',

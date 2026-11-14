@@ -13,6 +13,52 @@ async function open(url: string): Promise<void> {
   openExternal(url);
 }
 
+const LATEST_API = 'https://api.github.com/repos/socrtwo/annes-folio/releases/latest';
+const LAST_CHECK_KEY = 'quillfolio.updateCheckedAt';
+
+/** -1, 0 or 1 for two versions like "1.2.3" (a leading "v" and anything after "-" or "+" are ignored). */
+export function compareVersions(a: string, b: string): number {
+  const parts = (v: string) => v.replace(/^v/i, '').split(/[-+]/)[0].split('.').map((x) => parseInt(x, 10) || 0);
+  const x = parts(a), y = parts(b);
+  for (let i = 0; i < Math.max(x.length, y.length); i++) { const d = (x[i] || 0) - (y[i] || 0); if (d) return d > 0 ? 1 : -1; }
+  return 0;
+}
+
+/** The newest published (non-prerelease) release, from GitHub. Null when it cannot be read. */
+export async function latestRelease(fetcher: typeof fetch = fetch): Promise<{ version: string; url: string } | null> {
+  try {
+    const r = await fetcher(LATEST_API, { headers: { Accept: 'application/vnd.github+json' } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const tag = typeof j?.tag_name === 'string' ? j.tag_name : '';
+    if (!/^v?\d+(\.\d+)*/.test(tag)) return null;
+    const url = typeof j.html_url === 'string' && j.html_url.startsWith('https://github.com/') ? j.html_url : `${REPO}/releases/latest`;
+    return { version: tag.replace(/^v/i, ''), url };
+  } catch { return null; }
+}
+
+/** Asks GitHub for the newest release and tells the user. `quiet`: say nothing unless there is a newer one. */
+export async function checkForUpdates(quiet = false): Promise<void> {
+  try { localStorage.setItem(LAST_CHECK_KEY, String(Date.now())); } catch { /* storage off */ }
+  const rel = await latestRelease();
+  if (!rel) { if (!quiet) toast('Could not reach GitHub to look for a newer version.', { action: 'Releases page', onAction: () => void open(`${REPO}/releases/latest`) }); return; }
+  if (VERSION !== 'dev' && compareVersions(rel.version, VERSION) > 0) {
+    toast(`Anne's Folio ${rel.version} is available (this is ${VERSION}).`, { ms: 12000, action: 'Download', onAction: () => void open(rel.url) });
+  } else if (!quiet) toast(`This is the newest version (${VERSION}).`);
+}
+
+/**
+ * The start-up check, only when the user turned it on (Options ▸ Check for a newer version when the app
+ * starts; off by default, so the app contacts no server unasked), at most once a day, and only in the
+ * installed apps: the web build is served fresh by its host.
+ */
+export async function startupUpdateCheck(enabled: boolean, installed: boolean): Promise<void> {
+  if (!enabled || !installed || VERSION === 'dev') return;
+  let last = 0; try { last = +(localStorage.getItem(LAST_CHECK_KEY) || 0); } catch { /* storage off */ }
+  if (Date.now() - last < 86400000) return;
+  await checkForUpdates(true);
+}
+
 def([
   {
     id: 'help.help', label: 'Help', icon: 'help', tab: 'Help', group: 'Help', keys: ['F1'], edits: false, noRecord: true,
@@ -32,7 +78,7 @@ def([
   { id: 'help.tour', label: 'Tour', icon: 'tour', tab: 'Help', group: 'Help', edits: false, noRecord: true, run: (app) => app.ui.tour() },
   { id: 'help.whatsNew', label: "What's New", icon: 'new_releases', tab: 'Help', group: 'Help', edits: false, noRecord: true, run: () => open(`${REPO}/releases`) },
   { id: 'help.feedback', label: 'Report a Problem / Feedback', icon: 'feedback', tab: 'Help', group: 'Help', edits: false, noRecord: true, run: () => open(`${REPO}/issues/new/choose`) },
-  { id: 'help.updates', label: 'Check for Updates', icon: 'system_update', tab: 'Help', group: 'Help', edits: false, noRecord: true, tip: 'Open the releases page to compare with this version', run: () => open(`${REPO}/releases/latest`) },
+  { id: 'help.updates', label: 'Check for Updates', icon: 'system_update', tab: 'Help', group: 'Help', edits: false, noRecord: true, tip: 'Ask GitHub for the newest release and compare it with this version (sends nothing about you or your documents)', run: () => checkForUpdates(false) },
   {
     id: 'help.notices', label: 'Third-Party Notices', icon: 'gavel', tab: 'Help', group: 'Help', edits: false, noRecord: true,
     run: async () => {

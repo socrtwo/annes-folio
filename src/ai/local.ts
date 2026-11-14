@@ -14,11 +14,13 @@ import { AiError } from './errors';
 export interface LocalModel { id: string; label: string; size: string; note: string; bytes: number; revision?: string }
 
 const MB = 1048576;
+// Each model is pinned to the Hub commit it was checked against (2026-11-14: the ONNX files the worker asks for are present),
+// so a later change to a model repository cannot change what the app downloads and runs.
 export const LOCAL_MODELS: LocalModel[] = [
-  { id: 'onnx-community/Qwen2.5-0.5B-Instruct', label: 'Qwen2.5 0.5B Instruct (recommended)', size: '≈ 480–510 MB', note: 'Best quality for its size; handles many languages.', bytes: 510 * MB },
-  { id: 'HuggingFaceTB/SmolLM2-360M-Instruct', label: 'SmolLM2 360M Instruct (smallest download)', size: '≈ 270–365 MB', note: 'Fastest on older phones; English-centric.', bytes: 365 * MB },
-  { id: 'onnx-community/gemma-3-270m-it-ONNX', label: 'Gemma 3 270M IT', size: '≈ 270–545 MB', note: 'Very small; simple rewrites and summaries.', bytes: 545 * MB },
-  { id: 'onnx-community/Llama-3.2-1B-Instruct-q4f16', label: 'Llama 3.2 1B Instruct (needs WebGPU)', size: '≈ 1.24 GB', note: 'Noticeably better writing; only for devices with WebGPU and plenty of storage.', bytes: 1270 * MB },
+  { id: 'onnx-community/Qwen2.5-0.5B-Instruct', label: 'Qwen2.5 0.5B Instruct (recommended)', size: '≈ 480–510 MB', note: 'Best quality for its size; handles many languages.', bytes: 510 * MB, revision: '22942cb7d7ba4cc81bb4673549ca4d4614469b5e' },
+  { id: 'HuggingFaceTB/SmolLM2-360M-Instruct', label: 'SmolLM2 360M Instruct (smallest download)', size: '≈ 270–365 MB', note: 'Fastest on older phones; English-centric.', bytes: 365 * MB, revision: 'a10cc1512eabd3dde888204e902eca88bddb4951' },
+  { id: 'onnx-community/gemma-3-270m-it-ONNX', label: 'Gemma 3 270M IT', size: '≈ 270–545 MB', note: 'Very small; simple rewrites and summaries.', bytes: 545 * MB, revision: '2dbbfdb1b59bd034eb959428c6a7da9dd7ea27f0' },
+  { id: 'onnx-community/Llama-3.2-1B-Instruct-q4f16', label: 'Llama 3.2 1B Instruct (needs WebGPU)', size: '≈ 1.24 GB', note: 'Noticeably better writing; only for devices with WebGPU and plenty of storage.', bytes: 1270 * MB, revision: '1089a6ec8011cc0acc4eacd544ced5cd4f524ab0' },
 ];
 
 const MODEL_CACHE = 'transformers-cache';

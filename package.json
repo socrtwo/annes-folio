@@ -54,6 +54,7 @@
     "hunspell-asm": "^4.0.2",
     "jszip": "^3.10.2",
     "material-symbols": "^0.48.0",
+    "nanoid": "file:vendor/nanoid-compat",
     "nspell": "^2.1.5",
     "pdfjs-dist": "^6.4.299",
     "tesseract.js": "^7.0.0",
@@ -61,7 +62,13 @@
   },
   "overrides": {
     "sharp": "^0.35.5",
-    "adm-zip": "^0.6.1"
+    "adm-zip": "^0.6.1",
+    "hunspell-asm": {
+      "nanoid": "$nanoid"
+    },
+    "emscripten-wasm-loader": {
+      "nanoid": "$nanoid"
+    }
   },
   "devDependencies": {
     "@capacitor/cli": "^8.5.3",

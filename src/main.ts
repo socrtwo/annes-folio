@@ -12,6 +12,7 @@ import { launchFile, onFileOpened, onBackButton, isNative, isDesktop, isCapacito
 import { closeMenus, inDialog, toast } from './ui/dialog';
 import { allCommands, getCommand } from './commands/registry';
 import { installScrollCues } from './ui/scrollcue';
+import { startupUpdateCheck } from './commands/help';
 
 installFonts();
 
@@ -107,6 +108,8 @@ async function start() {
   if (drafts.length) toast(`${drafts.length} unsaved document(s) can be recovered.`, { action: 'Recover', onAction: () => app.exec('file.recoverUnsaved'), ms: 8000 });
   if (app.prefs.firstRun && !openedAny) setTimeout(() => { if (!openedAny) void app.ui.tour(); }, 600);
   app.focus();
+  // Off unless the user turned it on in Options; installed apps only (a hosted web copy is always current).
+  setTimeout(() => { void startupUpdateCheck(!!app.prefs.checkUpdates, isDesktop() || isCapacitor()); }, 5000);
 }
 void start();
 

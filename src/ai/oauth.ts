@@ -3,10 +3,12 @@
  * browser and OpenRouter hands back a code that Anne's Folio exchanges for an API key. No
  * copying or pasting.
  *
- * OpenRouter accepts https callbacks and http://localhost / 127.0.0.1 on any port.
+ * OpenRouter accepts https callbacks and http://localhost on any port (its OAuth PKCE guide, checked
+ * 2026-11-14, documents localhost; 127.0.0.1 is not mentioned, so the callback is written as localhost).
  *  - Browser build: the callback is this page (opened in a new tab), which finishes the
  *    exchange and tells the original tab through BroadcastChannel.
- *  - Android and desktop: the native bridge listens once on http://127.0.0.1:<port>/ and passes the
+ *  - Android and desktop: the native bridge listens once on 127.0.0.1:<port> (where browsers send
+ *    localhost; they fall back to it from ::1) and passes the
  *    redirect to the app.
  *  - iOS app: not available (the app has no address OpenRouter can redirect to); signInAvailable()
  *    is false and the wizard offers pasting a key instead.
@@ -106,7 +108,7 @@ export async function startOpenRouterSignIn(timeoutMs = 10 * 60 * 1000): Promise
   if (isNative()) {
     const path = `/callback/${nonce}`;
     const port = await startOAuthLoopback(timeoutMs, '<!doctype html><meta name="viewport" content="width=device-width"><body style="font:16px system-ui;padding:24px;text-align:center"><h2>Signed in</h2><p>Anne\'s Folio received your OpenRouter key. You can close this tab and return to Anne\'s Folio.</p></body>', path);
-    callback = `http://127.0.0.1:${port}${path}`;
+    callback = `http://localhost:${port}${path}`;
     const h = await onOAuthCallback((url) => {
       if (!isOurCallback(url, path)) return;
       const err = new URL(url).searchParams.get('error');

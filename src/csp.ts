@@ -31,9 +31,10 @@ export const CSP_POLICY = [
 ].join('; ');
 
 /**
- * Whether to insert the policy. Not under Electron (it sends the header), and only on engines that know
- * 'wasm-unsafe-eval': Chromium 97+, Safari/iOS 16+, Firefox 102+. On anything older or unrecognized the
- * policy would stop WebAssembly (rendering, spelling, OCR), so none is set.
+ * Whether the engine takes the full policy: not under Electron (it sends the header), and only engines that
+ * know 'wasm-unsafe-eval': Chromium 97+, Safari/iOS 16+, Firefox 102+. Older or unrecognized engines get
+ * CSP_POLICY_LEGACY instead (see cspLevel), because this one would stop their WebAssembly (rendering,
+ * spelling, OCR).
  */
 export function shouldApplyCsp(userAgent: string, isElectron: boolean): boolean {
   const ua = String(userAgent || '');
@@ -53,19 +54,33 @@ export function shouldApplyCsp(userAgent: string, isElectron: boolean): boolean 
 }
 
 /**
+ * The policy for engines that predate 'wasm-unsafe-eval' (Chromium < 97, Safari/iOS < 16, Firefox < 102, and
+ * engines this file does not recognise). They only run WebAssembly under 'unsafe-eval', so that takes its
+ * place. Everything else stays: inline and injected scripts are still refused, which is what keeps markup
+ * from a document from running.
+ */
+export const CSP_POLICY_LEGACY = CSP_POLICY.replace("'wasm-unsafe-eval'", "'unsafe-eval'");
+
+/** Which policy to insert: none under Electron (it sends its own header), the legacy one on older engines. */
+export function cspLevel(userAgent: string, isElectron: boolean): 'modern' | 'legacy' | 'none' {
+  if (isElectron || /\bElectron\//.test(String(userAgent || ''))) return 'none';
+  return shouldApplyCsp(userAgent, false) ? 'modern' : 'legacy';
+}
+
+/**
  * The policy for a page address. On http(s) it is CSP_POLICY as written. An app served from its own scheme
  * (the iOS app: capacitor://localhost) also gets that origin spelled out next to every 'self', because
  * engines differ on whether 'self' covers a custom scheme. Null for file: pages, which have no origin to allow.
  */
-export function cspFor(loc: { protocol: string; host: string }): string | null {
-  if (loc.protocol === 'http:' || loc.protocol === 'https:') return CSP_POLICY;
+export function cspFor(loc: { protocol: string; host: string }, base: string = CSP_POLICY): string | null {
+  if (loc.protocol === 'http:' || loc.protocol === 'https:') return base;
   if (loc.protocol === 'file:' || !loc.host || !/^[a-z][a-z0-9+.-]*:$/i.test(loc.protocol)) return null;
-  return CSP_POLICY.replace(/'self'/g, `'self' ${loc.protocol}//${loc.host}`);
+  return base.replace(/'self'/g, `'self' ${loc.protocol}//${loc.host}`);
 }
 
 /** Inserts the policy as the first element of <head>. False when the document already carries one or the page has no origin. */
-export function installCsp(doc: Document = document, loc: { protocol: string; host: string } = doc.defaultView?.location || { protocol: 'https:', host: '' }): boolean {
-  const policy = cspFor(loc);
+export function installCsp(doc: Document = document, loc: { protocol: string; host: string } = doc.defaultView?.location || { protocol: 'https:', host: '' }, base: string = CSP_POLICY): boolean {
+  const policy = cspFor(loc, base);
   if (!policy || doc.querySelector('meta[http-equiv="Content-Security-Policy" i]')) return false;
   const meta = doc.createElement('meta');
   meta.httpEquiv = 'Content-Security-Policy';
@@ -75,4 +90,7 @@ export function installCsp(doc: Document = document, loc: { protocol: string; ho
 }
 
 // The development server needs inline modules and a WebSocket for hot reload, so the policy is for built pages only.
-if (typeof document !== 'undefined' && typeof navigator !== 'undefined' && !import.meta.env?.DEV && shouldApplyCsp(navigator.userAgent, !!(window as any).quillDesktop)) installCsp();
+if (typeof document !== 'undefined' && typeof navigator !== 'undefined' && !import.meta.env?.DEV) {
+  const level = cspLevel(navigator.userAgent, !!(window as any).quillDesktop);
+  if (level !== 'none') installCsp(document, location, level === 'modern' ? CSP_POLICY : CSP_POLICY_LEGACY);
+}
