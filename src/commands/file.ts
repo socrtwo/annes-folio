@@ -125,9 +125,16 @@ const AUTO_SNAPSHOT = 'Saved';
 async function snapshot(tab: DocTab, label: string, bytes: Uint8Array = tab.bytes): Promise<boolean> {
   const prefix = `snap:${docKey(tab)}:`;
   return stored('snapshot', async () => {
-    await kvSet(`${prefix}${Date.now()}`, { label, bytes: bufferOf(bytes), when: Date.now(), name: tab.displayName });
+    const when = Date.now(), key = `${prefix}${when}`;
+    await kvSet(key, { label, bytes: bufferOf(bytes), when, name: tab.displayName });
+    // A small record beside the bytes, so listing and pruning snapshots does not read every stored copy of the file.
+    const metaKey = (k: string) => 'snapmeta:' + k.slice(5);
+    await kvSet(metaKey(key), { label, when, name: tab.displayName });
     const keys = (await kvKeys(prefix)).filter((k) => /^\d+$/.test(k.slice(prefix.length))).sort((a, b) => +a.slice(prefix.length) - +b.slice(prefix.length));
-    for (const k of keys.slice(0, Math.max(0, keys.length - SNAPSHOTS_KEPT))) { const v = await kvGet(k); if (!v || v.label === AUTO_SNAPSHOT) await kvDel(k); }
+    for (const k of keys.slice(0, Math.max(0, keys.length - SNAPSHOTS_KEPT))) {
+      const v = (await kvGet(metaKey(k)).catch(() => undefined)) || (await kvGet(k));
+      if (!v || v.label === AUTO_SNAPSHOT) { await kvDel(k); await kvDel(metaKey(k)); }
+    }
   });
 }
 

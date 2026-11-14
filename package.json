@@ -11,7 +11,7 @@
   "scripts": {
     "dev": "vite",
     "prebuild": "node scripts/gen-notices.mjs && node scripts/copy-pdfjs.mjs",
-    "build": "vite build",
+    "build": "vite build && node scripts/gen-sw-precache.mjs",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
