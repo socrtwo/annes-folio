@@ -172,29 +172,45 @@ The `.aab` is for Google Play only; it cannot be installed directly.
   (`res/xml/data_extraction_rules.xml`, `res/xml/backup_rules.xml`).
 - **Print** goes through Android's print service, which also offers *Save as PDF*.
 - **Share** sends the exported file to any app via the share sheet.
+- **AI sign-in (OpenRouter):** while the app waits for the browser to send you back, it runs a short
+  foreground service (`LoopbackService`) with a "Waiting for sign-in" notification, so that Android 14
+  and later do not freeze the app and its sign-in listener while the browser is in front. On Android 14+
+  it is a `shortService` (about three minutes; it stops itself when that time is up); on older versions a
+  plain foreground service. It stops when the browser returns, when sign-in is cancelled and when the
+  listener times out. It needs only the `FOREGROUND_SERVICE` permission; without the notification
+  permission Android still runs it, and it shows in the Task Manager (active apps) instead of the
+  notification drawer.
 - The activity is `singleTask`, so opening another file while Anne's Folio runs delivers it to the running
   instance (`fileOpened` event).
 
 ## Native plugin API (`QuillNative`)
 
 Implemented in `android/app/src/main/java/io/github/socrtwo/quillfolio/QuillNativePlugin.java`,
-registered in `MainActivity`, consumed by `src/platform/native.ts`. All file contents cross the bridge as
-base64 strings (no line breaks); `data:` URL prefixes are tolerated on input.
+registered in `MainActivity`, consumed by `src/platform/native.ts`.
+
+File contents are not passed to the page as one string. A file the plugin reads is copied (streamed) to
+`cache/opened/<random>.bin`, and the result carries its `path` and `size`; the page reads it with
+`fetch(Capacitor.convertFileSrc(path))` and then calls `releaseFile`. Copies the page did not release are
+deleted at the next start. Files the page sends are either `data`, a base64 string (no line breaks;
+`data:` URL prefixes are tolerated), or, above 4 MB, `path`: a file the page wrote in `cache/outgoing/`
+with the Filesystem plugin in 3 MB chunks, which the plugin streams to the destination and deletes. Only
+files directly in those two folders are accepted as `path`.
 
 | Method | Arguments | Resolves with |
 | --- | --- | --- |
-| `openDocument` | `{ mimeTypes: string[] }` | `{ uri, name, mime, data }` or `{ canceled: true }` |
-| `saveAs` | `{ name, mime, data }` | `{ uri, name }` or `{ canceled: true }` |
-| `writeUri` | `{ uri, data }` | `{ ok: true }` (rejects with a message on failure) |
-| `readUri` | `{ uri }` | `{ uri, name, mime, data }` |
+| `openDocument` | `{ mimeTypes: string[] }` | `{ uri, name, mime, path, size }` or `{ canceled: true }` |
+| `saveAs` | `{ name, mime, data }` or `{ name, mime, path }` | `{ uri, name }` or `{ canceled: true }` |
+| `writeUri` | `{ uri, data }` or `{ uri, path }` | `{ ok: true }` (rejects with a message on failure) |
+| `readUri` | `{ uri }` | `{ uri, name, mime, path, size }` |
+| `releaseFile` | `{ path }` | nothing; deletes a copy in `cache/opened/` |
 | `print` | `{ jobName }` | nothing (print dialog shown) |
-| `share` | `{ name, mime, data, title? }` | nothing (share sheet shown) |
-| `getLaunchFile` | - | `{ uri, name, mime, data }`, or `{}` if the app was not opened with a file. Consumed once. Text shared without a file arrives as `{ name: "….txt", mime: "text/plain", data }` with no `uri`. When several files were shared at once, the others follow as `fileOpened` events. |
+| `share` | `{ name, mime, data, title? }` or `{ name, mime, path, title? }` | nothing (share sheet shown) |
+| `getLaunchFile` | - | `{ uri, name, mime, path, size }`, or `{}` if the app was not opened with a file. Consumed once. Text shared without a file arrives as `{ name: "….txt", mime: "text/plain", data }` with no `uri`. When several files were shared at once, the others follow as `fileOpened` events. |
 | `keepAwake` | `{ on: boolean }` | nothing |
 | event `fileOpened` | - | same payload as `getLaunchFile`, for files opened/shared while the app is running (kept until a listener subscribes) |
 | `secureSet` / `secureGet` / `secureRemove` | `{ key, value }` / `{ key }` / `{ key }` | nothing / `{ value }` / nothing. API keys, AES-256-GCM with a key in the Android Keystore |
 | `readClipboard` / `writeClipboard` | - / `{ text, sensitive? }` | `{ text }` / nothing |
-| `startLoopback` / `stopLoopback` | `{ timeoutMs, successHtml?, path? }` / - | `{ port }` / nothing; event `oauthCallback` `{ url }` for the sign-in redirect |
+| `startLoopback` / `stopLoopback` | `{ timeoutMs, successHtml?, path? }` / - | `{ port }` / nothing; event `oauthCallback` `{ url }` for the sign-in redirect. The listener is on 127.0.0.1 (what `localhost` in the redirect address resolves to) and runs inside `LoopbackService` while it waits |
 
 Notes:
 
@@ -202,10 +218,12 @@ Notes:
   the returned `uri` keeps working for `writeUri` / `readUri` after restarts. URIs from "Open with" may
   be read-only or temporary; if `writeUri` rejects, fall back to `saveAs`.
 - Writes use mode `"wt"` (truncate), falling back to `"w"` for providers that do not support it.
-- File I/O runs on a background thread; very large documents are limited by memory because they are
-  passed to the WebView as one base64 string: files over 64 MB are refused, and a smaller file that
-  still does not fit in the device's memory is reported as too large instead of closing the app.
-  (The desktop app passes bytes instead and has no such limit.)
+- File I/O runs on a background thread. Files up to 1 GB open: the copy to the cache is streamed, so the
+  native side never holds the whole file, but the page holds it once in the WebView's memory, plus what
+  the PDF engine builds from it, and beyond 1 GB that does not fit in a phone's WebView. Larger files are
+  refused with a message before the cache fills up. A file that fits the limit but not the device's
+  memory can still fail to open in the page.
+  (The desktop app passes bytes and has no such limit.)
 
 ## App icon
 

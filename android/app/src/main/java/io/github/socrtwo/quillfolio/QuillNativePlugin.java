@@ -31,8 +31,8 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.ActivityCallback;
 import com.getcapacitor.annotation.CapacitorPlugin;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -41,27 +41,34 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
  * Native file plumbing for Anne's Folio on Android.
  *
- * JS contract (all binary payloads are base64 strings without line breaks):
+ * JS contract. Files read for the page are not sent over the bridge: they are copied (streamed) to
+ * cache/opened/, and the page fetches them through the WebView's local server
+ * (Capacitor.convertFileSrc(path)), then calls releaseFile. Files the page sends are either a base64
+ * string ({@code data}, no line breaks) or, for large ones, a file the page wrote in cache/outgoing/ with the
+ * Filesystem plugin ({@code path}), streamed from there and deleted.
  * <ul>
- *   <li>openDocument({mimeTypes: string[]}) -> {uri, name, mime, data} | {canceled: true}</li>
- *   <li>saveAs({name, mime, data}) -> {uri, name} | {canceled: true}</li>
- *   <li>writeUri({uri, data}) -> {ok: true}</li>
- *   <li>readUri({uri}) -> {uri, name, mime, data}</li>
+ *   <li>openDocument({mimeTypes: string[]}) -> {uri, name, mime, path, size} | {canceled: true}</li>
+ *   <li>saveAs({name, mime, data | path}) -> {uri, name} | {canceled: true}</li>
+ *   <li>writeUri({uri, data | path}) -> {ok: true}</li>
+ *   <li>readUri({uri}) -> {uri, name, mime, path, size}</li>
+ *   <li>releaseFile({path}) -> void: deletes a cache copy the page has read</li>
  *   <li>print({jobName}) -> void</li>
- *   <li>share({name, mime, data, title}) -> void</li>
- *   <li>getLaunchFile() -> {uri?, name, mime, data} | {} (consumed once; when several files were shared at once,
- *       the others follow as "fileOpened" events)</li>
+ *   <li>share({name, mime, data | path, title}) -> void</li>
+ *   <li>getLaunchFile() -> {uri?, name, mime, path, size} | {} (consumed once; when several files were shared at
+ *       once, the others follow as "fileOpened" events; shared plain text comes as {name, mime, data})</li>
  *   <li>keepAwake({on: boolean}) -> void</li>
  *   <li>event "fileOpened" -> same payload as getLaunchFile, for files opened while running</li>
  *   <li>secureSet({key, value}) / secureGet({key}) -> {value} / secureRemove({key}): Keystore-encrypted secrets</li>
  *   <li>readClipboard() -> {text} / writeClipboard({text, sensitive})</li>
- *   <li>startLoopback({timeoutMs, successHtml, path}) -> {port}; event "oauthCallback" {url} (requests for path only); stopLoopback()</li>
+ *   <li>startLoopback({timeoutMs, successHtml, path}) -> {port}; event "oauthCallback" {url} (requests for path only); stopLoopback().
+ *       While it waits, {@link LoopbackService} keeps the app in the foreground state so Android does not freeze the listener.</li>
  * </ul>
  * Only content: URIs of other apps' providers are read or written (see {@link #isAllowedUri}).
  */
@@ -72,13 +79,21 @@ public class QuillNativePlugin extends Plugin {
     private static final String EVENT_FILE_OPENED = "fileOpened";
     private static final String SHARE_DIR = "shared";
     private static final long SHARE_FILE_MAX_AGE_MS = 24L * 60L * 60L * 1000L;
+    /** Cache copies of opened files, waiting for the page to fetch them; emptied at every start. */
+    private static final String OPENED_DIR = "opened";
+    /** Files the page wrote for saving or sharing (Filesystem plugin, Directory.Cache); emptied at every start. */
+    private static final String OUTGOING_DIR = "outgoing";
 
     /** Single background thread for file I/O so large documents never block the UI or the plugin queue. */
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     /** Large payloads waiting for an activity result, kept out of the call's saved state. */
     private static final java.util.Map<String, String> pendingData = new java.util.concurrent.ConcurrentHashMap<>();
-    /** Largest file read into memory (bytes); bigger files are refused instead of crashing. */
-    private static final long MAX_READ_BYTES = 64L * 1024L * 1024L;
+    /**
+     * Largest file opened (bytes). The copy is streamed, so this is not a limit of the native side: the page
+     * holds the whole file in the WebView's memory once, plus what the PDF engine builds from it, and beyond
+     * 1 GB that does not fit in a phone's WebView process. Bigger files are refused before the cache fills up.
+     */
+    private static final long MAX_READ_BYTES = 1024L * 1024L * 1024L;
 
     private AiSupport.Loopback loopback;
 
@@ -86,10 +101,21 @@ public class QuillNativePlugin extends Plugin {
     private boolean launchFileConsumed = false;
 
     @Override
+    public void load() {
+        // Copies left by the last run (the app was closed before the page read them, or a save failed).
+        final File cache = getContext().getCacheDir();
+        io.execute(() -> {
+            deleteFilesIn(new File(cache, OPENED_DIR));
+            deleteFilesIn(new File(cache, OUTGOING_DIR));
+        });
+    }
+
+    @Override
     protected void handleOnDestroy() {
         if (loopback != null) {
             loopback.stop();
         }
+        LoopbackService.stop();
         io.shutdown();
         super.handleOnDestroy();
     }
@@ -205,8 +231,10 @@ public class QuillNativePlugin extends Plugin {
             if (loopback != null) {
                 loopback.stop();
             }
+            final AiSupport.Loopback lb;
             try {
-                loopback = new AiSupport.Loopback(timeoutMs, html, path, (url) -> {
+                lb = new AiSupport.Loopback(timeoutMs, html, path, (url) -> {
+                    LoopbackService.stop();
                     JSObject ev = new JSObject();
                     ev.put("url", url);
                     notifyListeners("oauthCallback", ev, true);
@@ -215,9 +243,24 @@ public class QuillNativePlugin extends Plugin {
                 call.reject("Could not start the sign-in listener: " + e.getMessage(), asException(e));
                 return;
             }
-            Thread t = new Thread(loopback, "quillfolio-oauth");
+            loopback = lb;
+            Thread t = new Thread(() -> {
+                try {
+                    lb.run();
+                } finally {
+                    // Timed out or stopped. A listener that replaced this one keeps the service.
+                    synchronized (QuillNativePlugin.this) {
+                        if (loopback == lb || loopback == null) {
+                            LoopbackService.stop();
+                        }
+                    }
+                }
+            }, "quillfolio-oauth");
             t.setDaemon(true);
             t.start();
+            // Android 14+ freezes apps in the background: while the browser is in front, the listener
+            // would not answer the redirect. A short foreground service keeps the app running meanwhile.
+            LoopbackService.start(getContext());
             JSObject ret = new JSObject();
             ret.put("port", loopback.port());
             call.resolve(ret);
@@ -232,6 +275,7 @@ public class QuillNativePlugin extends Plugin {
                 loopback = null;
             }
         }
+        LoopbackService.stop();
         call.resolve();
     }
 
@@ -279,8 +323,8 @@ public class QuillNativePlugin extends Plugin {
     public void saveAs(PluginCall call) {
         String name = call.getString("name", "Untitled");
         String mime = call.getString("mime", "application/octet-stream");
-        if (call.getString("data") == null) {
-            call.reject("saveAs requires 'data'");
+        if (call.getString("data") == null && call.getString("path") == null) {
+            call.reject("saveAs requires 'data' or 'path'");
             return;
         }
         Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT);
@@ -289,8 +333,11 @@ public class QuillNativePlugin extends Plugin {
         intent.putExtra(Intent.EXTRA_TITLE, name);
         // Capacitor parcels the call's data into onSaveInstanceState while the picker is up;
         // a large base64 document there exceeds the 1 MB binder limit (TransactionTooLargeException).
-        pendingData.put(call.getCallbackId(), call.getString("data"));
-        call.getData().remove("data");
+        // A staged file ('path') is a short string and stays in the call.
+        if (call.getString("data") != null) {
+            pendingData.put(call.getCallbackId(), call.getString("data"));
+            call.getData().remove("data");
+        }
         try {
             startActivityForResult(call, intent, "saveResult");
         } catch (ActivityNotFoundException e) {
@@ -306,18 +353,22 @@ public class QuillNativePlugin extends Plugin {
         }
         final Uri uri = resultUri(result);
         final String data = pendingData.remove(call.getCallbackId());
+        final String staged = call.getString("path");
         if (uri == null) {
+            if (staged != null) {
+                deleteStaged(staged);
+            }
             resolveCanceled(call);
             return;
         }
-        if (data == null) {
+        if (data == null && staged == null) {
             // The app process was recreated while the picker was open.
             call.reject("The document was not kept while the file picker was open. Please save again.");
             return;
         }
         io.execute(() -> {
             try {
-                writeBytes(uri, decodeBase64(data));
+                writePayload(uri, data, staged);
                 takePersistablePermission(uri);
                 String name = queryDisplayName(uri);
                 JSObject ret = new JSObject();
@@ -334,8 +385,9 @@ public class QuillNativePlugin extends Plugin {
     public void writeUri(PluginCall call) {
         final String uriString = call.getString("uri");
         final String data = call.getString("data");
-        if (uriString == null || uriString.isEmpty() || data == null) {
-            call.reject("writeUri requires 'uri' and 'data'");
+        final String staged = call.getString("path");
+        if (uriString == null || uriString.isEmpty() || (data == null && staged == null)) {
+            call.reject("writeUri requires 'uri' and 'data' or 'path'");
             return;
         }
         if (!isAllowedUri(Uri.parse(uriString))) {
@@ -344,7 +396,7 @@ public class QuillNativePlugin extends Plugin {
         }
         io.execute(() -> {
             try {
-                writeBytes(Uri.parse(uriString), decodeBase64(data));
+                writePayload(Uri.parse(uriString), data, staged);
                 JSObject ret = new JSObject();
                 ret.put("ok", true);
                 call.resolve(ret);
@@ -371,6 +423,19 @@ public class QuillNativePlugin extends Plugin {
             } catch (Throwable e) {
                 call.reject("Could not read document: " + e.getMessage(), asException(e));
             }
+        });
+    }
+
+    /** Deletes the cache copy of an opened file once the page has read it. Only files in cache/opened/. */
+    @PluginMethod
+    public void releaseFile(PluginCall call) {
+        final String path = call.getString("path");
+        io.execute(() -> {
+            File f = cacheChild(OPENED_DIR, path);
+            if (f != null && f.isFile() && !f.delete()) {
+                Log.w(TAG, "Could not delete " + f.getName());
+            }
+            call.resolve();
         });
     }
 
@@ -408,9 +473,10 @@ public class QuillNativePlugin extends Plugin {
         final String name = sanitizeFileName(call.getString("name", "document"));
         final String mime = call.getString("mime", "application/octet-stream");
         final String data = call.getString("data");
+        final String staged = call.getString("path");
         final String title = call.getString("title", name);
-        if (data == null) {
-            call.reject("share requires 'data'");
+        if (data == null && staged == null) {
+            call.reject("share requires 'data' or 'path'");
             return;
         }
         io.execute(() -> {
@@ -422,8 +488,22 @@ public class QuillNativePlugin extends Plugin {
                 }
                 pruneOldShares(dir);
                 File file = new File(dir, name);
-                try (FileOutputStream out = new FileOutputStream(file)) {
-                    out.write(decodeBase64(data));
+                if (staged != null) {
+                    File src = cacheChild(OUTGOING_DIR, staged);
+                    if (src == null || !src.isFile()) {
+                        throw new IOException("The file to share is missing");
+                    }
+                    if (!src.renameTo(file)) {
+                        try (InputStream in = new FileInputStream(src)) {
+                            copyToFile(in, file, Long.MAX_VALUE);
+                        } finally {
+                            deleteStaged(staged);
+                        }
+                    }
+                } else {
+                    try (FileOutputStream out = new FileOutputStream(file)) {
+                        out.write(decodeBase64(data));
+                    }
                 }
                 Uri uri = FileProvider.getUriForFile(context, context.getPackageName() + ".fileprovider", file);
 
@@ -666,19 +746,117 @@ public class QuillNativePlugin extends Plugin {
         ret.put("uri", uri.toString());
         ret.put("name", name);
         ret.put("mime", resolveMime(resolver, uri, name, hintMime));
+        // Streamed to a cache file that the page fetches: the contents never cross the bridge as a string.
+        File dir = new File(getContext().getCacheDir(), OPENED_DIR);
+        if (!dir.isDirectory() && !dir.mkdirs()) {
+            throw new IOException("Cannot create " + dir.getAbsolutePath());
+        }
+        File copy = new File(dir, UUID.randomUUID().toString() + ".bin");
+        long size;
         try (InputStream in = resolver.openInputStream(uri)) {
             if (in == null) {
                 throw new IOException("Unable to open " + uri);
             }
-            // The file crosses to the web app as one base64 string, so it is held in memory several times over.
-            ret.put("data", Base64.encodeToString(readAll(in), Base64.NO_WRAP));
-        } catch (OutOfMemoryError e) {
-            throw new IOException("The file is too large for this device's memory");
+            size = copyToFile(in, copy, MAX_READ_BYTES);
         }
+        ret.put("path", copy.getAbsolutePath());
+        ret.put("size", size);
         return ret;
     }
 
+    /** Writes the page's payload: base64 {@code data}, or the staged file {@code path} (streamed, then deleted). */
+    private void writePayload(Uri uri, String data, String staged) throws IOException {
+        if (staged == null) {
+            writeBytes(uri, decodeBase64(data));
+            return;
+        }
+        File src = cacheChild(OUTGOING_DIR, staged);
+        if (src == null || !src.isFile()) {
+            throw new IOException("The file to save is missing");
+        }
+        try (InputStream in = new FileInputStream(src); OutputStream out = openForWriting(uri)) {
+            byte[] buffer = new byte[64 * 1024];
+            int read;
+            while ((read = in.read(buffer)) != -1) {
+                out.write(buffer, 0, read);
+            }
+            out.flush();
+        } finally {
+            deleteStaged(staged);
+        }
+    }
+
+    /**
+     * The file {@code path} names (an absolute path or a file: URL) when it lies directly in cache/{@code dir}/,
+     * else null: the page cannot make the plugin read, write or delete anything else.
+     */
+    private File cacheChild(String dir, String path) {
+        if (path == null || path.isEmpty()) {
+            return null;
+        }
+        try {
+            String p = path.startsWith("file:") ? Uri.parse(path).getPath() : path;
+            if (p == null) {
+                return null;
+            }
+            File f = new File(p).getCanonicalFile();
+            File parent = new File(getContext().getCacheDir(), dir).getCanonicalFile();
+            return parent.equals(f.getParentFile()) ? f : null;
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    private void deleteStaged(String path) {
+        File f = cacheChild(OUTGOING_DIR, path);
+        if (f != null && f.isFile() && !f.delete()) {
+            Log.w(TAG, "Could not delete " + f.getName());
+        }
+    }
+
+    /** Copies a stream to a file, at most {@code max} bytes; a partial copy is deleted. Returns the size. */
+    private static long copyToFile(InputStream in, File dest, long max) throws IOException {
+        long total = 0;
+        boolean ok = false;
+        try (OutputStream out = new FileOutputStream(dest)) {
+            byte[] buffer = new byte[64 * 1024];
+            int read;
+            while ((read = in.read(buffer)) != -1) {
+                total += read;
+                if (total > max) {
+                    throw new IOException("The file is larger than " + (max / (1024 * 1024)) + " MB, the most Anne's Folio opens on Android");
+                }
+                out.write(buffer, 0, read);
+            }
+            ok = true;
+        } finally {
+            if (!ok && !dest.delete()) {
+                Log.w(TAG, "Could not delete the partial copy " + dest.getName());
+            }
+        }
+        return total;
+    }
+
+    private static void deleteFilesIn(File dir) {
+        File[] files = dir.listFiles();
+        if (files == null) {
+            return;
+        }
+        for (File f : files) {
+            if (f.isFile() && !f.delete()) {
+                Log.w(TAG, "Could not delete " + f.getName());
+            }
+        }
+    }
+
     private void writeBytes(Uri uri, byte[] bytes) throws IOException {
+        try (OutputStream out = openForWriting(uri)) {
+            out.write(bytes);
+            out.flush();
+        }
+    }
+
+    private OutputStream openForWriting(Uri uri) throws IOException {
         ContentResolver resolver = getContext().getContentResolver();
         OutputStream stream = null;
         try {
@@ -693,10 +871,7 @@ public class QuillNativePlugin extends Plugin {
         if (stream == null) {
             throw new IOException("Unable to open " + uri + " for writing");
         }
-        try (OutputStream out = stream) {
-            out.write(bytes);
-            out.flush();
-        }
+        return stream;
     }
 
     private String queryDisplayName(Uri uri) {
@@ -851,21 +1026,6 @@ public class QuillNativePlugin extends Plugin {
         JSObject ret = new JSObject();
         ret.put("canceled", true);
         call.resolve(ret);
-    }
-
-    private static byte[] readAll(InputStream in) throws IOException {
-        ByteArrayOutputStream out = new ByteArrayOutputStream(64 * 1024);
-        byte[] buffer = new byte[64 * 1024];
-        int read;
-        long total = 0;
-        while ((read = in.read(buffer)) != -1) {
-            total += read;
-            if (total > MAX_READ_BYTES) {
-                throw new IOException("File is larger than " + (MAX_READ_BYTES / (1024 * 1024)) + " MB");
-            }
-            out.write(buffer, 0, read);
-        }
-        return out.toByteArray();
     }
 
     private static byte[] decodeBase64(String data) {

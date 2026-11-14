@@ -1,11 +1,14 @@
 /**
  * Printing: pages are rendered to images at the chosen resolution and sent to the system print
- * service through a hidden frame (web and desktop) or the native print plugin (Android).
+ * service through a hidden frame (web and desktop) or the native print plugin (Android). The iOS app
+ * with its native plugin prints a PDF of the chosen pages through the iOS print sheet instead, because
+ * printing a web page from WKWebView is unreliable.
  */
 import type { App } from '../app';
 import { openDialog, toast } from '../ui/dialog';
 import { pagesFromRange, rangeField, pageImage } from '../commands/util';
-import { isNative, printDocument } from '../platform/native';
+import { isNative, isIOS, printDocument, printPdf } from '../platform/native';
+import { extractPages, nUp, booklet } from '../pdf/ops/pages';
 
 export interface PrintOptions { pages?: number[]; dpi?: number; scale?: 'fit' | 'actual'; booklet?: boolean; nUp?: 1 | 2 | 4; grayscale?: boolean; annotations?: boolean }
 
@@ -14,6 +17,7 @@ export async function printPages(app: App, o: PrintOptions = {}): Promise<void> 
   const dpi = o.dpi || app.prefs.printDpi || 150;
   if (!pages.length) { toast('No pages to print.'); return; }
   if (pages.length > 400) { toast('Printing is limited to 400 pages at a time; print a range.'); return; }
+  if (isIOS() && (await printPdfIOS(app, pages, o))) return;
   app.ui.status?.('● Preparing pages for printing…');
   const urls: string[] = [];
   // Page sizes in points, for printing at actual size.
@@ -59,6 +63,23 @@ export async function printPages(app: App, o: PrintOptions = {}): Promise<void> 
   w.focus();
   w.print();
   setTimeout(cleanup, 15 * 60000);
+}
+
+/**
+ * iOS: the chosen pages as a PDF (the pages themselves, not pictures of them) for the iOS print sheet,
+ * laid out two or four to a sheet, or as a booklet, with the engine's own imposition. Grayscale is the
+ * print sheet's "Black & White" option there. False when the app has no iOS print plugin.
+ */
+async function printPdfIOS(app: App, pages: number[], o: PrintOptions): Promise<boolean> {
+  const first = app.doc.pages[pages[0]];
+  const w = first?.width || 612, h = first?.height || 792;
+  let doc = extractPages(app.doc, pages);
+  // A booklet and two-up use a landscape sheet of the page's size; four-up a portrait one.
+  if (o.booklet) doc = booklet(doc, [Math.max(w, h), Math.min(w, h)]);
+  else if (o.nUp === 2) doc = nUp(doc, { cols: 2, rows: 1, paper: [Math.max(w, h), Math.min(w, h)] });
+  else if (o.nUp === 4) doc = nUp(doc, { cols: 2, rows: 2, paper: [Math.min(w, h), Math.max(w, h)] });
+  const bytes = doc.save({ incremental: false });
+  return printPdf(new Blob([bytes as BlobPart], { type: 'application/pdf' }), app.tab.displayName || 'Document');
 }
 
 /** Sheet order for a saddle-stitched booklet printed two-up: [last, first, second, second-to-last, …]. */

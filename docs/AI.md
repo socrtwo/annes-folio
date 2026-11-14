@@ -20,7 +20,7 @@ AI features are optional. Nothing is sent anywhere until you run an AI command, 
 | Linux desktop with a keyring (GNOME Keyring, KWallet) | The same file, encrypted through the keyring | Yes |
 | Linux desktop without a keyring (for example Raspberry Pi OS Lite, WSL) | The same file. Without a keyring the system only scrambles it with a fixed password | No: any program running under your account can read it |
 | Browser | This site's IndexedDB storage | No: other pages at the same address and anyone using the browser profile can read it |
-| iOS app | The app's private web storage (the iOS Keychain is not used yet) | No, though other apps cannot reach it |
+| iOS app | The iOS Keychain, for this app and this device only (not synced, not restored to another device), readable after the device is first unlocked | Yes |
 | A browser window that offers no database (some private windows) | Memory only, until the tab is closed | – |
 
 A key is never placed in the browser's `localStorage` (where settings live). `keyStorage()` in `src/ai/store.ts` reports which row applies, for the setup wizard to show.

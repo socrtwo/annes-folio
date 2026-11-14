@@ -195,6 +195,13 @@
 
         </activity>
 
+        <!-- Keeps the app from being frozen while sign-in waits for the browser (LoopbackService).
+             shortService (Android 14+) needs no FOREGROUND_SERVICE_* permission; below 14 it runs as a plain foreground service. -->
+        <service
+            android:name=".LoopbackService"
+            android:exported="false"
+            android:foregroundServiceType="shortService" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
@@ -209,6 +216,8 @@
     <!-- Permissions -->
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- LoopbackService, a foreground service only while an AI sign-in waits for the browser. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <!-- Recorded audio comments (Comment ▸ Audio Comment). Asked for when the user first records. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />

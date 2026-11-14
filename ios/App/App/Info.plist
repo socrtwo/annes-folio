@@ -248,7 +248,8 @@
 	<!-- Saved documents go to the app's Documents folder. UIFileSharingEnabled shows that folder in Finder's
 	     file sharing. It would also appear in the Files app only with LSSupportsOpeningDocumentsInPlace on,
 	     but then iOS hands over other apps' files in place (security-scoped), which the Capacitor file
-	     reader cannot open; with it off, iOS copies an opened file into Documents/Inbox first. -->
+	     reader cannot open; with it off, iOS copies an opened file into Documents/Inbox first. Save As puts
+	     a copy in Files (or iCloud Drive, another provider) through the export picker (QuillIOSPlugin). -->
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>

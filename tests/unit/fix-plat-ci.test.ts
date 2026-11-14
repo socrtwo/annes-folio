@@ -23,8 +23,8 @@ function runLines(text: string): string[] {
 }
 
 describe('workflows', () => {
-  it('there are three, and each defaults to read-only access', () => {
-    expect(files.sort()).toEqual(['android-build.yml', 'android.yml', 'release.yml']);
+  it('there are four, and each defaults to read-only access', () => {
+    expect(files.sort()).toEqual(['android-build.yml', 'android.yml', 'ios.yml', 'release.yml']);
     for (const f of files) expect(read(f), f).toMatch(/^permissions:\n  contents: read$/m);
   });
 

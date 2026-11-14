@@ -6,20 +6,24 @@
  * - Desktop (Windows, macOS, Linux, Raspberry Pi OS): the Electron preload (electron/preload.cjs)
  *   exposes the same interface as `window.quillDesktop`, backed by native file dialogs and the file system.
  * - Browser and iOS: <input type=file>, the File System Access API or downloads, and window.print().
- *   On iOS, saved files go to the app's own Documents folder. iOS shows that folder in Finder's file
- *   sharing, not in the Files app, so Share is the way to put a copy in Files or another app.
+ *   On iOS, saved files go to the app's own Documents folder, which iOS shows in Finder's file sharing,
+ *   not in the Files app. The `QuillIOS` plugin (ios/App/App/QuillIOSPlugin.swift) adds Save As to Files
+ *   (the system export picker), printing of PDF bytes, and Keychain storage for API keys; an older iOS
+ *   build without it falls back to the Documents folder, Share and the app's storage.
  *
- * File contents cross the Android bridge as base64 strings (`data`); the desktop bridge passes bytes
- * (`bytes`), which needs a third of the memory and has no string-length limit.
+ * Files the Android plugin reads are not sent over the bridge: it copies them to the app's cache and the
+ * page fetches the copy (Capacitor.convertFileSrc). Files the page sends to Android go as base64 (`data`),
+ * or above STAGE_MIN as a file written in chunks with the Filesystem plugin (`path`). The desktop bridge
+ * passes bytes (`bytes`) both ways.
  */
 import { Capacitor, registerPlugin } from '@capacitor/core';
 import { download, pickFile } from '../ui/dom';
 
 export interface OpenedFile { name: string; data: ArrayBuffer; uri: string | null; mime?: string }
 
-/** File contents on the bridge: base64 (`data`, Android) or bytes (`bytes`, desktop). */
-interface Payload { data?: string; bytes?: Uint8Array }
-interface FileResult extends Payload { uri?: string; name?: string; mime?: string }
+/** File contents on the bridge: base64 (`data`), bytes (`bytes`, desktop) or a cache file (`path`, Android). */
+interface Payload { data?: string; bytes?: Uint8Array; path?: string }
+interface FileResult extends Payload { uri?: string; name?: string; mime?: string; size?: number }
 
 interface QuillNativePlugin {
   /** ACTION_OPEN_DOCUMENT. Resolves {canceled:true} when dismissed. */
@@ -30,6 +34,8 @@ interface QuillNativePlugin {
   writeUri(opts: { uri: string } & Payload): Promise<{ ok: boolean }>;
   /** Read a URI again (recent files). */
   readUri(opts: { uri: string }): Promise<FileResult>;
+  /** Android: delete the cache copy of a file once the page has read it (the plugin also empties the folder at start). */
+  releaseFile?(opts: { path: string }): Promise<void>;
   /** Print the current WebView through PrintManager. */
   print(opts: { jobName: string }): Promise<void>;
   /** Share a file through ACTION_SEND. */
@@ -63,8 +69,24 @@ interface DesktopBridge extends QuillNativePlugin {
   secureInfo?(): Promise<{ encrypted: boolean; available: boolean; backend: string }>;
 }
 
+/** The iOS app's own plugin (ios/App/App/QuillIOSPlugin.swift). Not named QuillNative: iOS has no file dialogs to offer. */
+interface QuillIOSPlugin {
+  /** Keychain (generic password, this app's bundle id, this device only, readable after the first unlock). */
+  secureSet(opts: { key: string; value: string }): Promise<void>;
+  secureGet(opts: { key: string }): Promise<{ value?: string | null }>;
+  secureRemove(opts: { key: string }): Promise<void>;
+  secureInfo(): Promise<{ encrypted: boolean; available: boolean; backend: string }>;
+  /** The system export picker for a copy of the file (Files, iCloud Drive, other providers). */
+  exportFile(opts: { name: string; data: string }): Promise<{ canceled?: boolean; name?: string }>;
+  /** The system print sheet for PDF bytes. */
+  printPdf(opts: { data: string; jobName: string }): Promise<{ completed?: boolean }>;
+}
+
 const desktop: DesktopBridge | undefined = typeof window !== 'undefined' ? (window as any).quillDesktop : undefined;
 const Native: QuillNativePlugin = desktop || registerPlugin<QuillNativePlugin>('QuillNative');
+const IOSNative = registerPlugin<QuillIOSPlugin>('QuillIOS');
+/** The iOS plugin is in this build (an older iOS build has none). */
+const hasIOSPlugin = (): boolean => !desktop && Capacitor.getPlatform() === 'ios' && Capacitor.isPluginAvailable('QuillIOS');
 
 /** Running in the Capacitor app shell (Android or iOS). */
 export const isCapacitor = (): boolean => Capacitor.isNativePlatform();
@@ -74,6 +96,8 @@ export const isDesktop = (): boolean => !!desktop;
 export const isIOS = (): boolean => Capacitor.getPlatform() === 'ios';
 /** 'android' | 'ios' | 'web' | 'windows' | 'macos' | 'linux' */
 export const platformName = (): string => (desktop ? ({ win32: 'windows', darwin: 'macos' } as Record<string, string>)[desktop.platform] || 'linux' : Capacitor.getPlatform());
+/** API keys can go to the system's secure storage: Android Keystore, desktop keychain bridge, or the iOS Keychain. */
+export const hasSecureStorage = (): boolean => isNative() || hasIOSPlugin();
 /** Desktop HTTP without CORS, or null when not on desktop. */
 export const desktopHttp = desktop ? (o: { url: string; method: string; headers: Record<string, string>; data?: unknown }) => desktop.http(o) : null;
 
@@ -114,21 +138,58 @@ export function bufferFromB64(b64: string): ArrayBuffer {
 }
 
 /** The contents of a file the bridge handed over, or null when it carries none. */
-function received(r: Payload | null | undefined): ArrayBuffer | null {
+async function received(r: Payload | null | undefined): Promise<ArrayBuffer | null> {
   if (r?.bytes) { const b = r.bytes; return b.byteOffset === 0 && b.byteLength === b.buffer.byteLength ? (b.buffer as ArrayBuffer) : (b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer); }
+  if (r?.path) {
+    // Android: a cache copy, served by the WebView's local server. Deleted once read.
+    const path = r.path;
+    try {
+      const res = await fetch(Capacitor.convertFileSrc(path));
+      if (!res.ok) throw new Error(`Could not read the file (${res.status}).`);
+      return await res.arrayBuffer();
+    } finally {
+      void Native.releaseFile?.({ path })?.catch(() => undefined);
+    }
+  }
   return r?.data ? bufferFromB64(r.data) : null;
+}
+
+/** Payloads above this go to Android as a file instead of one bridge message (one base64 string). */
+export const STAGE_MIN = 4 * 1024 * 1024;
+/** Bytes per Filesystem call while staging (4 MB of base64). */
+const STAGE_CHUNK = 3 * 1024 * 1024;
+let stageSeq = 0;
+/** Writes the blob to cache/outgoing/ in chunks; QuillNativePlugin streams it from there and deletes it. */
+async function stage(blob: Blob): Promise<string> {
+  const { Filesystem, Directory } = await import('@capacitor/filesystem');
+  const path = `outgoing/${Date.now().toString(36)}-${++stageSeq}.bin`;
+  let uri = '';
+  try {
+    for (let off = 0; off < blob.size; off += STAGE_CHUNK) {
+      const data = b64FromBuffer(await blob.slice(off, off + STAGE_CHUNK).arrayBuffer());
+      if (off === 0) uri = (await Filesystem.writeFile({ path, data, directory: Directory.Cache, recursive: true })).uri;
+      else await Filesystem.appendFile({ path, data, directory: Directory.Cache });
+    }
+  } catch (e) {
+    void Filesystem.deleteFile({ path, directory: Directory.Cache }).catch(() => undefined);
+    throw e;
+  }
+  return uri;
 }
 /** A blob in the form this platform's bridge takes. */
 async function outgoing(blob: Blob): Promise<Payload> {
-  const buf = await blob.arrayBuffer();
-  return desktop ? { bytes: new Uint8Array(buf) } : { data: b64FromBuffer(buf) };
+  if (desktop) return { bytes: new Uint8Array(await blob.arrayBuffer()) };
+  if (blob.size > STAGE_MIN && Capacitor.getPlatform() === 'android' && Capacitor.isPluginAvailable('Filesystem')) {
+    try { return { path: await stage(blob) }; } catch { /* storage full or the plugin failed: one message, as before */ }
+  }
+  return { data: b64FromBuffer(await blob.arrayBuffer()) };
 }
 const opened = (r: FileResult, data: ArrayBuffer, uri: string | null = r.uri || null): OpenedFile => ({ name: r.name || 'document', data, uri, mime: r.mime });
 
 export async function openDocument(accept: string, mimeTypes: string[]): Promise<OpenedFile | null> {
   if (isNative()) {
     const r = await Native.openDocument({ mimeTypes });
-    const data = r.canceled ? null : received(r);
+    const data = r.canceled ? null : await received(r);
     return data ? opened(r, data) : null;
   }
   // Chromium browsers: a file handle, so that Save can write back to the file that was opened.
@@ -149,8 +210,8 @@ export async function openDocument(accept: string, mimeTypes: string[]): Promise
   return { name: files[0].name, data: await files[0].arrayBuffer(), uri: null, mime: files[0].type };
 }
 
-function toastSaved(name: string): void {
-  import('../ui/dialog').then(({ toast }) => toast(`Saved "${name}" in Anne's Folio on this device. To put a copy in Files or another app, use Share.`)).catch(() => undefined);
+function toastSaved(text: string): void {
+  import('../ui/dialog').then(({ toast }) => toast(text)).catch(() => undefined);
 }
 
 export async function saveAs(blob: Blob, name: string): Promise<{ uri: string | null; name: string } | null> {
@@ -160,8 +221,20 @@ export async function saveAs(blob: Blob, name: string): Promise<{ uri: string | 
     return { uri: r.uri || null, name: r.name || name };
   }
   if (isIOS()) {
+    if (hasIOSPlugin()) {
+      // The export picker puts a copy where the user chooses (Files, iCloud Drive, another provider);
+      // the app keeps its own copy so that Save, recent files and version history keep working.
+      let r: { canceled?: boolean; name?: string } | null = null;
+      try { r = await IOSNative.exportFile({ name: name.replace(/[\\/:]/g, '_') || 'document', data: b64FromBuffer(await blob.arrayBuffer()) }); } catch { /* the picker could not open: the app's copy only */ }
+      if (r?.canceled) return null;
+      const n = await iosWrite(blob, await iosFreeName(name));
+      toastSaved(r
+        ? `Saved a copy of "${r.name || name}" where you chose, and kept one in Anne's Folio. Save updates the copy in Anne's Folio; use Save As again to update the other copy.`
+        : `Saved "${n}" in Anne's Folio on this device. To put a copy in Files, use Save As again or Share.`);
+      return { uri: IOS_PREFIX + n, name: n };
+    }
     const n = await iosWrite(blob, await iosFreeName(name));
-    toastSaved(n);
+    toastSaved(`Saved "${n}" in Anne's Folio on this device. To put a copy in Files or another app, use Share.`);
     return { uri: IOS_PREFIX + n, name: n };
   }
   const anyWin = window as any;
@@ -222,7 +295,7 @@ export async function readUri(uri: string): Promise<OpenedFile | null> {
   if (!isNative()) return null;
   try {
     const r = await Native.readUri({ uri });
-    const data = received(r);
+    const data = await received(r);
     return data ? opened(r, data, uri) : null;
   } catch {
     return null;
@@ -232,6 +305,16 @@ export async function readUri(uri: string): Promise<OpenedFile | null> {
 export async function printDocument(jobName: string): Promise<void> {
   if (isNative()) { await Native.print({ jobName }); return; }
   window.print();
+}
+
+/**
+ * iOS: the system print sheet for a PDF (window.print() in the iOS WebView is unreliable). Resolves
+ * false when this build cannot (not iOS, or an iOS build without the plugin): print another way then.
+ */
+export async function printPdf(pdf: Blob, jobName: string): Promise<boolean> {
+  if (!hasIOSPlugin()) return false;
+  await IOSNative.printPdf({ data: b64FromBuffer(await pdf.arrayBuffer()), jobName });
+  return true;
 }
 
 export async function shareFile(blob: Blob, name: string, title?: string): Promise<void> {
@@ -289,7 +372,7 @@ export async function launchFile(): Promise<OpenedFile | null> {
   if (!isNative()) return null;
   try {
     const r = await Native.getLaunchFile();
-    const data = received(r);
+    const data = await received(r);
     return data ? opened(r, data) : null;
   } catch {
     return null;
@@ -302,7 +385,7 @@ export function onFileOpened(cb: (f: OpenedFile) => void): void {
     return;
   }
   if (!isNative()) return;
-  void Native.addListener('fileOpened', (r) => { const data = received(r); if (data) cb(opened(r, data)); });
+  void Native.addListener('fileOpened', (r) => { void received(r).then((data) => { if (data) cb(opened(r, data)); }).catch(() => undefined); });
 }
 
 export async function keepAwake(on: boolean): Promise<void> {
@@ -338,24 +421,30 @@ export const OPEN_MIMES = [
 // ------------------------------------------------------------------------------------------
 // Secure storage, clipboard, OAuth loopback, app resume (AI setup)
 
+/** The secure store of this platform: the iOS plugin on iOS, else the Android plugin or the desktop bridge. */
+const secure = (): Pick<QuillNativePlugin, 'secureSet' | 'secureGet' | 'secureRemove'> => (hasIOSPlugin() ? IOSNative : Native);
+
 export async function secureSet(key: string, value: string): Promise<void> {
-  await Native.secureSet({ key, value });
+  await secure().secureSet({ key, value });
 }
 /**
- * How the native bridge protects saved secrets: the Android Keystore, or on the desktop the system
- * keychain (macOS Keychain, Windows DPAPI, a Linux keyring). `encrypted: false` means a Linux desktop
- * without a keyring, where the key file can be read by anything running as the user.
+ * How the native bridge protects saved secrets: the Android Keystore, the iOS Keychain, or on the desktop
+ * the system keychain (macOS Keychain, Windows DPAPI, a Linux keyring). `encrypted: false` means a Linux
+ * desktop without a keyring, where the key file can be read by anything running as the user.
  */
 export async function secureStorageInfo(): Promise<{ encrypted: boolean; backend: string }> {
+  if (hasIOSPlugin()) {
+    try { const r = await IOSNative.secureInfo(); return { encrypted: !!r.encrypted, backend: String(r.backend || 'ios-keychain') }; } catch { return { encrypted: false, backend: 'unknown' }; }
+  }
   if (!desktop) return { encrypted: true, backend: 'android-keystore' };
   try { const r = await desktop.secureInfo?.(); if (r) return { encrypted: !!r.encrypted, backend: String(r.backend || 'unknown') }; } catch { /* an older desktop shell */ }
   return { encrypted: false, backend: 'unknown' };
 }
 export async function secureGet(key: string): Promise<string | null> {
-  return (await Native.secureGet({ key })).value ?? null;
+  return (await secure().secureGet({ key })).value ?? null;
 }
 export async function secureRemove(key: string): Promise<void> {
-  await Native.secureRemove({ key });
+  await secure().secureRemove({ key });
 }
 
 /** Read clipboard text. Returns null when the platform refuses (no permission, no focus). */
