@@ -164,7 +164,10 @@ function revisePrompt(block: string, minute: string, blocks: EnsembleResponse[],
   ].filter(Boolean).join('\n\n');
 }
 
-/** Reads a member's JSON stance. Unreadable replies count as "unite" with a note. */
+/**
+ * Reads a member's JSON stance. A reply that cannot be read comes back flagged `unreadable`; the
+ * meeting leaves that member out of the round (it is not counted as agreeing).
+ */
 export function parseStance(text: string): { stance: Stance; reason?: string; suggestedChange?: string; unreadable?: boolean } {
   const t = String(text || '').replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/```[a-z]*\n?/gi, '');
   let j: any = null;
@@ -174,7 +177,7 @@ export function parseStance(text: string): { stance: Stance; reason?: string; su
   }
   const raw = String(j?.stance ?? '').trim().toLowerCase().replace(/[\s_]+/g, '-');
   const stance: Stance | null = raw === 'unite' || raw === 'block' || raw === 'stand-aside' ? raw : raw === 'standaside' || raw === 'stand-aside.' ? 'stand-aside' : null;
-  if (!stance) return { stance: 'unite', reason: 'Its reply could not be read, so it counts as uniting.', unreadable: true };
+  if (!stance) return { stance: 'unite', reason: 'Its reply could not be read.', unreadable: true };
   const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, 2000) : undefined);
   return { stance, reason: str(j.reason), suggestedChange: str(j.suggested_change ?? j.suggestedChange) };
 }
@@ -326,6 +329,8 @@ export async function runEnsemble(req: ChatRequest, plan: EnsemblePlan, call: Me
         const r = await ask(m, { ...base, temperature: 0, maxTokens: Math.max(400, Math.min(req.maxTokens || 1200, 1200)), messages: withPrompt(stancePrompt(block, minute)) }, plan.memberTimeoutMs);
         add(r);
         const s = parseStance(r.text);
+        // An unreadable or cut-off reply (a thinking model that used up its output limit) is not agreement.
+        if (s.unreadable || r.truncated) return null;
         const resp: EnsembleResponse = { provider: m.provider, stance: s.stance };
         if (s.reason) resp.reason = s.reason;
         if (s.suggestedChange) resp.suggestedChange = s.suggestedChange;
@@ -340,6 +345,12 @@ export async function runEnsemble(req: ChatRequest, plan: EnsemblePlan, call: Me
     rounds.push({ minute, responses });
     blocks = responses.filter((x) => x.stance === 'block');
     asides = responses.filter((x) => x.stance === 'stand-aside');
+    if (!responses.length) {
+      // Nobody gave a readable answer on the minute: that is not unity, and there is nothing to revise.
+      outcome = 'no-unity';
+      status('No AI gave a readable reply on the minute');
+      break;
+    }
     if (!blocks.length) {
       outcome = asides.length ? 'unity-with-stand-asides' : 'unity';
       status(asides.length ? `United; ${asides.length} stood aside` : `United (${responses.length} of ${responses.length})`);
@@ -366,7 +377,7 @@ export async function runEnsemble(req: ChatRequest, plan: EnsemblePlan, call: Me
   if (asides.length) info.standAsides = reasons(asides);
   if (outcome === 'no-unity') info.blocks = reasons(blocks);
   const lastRound = rounds[rounds.length - 1];
-  if (lastRound && !lastRound.responses.length) info.note = 'No AI could be reached to consider the minute; the clerk\'s minute is used.';
+  if (lastRound && !lastRound.responses.length) info.note = 'No AI gave a readable reply on the minute, so it was not agreed; the clerk\'s minute is shown as it stands.';
   if (clerkNote) info.note = `${info.note ? info.note + ' ' : ''}${clerkNote}`;
   if (failNote) info.note = `${info.note ? info.note + ' ' : ''}${failNote.trim()}`;
   return { ...clerk, text: minute, ...total(), ensemble: info };
@@ -379,6 +390,6 @@ export function outcomeLine(info: EnsembleInfo, name: (provider: string) => stri
     case 'synthesized': return `Synthesized by ${name(info.master)}`;
     case 'unity': { const k = last?.responses.length ?? info.members.filter((m) => m.text != null).length; return `United (${k} of ${k})`; }
     case 'unity-with-stand-asides': return `United; ${info.standAsides?.length || 0} stood aside`;
-    case 'no-unity': return `No unity after ${plural(info.rounds?.length || 0, 'round')}: ${plural(info.blocks?.length || 0, 'objection')}`;
+    case 'no-unity': return last && !last.responses.length ? 'Not agreed: no AI gave a readable reply on the minute' : `No unity after ${plural(info.rounds?.length || 0, 'round')}: ${plural(info.blocks?.length || 0, 'objection')}`;
   }
 }

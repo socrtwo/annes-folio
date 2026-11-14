@@ -23,16 +23,37 @@ export function categories(app: App): { id: string; label: string; list: () => C
   ];
 }
 
-function commandList(cmds: (Command | '|')[], selected: number, onSelect: (i: number) => void, onDbl?: (i: number) => void): HTMLElement {
-  const box = h('div', { class: 'ql-cmdlist', role: 'listbox', tabindex: '0' });
+/** The Quick Access Bar ids that still name a command (or a separator): an imported layout or an older version can hold others. */
+export function knownQat(ids: unknown[], isCommand: (id: string) => boolean = (id) => !!getCommand(id)): string[] {
+  return ids.filter((x): x is string => typeof x === 'string' && (x === '|' || isCommand(x)));
+}
+
+/**
+ * Keyboard use of a list: Up/Down/Home/End move the selection, Enter or Space runs `act` (what a
+ * double-click does). `name` identifies the list so that it gets the focus back after the redraw a
+ * selection causes. data-capture-keys keeps the dialog from taking Enter as OK.
+ */
+function listKeys(box: HTMLElement, name: string, count: number, cur: number, pick: (i: number) => void, act?: (i: number) => void): HTMLElement {
+  box.setAttribute('role', 'listbox'); box.tabIndex = 0; box.dataset.list = name; box.setAttribute('data-capture-keys', '');
+  box.addEventListener('keydown', (e) => {
+    if (e.target !== box || e.ctrlKey || e.metaKey || e.altKey || !count) return;
+    const to = e.key === 'ArrowDown' ? Math.min(count - 1, cur + 1) : e.key === 'ArrowUp' ? Math.max(0, cur - 1) : e.key === 'Home' ? 0 : e.key === 'End' ? count - 1 : -1;
+    if (to >= 0) { e.preventDefault(); if (to !== cur) pick(to); }
+    else if ((e.key === 'Enter' || e.key === ' ') && act && cur >= 0) { e.preventDefault(); act(cur); }
+  });
+  return box;
+}
+
+function commandList(name: string, cmds: (Command | '|')[], selected: number, onSelect: (i: number) => void, onDbl?: (i: number) => void): HTMLElement {
+  const box = h('div', { class: 'ql-cmdlist' });
   cmds.forEach((c, i) => {
-    const row = c === '|' ? h('div', { class: 'ql-cmdlist-row ql-sep-row' + (i === selected ? ' ql-sel' : ''), role: 'option' }, h('span', { class: 'ql-icon-space' }), '<Separator>')
-      : h('div', { class: 'ql-cmdlist-row' + (i === selected ? ' ql-sel' : ''), role: 'option', title: `${c.label} — ${c.id}` }, icon(c.icon), h('span', null, c.label), c.kind === 'menu' || c.kind === 'split' ? h('span', { class: 'ql-help' }, ' ▸') : null);
+    const row = c === '|' ? h('div', { class: 'ql-cmdlist-row ql-sep-row' + (i === selected ? ' ql-sel' : ''), role: 'option', 'aria-selected': String(i === selected) }, h('span', { class: 'ql-icon-space' }), '<Separator>')
+      : h('div', { class: 'ql-cmdlist-row' + (i === selected ? ' ql-sel' : ''), role: 'option', 'aria-selected': String(i === selected), title: `${c.label} — ${c.id}` }, icon(c.icon), h('span', null, c.label), c.kind === 'menu' || c.kind === 'split' ? h('span', { class: 'ql-help' }, ' ▸') : null);
     row.addEventListener('click', () => onSelect(i));
     if (onDbl) row.addEventListener('dblclick', () => onDbl(i));
     box.appendChild(row);
   });
-  return box;
+  return listKeys(box, name, cmds.length, selected, onSelect, onDbl);
 }
 
 /** A button of the middle toolbar: icon plus a label that stays visible on phones (wrapping onto more rows). */
@@ -47,8 +68,15 @@ function midButton(label: string, ic: string, fn: () => void, tip = label): HTML
  */
 function clearKeepingScroll(...cols: HTMLElement[]): void {
   const tops = cols.map((c) => [...c.querySelectorAll<HTMLElement>('.ql-cmdlist')].map((l) => l.scrollTop));
+  // The list that had the keyboard focus gets it back on its replacement (arrow keys redraw the lists).
+  const active = document.activeElement as HTMLElement | null;
+  const focused = active && cols.some((c) => c.contains(active)) ? active.dataset.list : undefined;
+  const field = active && (active.tagName === 'INPUT' || active.tagName === 'SELECT') && cols.some((c) => c.contains(active)) ? active : null;
   for (const c of cols) clear(c);
+  // The filter box and the category list are taken out and put back by the redraw: typing must not lose the focus.
+  if (field) queueMicrotask(() => { if (field.isConnected && document.activeElement !== field) field.focus({ preventScroll: true }); });
   queueMicrotask(() => cols.forEach((c, j) => c.querySelectorAll<HTMLElement>('.ql-cmdlist').forEach((l, i) => {
+    if (focused && l.dataset.list === focused) l.focus({ preventScroll: true });
     if (tops[j][i]) l.scrollTop = tops[j][i];
     const row = l.querySelector<HTMLElement>('.ql-sel');
     if (!row) return;
@@ -63,7 +91,8 @@ export async function customizeQat(app: App): Promise<void> {
   let cat = cats[0];
   let filter = '';
   let leftSel = 0, rightSel = -1;
-  let qat = [...app.prefs.qat];
+  // Only ids that name a command: the list on the right must line up with `qat` index for index.
+  let qat = knownQat(app.prefs.qat);
   const root = h('div', { class: 'ql-customize' });
   const left = h('div', { class: 'ql-cust-col' });
   const right = h('div', { class: 'ql-cust-col' });
@@ -82,8 +111,8 @@ export async function customizeQat(app: App): Promise<void> {
     clearKeepingScroll(left, right);
     const items = leftItems();
     count.textContent = `${items.length} command(s)`;
-    left.append(h('label', { class: 'ql-label' }, 'Choose commands from:'), catSel, search, count, commandList(items, leftSel, (i) => { leftSel = i; draw(); }, (i) => { leftSel = i; add(); }));
-    right.append(h('label', { class: 'ql-label' }, 'Quick Access Bar:'), commandList(qatItems(), rightSel, (i) => { rightSel = i; draw(); }, (i) => { rightSel = i; remove(); }));
+    left.append(h('label', { class: 'ql-label' }, 'Choose commands from:'), catSel, search, count, commandList('commands', items, leftSel, (i) => { leftSel = i; draw(); }, (i) => { leftSel = i; add(); }));
+    right.append(h('label', { class: 'ql-label' }, 'Quick Access Bar:'), commandList('qat', qatItems(), rightSel, (i) => { rightSel = i; draw(); }, (i) => { rightSel = i; remove(); }));
   };
   mid.append(midButton('Add', 'arrow_forward', add), midButton('Remove', 'arrow_back', remove), midButton('Up', 'arrow_upward', () => move(-1)), midButton('Down', 'arrow_downward', () => move(1)),
     midButton('Separator', 'more_vert', () => { const at = rightSel >= 0 ? rightSel + 1 : qat.length; qat.splice(at, 0, '|'); rightSel = at; draw(); }),
@@ -98,13 +127,18 @@ export async function customizeQat(app: App): Promise<void> {
       { key: 'labels', label: 'Show command labels', type: 'checkbox', value: app.prefs.qatLabels },
     ],
     buttons: [
-      { label: 'Export…', onClick: () => { navigator.clipboard?.writeText(JSON.stringify({ qat })); toast('Quick Access Bar layout copied to clipboard'); } },
-      { label: 'Import…', onClick: async () => { const t = await promptDialog('Import', 'Paste a Quick Access Bar layout:', ''); if (!t) return; try { const j = JSON.parse(t); if (Array.isArray(j.qat)) { qat = j.qat.filter((x: unknown) => typeof x === 'string'); draw(); } } catch { toast('Invalid layout.'); } } },
+      { label: 'Export…', onClick: async () => {
+        const text = JSON.stringify({ qat });
+        try { if (!navigator.clipboard) throw new Error('no clipboard'); await navigator.clipboard.writeText(text); toast('Quick Access Bar layout copied to clipboard'); }
+        catch { void promptDialog('Export', 'The clipboard is not available here. Copy this layout:', text); }
+      } },
+      { label: 'Import…', onClick: async () => { const t = await promptDialog('Import', 'Paste a Quick Access Bar layout:', ''); if (!t) return; try { const j = JSON.parse(t); if (!Array.isArray(j?.qat)) throw new Error('no list'); const all = j.qat.filter((x: unknown) => typeof x === 'string'); qat = knownQat(all); rightSel = -1; draw(); if (qat.length < all.length) toast(`${all.length - qat.length} entr${all.length - qat.length === 1 ? 'y was' : 'ies were'} left out: this version has no such command.`); } catch { toast('That is not a Quick Access Bar layout.'); } } },
     ],
   });
   if (!r) return;
   app.prefs.qat = qat;
-  app.prefs.qatPosition = r.bottom ? 'bottom' : 'top';
+  // The checkbox only moves the bar to or from the bottom; "below the ribbon" stays as it was when it is left unticked.
+  if (r.bottom) app.prefs.qatPosition = 'bottom'; else if (app.prefs.qatPosition === 'bottom') app.prefs.qatPosition = 'top';
   app.prefs.qatLabels = r.labels;
   app.savePrefs();
   app.ui.applyPrefs();
@@ -146,12 +180,12 @@ export async function customizeRibbon(app: App): Promise<void> {
   search.addEventListener('input', () => { filter = search.value.toLowerCase(); leftSel = 0; draw(); });
   const draw = () => {
     clearKeepingScroll(left, right);
-    left.append(h('label', { class: 'ql-label' }, 'Choose commands from:'), catSel, search, commandList(leftItems(), leftSel, (i) => { leftSel = i; draw(); }, (i) => { leftSel = i; addCmd(); }));
-    const tabList = h('div', { class: 'ql-cmdlist' });
+    left.append(h('label', { class: 'ql-label' }, 'Choose commands from:'), catSel, search, commandList('commands', leftItems(), leftSel, (i) => { leftSel = i; draw(); }, (i) => { leftSel = i; addCmd(); }));
+    const tabList = listKeys(h('div', { class: 'ql-cmdlist' }), 'tabs', order.length, order.indexOf(selTab), (i) => { selTab = order[i]; selGroup = 0; selItem = -1; draw(); });
     for (const id of order) {
       const row = h('div', { class: 'ql-cmdlist-row' + (id === selTab ? ' ql-sel' : '') },
         h('input', { type: 'checkbox', checked: !hidden.has(id) && !(customTabs.find((t) => t.id === id)?.hidden), title: 'Show tab', onclick: (e: Event) => { e.stopPropagation(); const ct = customTabs.find((t) => t.id === id); if (ct) ct.hidden = !(e.target as HTMLInputElement).checked; else if ((e.target as HTMLInputElement).checked) hidden.delete(id); else hidden.add(id); } }),
-        h('span', null, labelOf(id) + (isCustom(id) ? ' (Custom)'.replace(/ \(Custom\) \(Custom\)/, '') : '')));
+        h('span', null, labelOf(id) + (isCustom(id) && !/\(Custom\)$/.test(labelOf(id)) ? ' (Custom)' : '')));
       row.addEventListener('click', () => { selTab = id; selGroup = 0; selItem = -1; draw(); });
       tabList.appendChild(row);
     }
@@ -166,6 +200,9 @@ export async function customizeRibbon(app: App): Promise<void> {
           groups.appendChild(h('div', { class: 'ql-cmdlist-row ql-item-row' + (gi === selGroup && ii === selItem ? ' ql-sel' : ''), onclick: () => { selGroup = gi; selItem = ii; draw(); } }, icon(c?.icon), c?.label || id));
         });
       });
+      // Keyboard: the rows in order, a group row first and then its commands.
+      const flat = t.groups.flatMap((g, gi) => [[gi, -1], ...g.items.map((_, ii) => [gi, ii])]);
+      listKeys(groups, 'groups', flat.length, flat.findIndex(([gi, ii]) => gi === selGroup && ii === selItem), (i) => { [selGroup, selItem] = flat[i]; draw(); });
       right.append(h('label', { class: 'ql-label' }, `Groups in "${labelOf(selTab)}"${isCustom(selTab) ? '' : ' (built-in: editing makes a copy)'}:`), groups);
     }
   };
@@ -236,7 +273,7 @@ export async function customizeKeyboard(app: App, initialId?: string): Promise<v
   const draw = () => {
     clearKeepingScroll(left, right);
     const list = items();
-    left.append(h('label', { class: 'ql-label' }, 'Categories:'), catSel, search, commandList(list, sel, (i) => { sel = i; pending = null; capture.value = ''; owner.textContent = ''; draw(); }));
+    left.append(h('label', { class: 'ql-label' }, 'Categories:'), catSel, search, commandList('commands', list, sel, (i) => { sel = i; pending = null; capture.value = ''; owner.textContent = ''; draw(); }));
     const c = list[sel];
     if (!c) return;
     const current = keysFor(c.id);

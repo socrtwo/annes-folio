@@ -3,7 +3,7 @@
  * the renderer), images (JPEG as is, Flate raster as RGB/gray samples), attachments, and tables from
  * positioned text (column clustering).
  */
-import { PdfStream, isName, Name } from '../objects';
+import { Dict, PdfObj, PdfStream, PdfString, isName, Name } from '../objects';
 import { PdfDocument } from '../document';
 import { parseContent, analyzeContent, TextRun } from '../content';
 import { listImages, ImageInfo } from './optimize';
@@ -15,8 +15,14 @@ export function pageTextRuns(doc: PdfDocument, index: number): PositionedText[] 
   const p = doc.pages[index];
   if (!p) return [];
   const info = analyzeContent(doc, parseContent(doc.pageContent(p)), p.resources);
-  const top = p.cropBox[3];
-  return info.runs.filter((r) => r.text.trim()).map((r: TextRun) => ({ text: r.text, x: r.box[0] - p.cropBox[0], y: top - r.box[3], w: r.box[2] - r.box[0], h: r.box[3] - r.box[1], size: r.size }));
+  // Positions are those of the page as displayed: a page turned by /Rotate reads in its turned order.
+  const [x0, y0, x1, y1] = p.cropBox;
+  const show = (x: number, y: number): [number, number] => (p.rotate === 90 ? [y - y0, x1 - x] : p.rotate === 180 ? [x1 - x, y1 - y] : p.rotate === 270 ? [y1 - y, x - x0] : [x - x0, y - y0]);
+  return info.runs.filter((r) => r.text.trim()).map((r: TextRun) => {
+    const a = show(r.box[0], r.box[1]), b = show(r.box[2], r.box[3]);
+    const left = Math.min(a[0], b[0]), right = Math.max(a[0], b[0]), bottom = Math.min(a[1], b[1]), up = Math.max(a[1], b[1]);
+    return { text: r.text, x: left, y: p.height - up, w: right - left, h: up - bottom, size: r.size };
+  });
 }
 
 /** Lines of text, in reading order, from positioned runs (works for the engine's and the renderer's runs). */
@@ -58,22 +64,40 @@ export function textToMarkdown(pages: PositionedText[][]): string {
   return out.join('\n');
 }
 
-/** Detects tables on a page: rows of runs sharing y, columns from x-clusters of their starts. */
+/**
+ * Detects tables on a page. Runs on one line that sit close together form one cell; a table is a
+ * block of consecutive lines with two or more cells whose cell starts line up in at least two
+ * columns. Ordinary paragraphs (one cell per line, or cells that do not align) are not tables.
+ */
 export function tablesFromRuns(runs: PositionedText[]): string[][][] {
   const sorted = [...runs].sort((a, b) => a.y - b.y || a.x - b.x);
-  const rows: PositionedText[][] = [];
-  for (const r of sorted) { const last = rows[rows.length - 1]; if (last && Math.abs(last[0].y - r.y) < Math.max(2, r.h * 0.5)) last.push(r); else rows.push([r]); }
-  // Group consecutive rows with 2+ cells into tables.
+  const lines: PositionedText[][] = [];
+  for (const r of sorted) { const last = lines[lines.length - 1]; if (last && Math.abs(last[0].y - r.y) < Math.max(2, r.h * 0.5)) last.push(r); else lines.push([r]); }
+  const rows = lines.map((line) => {
+    line.sort((a, b) => a.x - b.x);
+    const cells: { x: number; text: string }[] = [];
+    let end = -Infinity;
+    for (const r of line) {
+      const gap = r.x - end;
+      // A gap wider than a generous word space starts a new cell.
+      if (!cells.length || gap > Math.max(9, r.h * 1.2)) cells.push({ x: r.x, text: r.text });
+      else cells[cells.length - 1].text += (gap > r.h * 0.2 ? ' ' : '') + r.text;
+      end = Math.max(end, r.x + r.w);
+    }
+    return cells;
+  });
   const tables: string[][][] = [];
-  let cur: PositionedText[][] = [];
+  let cur: { x: number; text: string }[][] = [];
   const flush = () => {
     if (cur.length >= 2) {
-      // Column boundaries: cluster x starts.
-      const xs = cur.flat().map((r) => r.x).sort((a, b) => a - b);
+      // Column boundaries: cluster cell starts.
+      const xs = cur.flat().map((c) => c.x).sort((a, b) => a - b);
       const cols: number[] = [];
       for (const x of xs) if (!cols.length || x - cols[cols.length - 1] > 12) cols.push(x);
-      const grid = cur.map((row) => { const cells = new Array(cols.length).fill(''); for (const r of row) { let c = 0; for (let i = 0; i < cols.length; i++) if (r.x + 6 >= cols[i]) c = i; cells[c] = (cells[c] ? cells[c] + ' ' : '') + r.text; } return cells; });
-      if (cols.length >= 2) tables.push(grid);
+      const colOf = (x: number) => { let c = 0; for (let i = 0; i < cols.length; i++) if (x + 6 >= cols[i]) c = i; return c; };
+      const hits = new Array(cols.length).fill(0);
+      for (const row of cur) for (const c of new Set(row.map((cell) => colOf(cell.x)))) hits[c]++;
+      if (hits.filter((h) => h >= 2).length >= 2) tables.push(cur.map((row) => { const cells = new Array(cols.length).fill(''); for (const cell of row) { const c = colOf(cell.x); cells[c] = (cells[c] ? cells[c] + ' ' : '') + cell.text.replace(/\s+/g, ' ').trim(); } return cells; }));
     }
     cur = [];
   };
@@ -86,59 +110,114 @@ export function toCsv(table: string[][]): string { return table.map((r) => r.map
 
 export interface ExtractedImage { info: ImageInfo; kind: 'jpeg' | 'jp2' | 'raw' | 'unsupported'; data: Uint8Array; components: number; width: number; height: number; bpc: number }
 
+type ColorModel = 'gray' | 'rgb' | 'cmyk' | 'lab' | 'tint' | 'indexed' | 'mask';
+interface ColorInfo { model: ColorModel | null; comps: number; /** Indexed: the base space and the lookup table. */ base?: ColorInfo; palette?: Uint8Array; /** Lab: white point and the range of a and b. */ white?: number[]; range?: number[] }
+
+/** What the engine knows about a colour space: its model and component count (model null: not convertible here). */
+function colorInfo(doc: PdfDocument, cs: PdfObj | undefined, depth = 0): ColorInfo {
+  const v = doc.resolve<PdfObj>(cs);
+  const name = isName(v) ? v.name : Array.isArray(v) && isName(doc.resolve<PdfObj>(v[0])) ? (doc.resolve<PdfObj>(v[0]) as Name).name : '';
+  const arr = Array.isArray(v) ? v : [];
+  switch (name) {
+    case 'DeviceGray': case 'G': case 'CalGray': return { model: 'gray', comps: 1 };
+    case 'DeviceRGB': case 'RGB': case 'CalRGB': return { model: 'rgb', comps: 3 };
+    case 'DeviceCMYK': case 'CMYK': return { model: 'cmyk', comps: 4 };
+    case 'ICCBased': { const st = doc.resolve<PdfObj>(arr[1]); const n = st instanceof PdfStream ? doc.getNum(st, 'N', 3) : 3; return n === 1 ? { model: 'gray', comps: 1 } : n === 4 ? { model: 'cmyk', comps: 4 } : n === 3 ? { model: 'rgb', comps: 3 } : { model: null, comps: n }; }
+    case 'Lab': { const d = doc.resolve<PdfObj>(arr[1]); const nums = (k: string, def: number[]) => { const a = d instanceof Dict ? doc.getArray(d, k) : null; const out = (a || []).map((x) => doc.resolve<PdfObj>(x)).filter((x): x is number => typeof x === 'number'); return out.length === def.length ? out : def; }; return { model: 'lab', comps: 3, white: nums('WhitePoint', [0.9642, 1, 0.8249]), range: nums('Range', [-100, 100, -100, 100]) }; }
+    // One ink: the tint is how much ink, so 0 is paper. The ink's own colour is not looked up; it is shown as black.
+    case 'Separation': return { model: 'tint', comps: 1 };
+    case 'DeviceN': { const names = doc.resolve<PdfObj>(arr[1]); const n = Array.isArray(names) ? names.length : 0; return n === 1 ? { model: 'tint', comps: 1 } : { model: null, comps: n || 1 }; }
+    case 'Indexed': case 'I': {
+      if (depth > 2) return { model: null, comps: 1 };
+      const base = colorInfo(doc, arr[1], depth + 1);
+      const lookup = doc.resolve<PdfObj>(arr[3]);
+      const palette = lookup instanceof PdfStream ? doc.decoded(lookup) : lookup instanceof PdfString ? lookup.bytes : undefined;
+      return { model: base.model && base.model !== 'indexed' && palette ? 'indexed' : null, comps: 1, base, palette };
+    }
+    default: return { model: null, comps: 1 };
+  }
+}
+
+const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
+/** Components in 0..1 (Lab: L* 0..100 and a*, b* in their range) → sRGB 0..255. */
+function toRgb(ci: ColorInfo, c: number[]): [number, number, number] {
+  if (ci.model === 'gray') return [c[0] * 255, c[0] * 255, c[0] * 255];
+  if (ci.model === 'tint') return [(1 - c[0]) * 255, (1 - c[0]) * 255, (1 - c[0]) * 255];
+  if (ci.model === 'rgb') return [c[0] * 255, c[1] * 255, c[2] * 255];
+  if (ci.model === 'cmyk') return [255 * (1 - c[0]) * (1 - c[3]), 255 * (1 - c[1]) * (1 - c[3]), 255 * (1 - c[2]) * (1 - c[3])];
+  if (ci.model === 'lab') {
+    // CIE L*a*b* → XYZ (relative to the space's white) → linear sRGB (D50 matrix) → gamma.
+    const w = ci.white!, fy = (c[0] + 16) / 116, fx = fy + c[1] / 500, fz = fy - c[2] / 200;
+    const g = (t: number) => (t > 6 / 29 ? t * t * t : 3 * (6 / 29) * (6 / 29) * (t - 4 / 29));
+    const X = w[0] * g(fx), Y = w[1] * g(fy), Z = w[2] * g(fz);
+    const lin = [3.1338561 * X - 1.6168667 * Y - 0.4906146 * Z, -0.9787684 * X + 1.9161415 * Y + 0.033454 * Z, 0.0719453 * X - 0.2289914 * Y + 1.4052427 * Z];
+    const out = lin.map((v) => 255 * clamp01(v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(v, 1 / 2.4) - 0.055));
+    return [out[0], out[1], out[2]];
+  }
+  return [0, 0, 0];
+}
+
 /** Raw bytes of an image: JPEG/JPX files directly; Flate/uncompressed samples as 'raw'. */
 export function extractImage(doc: PdfDocument, info: ImageInfo): ExtractedImage {
   const r = doc.decode(info.stream);
-  const cs = doc.get(info.stream, 'ColorSpace');
-  const csName = isName(cs) ? cs.name : Array.isArray(cs) && isName(cs[0]) ? cs[0].name : '';
-  const components = csName === 'DeviceCMYK' ? 4 : csName === 'DeviceRGB' || csName === 'CalRGB' || csName === 'Lab' ? 3 : csName === 'ICCBased' ? (() => { const n = Array.isArray(cs) ? doc.resolve<PdfStream | null>(cs[1]) : null; return n instanceof PdfStream ? doc.getNum(n, 'N', 3) : 3; })() : csName === 'Indexed' ? 1 : 1;
+  const mask = doc.get(info.stream, 'ImageMask') === true;
+  const ci = colorInfo(doc, info.stream.dict.get('ColorSpace'));
+  const components = mask ? 1 : ci.comps;
+  const bpc = mask ? 1 : info.bpc;
   if (r.imageFilter === 'DCTDecode') return { info, kind: 'jpeg', data: r.data, components, width: info.width, height: info.height, bpc: 8 };
   if (r.imageFilter === 'JPXDecode') return { info, kind: 'jp2', data: r.data, components, width: info.width, height: info.height, bpc: 8 };
-  if (r.imageFilter) return { info, kind: 'unsupported', data: r.data, components, width: info.width, height: info.height, bpc: info.bpc };
-  return { info, kind: 'raw', data: r.data, components, width: info.width, height: info.height, bpc: info.bpc };
+  if (r.imageFilter) return { info, kind: 'unsupported', data: r.data, components, width: info.width, height: info.height, bpc };
+  return { info, kind: 'raw', data: r.data, components, width: info.width, height: info.height, bpc };
 }
 
-/** Expands raw samples (gray/RGB/CMYK/indexed, 1–16 bpc) to RGBA bytes for a canvas. */
+/**
+ * Expands raw samples to RGBA bytes for a canvas: gray, RGB, CMYK, Lab, single-ink (Separation) and
+ * indexed images at 1–16 bits per component, /Decode arrays, stencil masks (painted pixels black,
+ * the rest transparent) and soft masks. Null for colour spaces the engine cannot convert (several
+ * inks, patterns) and for sizes that make no sense.
+ */
 export function rawToRgba(doc: PdfDocument, ex: ExtractedImage): Uint8ClampedArray | null {
-  const { width: w, height: h, bpc, data } = ex;
+  const { width: w, height: h, data } = ex;
   if (ex.kind !== 'raw') return null;
-  const out = new Uint8ClampedArray(w * h * 4);
-  const cs = doc.get(ex.info.stream, 'ColorSpace');
-  const csName = isName(cs) ? cs.name : Array.isArray(cs) && isName(cs[0]) ? cs[0].name : '';
-  let palette: Uint8Array | null = null, palComps = 3;
-  if (csName === 'Indexed' && Array.isArray(cs)) {
-    const base = doc.resolve(cs[1]);
-    const baseName = isName(base) ? base.name : Array.isArray(base) && isName(base[0]) ? base[0].name : 'DeviceRGB';
-    palComps = baseName === 'DeviceCMYK' ? 4 : baseName === 'DeviceGray' ? 1 : 3;
-    const lookup = doc.resolve(cs[3]);
-    palette = lookup instanceof PdfStream ? doc.decoded(lookup) : lookup && typeof (lookup as any).bytes !== 'undefined' ? (lookup as any).bytes : null;
-  }
-  const decode = doc.getArray(ex.info.stream, 'Decode');
-  const inverted = !!decode && doc.resolve<number>(decode[0]) === 1;
-  const comps = palette ? 1 : ex.components;
+  if (!(Number.isInteger(w) && Number.isInteger(h) && w > 0 && h > 0) || w * h > 120_000_000) return null;
+  const st = ex.info.stream;
+  const mask = doc.get(st, 'ImageMask') === true;
+  const ci: ColorInfo = mask ? { model: 'mask', comps: 1 } : colorInfo(doc, st.dict.get('ColorSpace'));
+  if (!ci.model) return null;
+  const bpc = mask ? 1 : ex.bpc;
+  if (![1, 2, 4, 8, 16].includes(bpc)) return null;
+  const comps = ci.comps;
   const rowBytes = Math.ceil((w * comps * bpc) / 8);
-  const max = (1 << bpc) - 1;
+  const max = 2 ** bpc - 1;
   const sample = (row: number, i: number): number => {
     if (bpc === 8) return data[row * rowBytes + i] ?? 0;
-    if (bpc === 16) return (data[row * rowBytes + i * 2] ?? 0);
+    if (bpc === 16) return ((data[row * rowBytes + i * 2] ?? 0) << 8) | (data[row * rowBytes + i * 2 + 1] ?? 0);
     const bit = i * bpc; const byte = data[row * rowBytes + (bit >> 3)] ?? 0;
     return (byte >> (8 - bpc - (bit & 7))) & max;
   };
+  // /Decode maps the sample range onto each component's range; the default depends on the colour space.
+  const dec = (doc.getArray(st, 'Decode') || []).map((x) => doc.resolve<PdfObj>(x)).filter((x): x is number => typeof x === 'number');
+  const lab = ci.model === 'lab' ? [0, 100, ci.range![0], ci.range![1], ci.range![2], ci.range![3]] : null;
+  const lo = (k: number) => (dec.length >= comps * 2 ? dec[k * 2] : lab ? lab[k * 2] : ci.model === 'indexed' ? 0 : 0);
+  const hi = (k: number) => (dec.length >= comps * 2 ? dec[k * 2 + 1] : lab ? lab[k * 2 + 1] : ci.model === 'indexed' ? max : 1);
+  const out = new Uint8ClampedArray(w * h * 4);
+  const c: number[] = new Array(comps).fill(0);
+  const base = ci.base, pal = ci.palette, pc = base ? base.comps : 0, pv: number[] = new Array(pc).fill(0);
+  const baseLab = base && base.model === 'lab' ? [0, 100, base.range![0], base.range![1], base.range![2], base.range![3]] : null;
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
     const o = (y * w + x) * 4;
-    if (palette) {
-      const idx = sample(y, x);
-      const pi = idx * palComps;
-      if (palComps === 1) { out[o] = out[o + 1] = out[o + 2] = palette[pi] ?? 0; }
-      else if (palComps === 4) { const c = palette[pi] / 255, m = palette[pi + 1] / 255, yy = palette[pi + 2] / 255, k = palette[pi + 3] / 255; out[o] = 255 * (1 - c) * (1 - k); out[o + 1] = 255 * (1 - m) * (1 - k); out[o + 2] = 255 * (1 - yy) * (1 - k); }
-      else { out[o] = palette[pi] ?? 0; out[o + 1] = palette[pi + 1] ?? 0; out[o + 2] = palette[pi + 2] ?? 0; }
-    } else if (comps === 1) { let v = (sample(y, x) / (bpc === 16 ? 255 : max)) * 255; if (inverted) v = 255 - v; out[o] = out[o + 1] = out[o + 2] = v; }
-    else if (comps === 3) { for (let k = 0; k < 3; k++) out[o + k] = (sample(y, x * 3 + k) / (bpc === 16 ? 255 : max)) * 255; }
-    else if (comps === 4) { const c = sample(y, x * 4) / max, m = sample(y, x * 4 + 1) / max, yy = sample(y, x * 4 + 2) / max, k = sample(y, x * 4 + 3) / max; const inv = inverted ? -1 : 1; const cc = inverted ? 1 - c : c, mm = inverted ? 1 - m : m, yy2 = inverted ? 1 - yy : yy, kk = inverted ? 1 - k : k; void inv; out[o] = 255 * (1 - cc) * (1 - kk); out[o + 1] = 255 * (1 - mm) * (1 - kk); out[o + 2] = 255 * (1 - yy2) * (1 - kk); }
-    out[o + 3] = 255;
+    for (let k = 0; k < comps; k++) c[k] = lo(k) + (sample(y, x * comps + k) * (hi(k) - lo(k))) / max;
+    if (ci.model === 'mask') { out[o + 3] = c[0] < 0.5 ? 255 : 0; continue; } // 0 paints (with the default /Decode)
+    let rgb: [number, number, number];
+    if (ci.model === 'indexed' && base && pal) {
+      const idx = Math.max(0, Math.round(c[0])) * pc;
+      for (let k = 0; k < pc; k++) { const b = (pal[idx + k] ?? 0) / 255; pv[k] = baseLab ? baseLab[k * 2] + b * (baseLab[k * 2 + 1] - baseLab[k * 2]) : b; }
+      rgb = toRgb(base, pv);
+    } else rgb = toRgb(ci, c);
+    out[o] = rgb[0]; out[o + 1] = rgb[1]; out[o + 2] = rgb[2]; out[o + 3] = 255;
   }
   // Soft mask → alpha
-  const sm = doc.get(ex.info.stream, 'SMask');
+  const sm = doc.get(st, 'SMask');
   if (sm instanceof PdfStream) {
     try {
       const smd = doc.decode(sm);

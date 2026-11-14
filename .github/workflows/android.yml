@@ -19,146 +19,57 @@ on:
         description: 'Publish this build as a GitHub prerelease (works from any branch)'
         type: boolean
         default: false
-  # Called by release.yml, which publishes every platform together.
-  workflow_call:
-    inputs:
-      prerelease:
-        type: boolean
-        default: false
 
 concurrency:
-  # github.workflow is the caller's name when called from release.yml, so the two never cancel each other.
-  group: android-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Build APK + AAB
+    name: Build
+    # A commit marked [release] is built once, by release.yml.
+    if: ${{ !(github.event_name == 'push' && contains(github.event.head_commit.message, '[release]')) }}
+    uses: ./.github/workflows/android-build.yml
+    secrets:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+  # The only job that can write to the repository: it downloads the files the build job made and attaches them.
+  prerelease:
+    name: Publish GitHub prerelease (manual, any branch)
+    needs: build
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease && !startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 10
     permissions:
-      contents: write # needed to create GitHub Releases
+      contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # versionCode must only grow, whichever workflow (Android or Release) builds the APK, so it is
-      # minutes since 2024-01-01 rather than a per-workflow run number.
-      - name: Version code
-        run: echo "VERSION_CODE=$(( ($(date -u +%s) - 1704067200) / 60 ))" >> "$GITHUB_ENV"
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/download-artifact@v4
         with:
-          node-version: 22
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Type-check
-        run: npm run typecheck
-
-      - name: Unit tests
-        run: npm test
-
-      - name: Build web app
-        run: npm run build
-
-      - name: Read app version
-        id: version
+          pattern: QuillFolio-*
+          path: out
+          merge-multiple: true
+      - name: Checksums
         run: |
-          VERSION=$(node -p "require('./package.json').version")
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Anne's Folio version $VERSION, versionCode $VERSION_CODE"
-          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF#refs/tags/v}" != "$VERSION" ]]; then
-            echo "::warning::Tag ${GITHUB_REF#refs/tags/} does not match package.json version $VERSION"
-          fi
-
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
+          cd out
+          sha256sum QuillFolio-* > SHA256SUMS.txt
+          ls -la
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          distribution: temurin
-          java-version: 21
-
-      - name: Set up Gradle (with caching)
-        uses: gradle/actions/setup-gradle@v4
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          # The legacy "tools" package (the action's default) no longer exists in the SDK repository.
-          packages: 'platform-tools platforms;android-36 build-tools;36.0.0'
-
-      - name: Sync Capacitor Android project
-        run: npx cap sync android
-
-      - name: Decode release keystore
-        env:
-          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-        run: |
-          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
-            KS="$RUNNER_TEMP/quillfolio-release.jks"
-            echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KS"
-            echo "ANDROID_KEYSTORE_PATH=$KS" >> "$GITHUB_ENV"
-            echo "Release keystore decoded; release builds will be signed with it."
-          else
-            echo "::warning::ANDROID_KEYSTORE_BASE64 secret not set: the release APK/AAB are signed with a DEBUG key (fine for sideloading/testing, not accepted by Google Play)."
-          fi
-
-      - name: Build release APK and AAB
-        working-directory: android
-        env:
-          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-        run: |
-          chmod +x gradlew
-          ./gradlew --no-daemon --stacktrace assembleRelease bundleRelease
-
-      - name: Collect outputs
-        id: outputs
-        run: |
-          VERSION='${{ steps.version.outputs.version }}'
-          mkdir -p out
-          APK=$(ls android/app/build/outputs/apk/release/*.apk | head -n 1)
-          AAB=$(ls android/app/build/outputs/bundle/release/*.aab | head -n 1)
-          cp "$APK" "out/QuillFolio-$VERSION.apk"
-          cp "$AAB" "out/QuillFolio-$VERSION.aab"
-          (cd out && sha256sum QuillFolio-* > SHA256SUMS.txt)
-          ls -la out
-          echo "apk=out/QuillFolio-$VERSION.apk" >> "$GITHUB_OUTPUT"
-          echo "aab=out/QuillFolio-$VERSION.aab" >> "$GITHUB_OUTPUT"
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: QuillFolio-${{ steps.version.outputs.version }}-apk
-          path: ${{ steps.outputs.outputs.apk }}
-          if-no-files-found: error
-
-      - name: Upload AAB
-        uses: actions/upload-artifact@v4
-        with:
-          name: QuillFolio-${{ steps.version.outputs.version }}-aab
-          path: ${{ steps.outputs.outputs.aab }}
-          if-no-files-found: error
-
-      - name: Publish GitHub prerelease (manual, any branch)
-        if: github.event_name == 'workflow_dispatch' && inputs.prerelease && !startsWith(github.ref, 'refs/tags/') && github.workflow == 'Android'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ steps.version.outputs.version }}-build.${{ github.run_number }}
+          tag_name: v${{ needs.build.outputs.version }}-build.${{ github.run_number }}
           target_commitish: ${{ github.sha }}
-          name: Anne's Folio ${{ steps.version.outputs.version }} (build ${{ github.run_number }})
+          name: Anne's Folio ${{ needs.build.outputs.version }} (build ${{ github.run_number }})
           prerelease: true
           generate_release_notes: true
           body: |
             Test build from branch `${{ github.ref_name }}` at ${{ github.sha }}.
             Install the APK on Android by sideloading (see docs/ANDROID.md).
+            ${{ needs.build.outputs.signing == 'debug' && 'Signed with a throwaway debug key: it cannot update an installed copy signed with another key, and a later build cannot update it (uninstall first).' || 'Signed with the release key.' }}
           files: |
             out/QuillFolio-*.apk
             out/QuillFolio-*.aab

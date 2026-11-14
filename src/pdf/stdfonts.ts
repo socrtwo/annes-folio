@@ -13,8 +13,10 @@ export type StdFont = 'Helvetica' | 'Helvetica-Bold' | 'Helvetica-Oblique' | 'He
 
 export const STD_FONTS: StdFont[] = ['Helvetica', 'Helvetica-Bold', 'Helvetica-Oblique', 'Helvetica-BoldOblique', 'Times-Roman', 'Times-Bold', 'Times-Italic', 'Times-BoldItalic', 'Courier', 'Courier-Bold', 'Courier-Oblique', 'Courier-BoldOblique', 'Symbol', 'ZapfDingbats'];
 
+const COURIER_WIDTHS: number[] = new Array(95).fill(COURIER_WIDTH);
+
 export function stdWidths(font: string): number[] {
-  if (/^Courier/.test(font)) return new Array(95).fill(COURIER_WIDTH);
+  if (/^Courier/.test(font)) return COURIER_WIDTHS;
   if (/^Times/.test(font)) return /Bold/.test(font) ? TIMES_BOLD_WIDTHS : TIMES_WIDTHS;
   return /Bold/.test(font) ? HELVETICA_BOLD_WIDTHS : HELVETICA_WIDTHS;
 }
@@ -42,6 +44,12 @@ export function textWidth(s: string, font: string, size: number): number {
   return (total / 1000) * size;
 }
 
+/** Width of one character in 1/1000 em (the same rule as textWidth). */
+function charUnits(ch: string, font: string): number {
+  const b = winAnsiBytes(ch)[0];
+  return b >= 32 && b <= 126 ? stdWidths(font)[b - 32] : /^Courier/.test(font) ? COURIER_WIDTH : 556;
+}
+
 /** Breaks text into lines that fit a width. */
 export function wrapText(text: string, font: string, size: number, width: number): string[] {
   const lines: string[] = [];
@@ -53,12 +61,17 @@ export function wrapText(text: string, font: string, size: number, width: number
       const cand = line + w;
       if (textWidth(cand, font, size) <= width || !line.trim()) {
         line = cand;
-        // A single word longer than the line: break it by characters.
-        while (textWidth(line, font, size) > width && line.length > 1) {
-          let k = line.length - 1;
-          while (k > 1 && textWidth(line.slice(0, k), font, size) > width) k--;
-          lines.push(line.slice(0, k));
-          line = line.slice(k);
+        // A single word longer than the line: break it by characters, in one pass over the word (measuring
+        // every prefix again for every piece made a long unbroken token take minutes).
+        if (textWidth(line, font, size) > width) {
+          const chars = [...line];
+          let start = 0, units = 0;
+          for (let i = 0; i < chars.length; i++) {
+            const u = charUnits(chars[i], font);
+            if (i > start && ((units + u) / 1000) * size > width) { lines.push(chars.slice(start, i).join('')); start = i; units = 0; }
+            units += u;
+          }
+          line = chars.slice(start).join('');
         }
       } else { lines.push(line.replace(/\s+$/, '')); line = w.trimStart(); }
     }

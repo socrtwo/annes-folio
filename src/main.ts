@@ -1,15 +1,15 @@
 /** Anne's Folio entry point. */
+import './csp';
 import 'material-symbols/outlined.css';
 import './styles/app.css';
 import './styles/folio.css';
 import './ui/scrollcue.css';
 import { installFonts } from './fonts';
 import './commands';
-import { App } from './app';
+import { App, recoverableDraftKeys } from './app';
 import { Shell } from './ui/shell';
 import { launchFile, onFileOpened, onBackButton, isNative, isDesktop, isCapacitor, type OpenedFile } from './platform/native';
 import { closeMenus, inDialog, toast } from './ui/dialog';
-import { kvKeys } from './util/store';
 import { allCommands, getCommand } from './commands/registry';
 import { installScrollCues } from './ui/scrollcue';
 
@@ -30,13 +30,26 @@ app.rebuildKeyIndex();
 app.createTab();
 app.tab.dirty = false;
 app.ui.tabsChanged();
-(window as any).qf = app;
-(window as any).__qfAllIds = allCommands().map((c) => c.id);
-(window as any).__qfGetCommand = getCommand;
-(window as any).__qfEngine = () => import('./pdf/document');
-(window as any).__qfBuild = () => import('./pdf/build');
-(window as any).__qfIO = () => import('./io');
-(window as any).__qfStructure = () => import('./pdf/structure');
+
+// Hooks for the development console and the end-to-end test. Off in released builds unless switched on by hand:
+// localStorage['quillfolio.debugHooks'] = '1'.
+const debugHooks = (() => { try { return import.meta.env.DEV || localStorage.getItem('quillfolio.debugHooks') === '1'; } catch { return false; } })();
+if (debugHooks) {
+  (window as any).qf = app;
+  (window as any).__qfAllIds = allCommands().map((c) => c.id);
+  (window as any).__qfGetCommand = getCommand;
+  (window as any).__qfEngine = () => import('./pdf/document');
+  (window as any).__qfBuild = () => import('./pdf/build');
+  (window as any).__qfIO = () => import('./io');
+  (window as any).__qfStructure = () => import('./pdf/structure');
+}
+
+/** Runs fn once no dialog is open: a document opened behind a dialog would change the active document under it. */
+function afterDialogs(fn: () => void): void {
+  if (!inDialog()) { fn(); return; }
+  toast('The file opens when this dialog is closed.', { ms: 4000 });
+  const t = setInterval(() => { if (!inDialog()) { clearInterval(t); fn(); } }, 250);
+}
 
 // Files dropped on the window open as documents (or insert pages when dropped on the thumbnail rail).
 window.addEventListener('dragover', (e) => { if (e.dataTransfer?.types.includes('Files')) e.preventDefault(); });
@@ -44,8 +57,8 @@ window.addEventListener('drop', (e) => {
   const files = [...(e.dataTransfer?.files || [])];
   if (!files.length) return;
   e.preventDefault();
-  if ((e.target as HTMLElement)?.closest?.('.qf-rail, .qf-grid')) app.exec('organize.insertFiles', files);
-  else app.exec('file.openDropped', files);
+  const onRail = !!(e.target as HTMLElement)?.closest?.('.qf-rail, .qf-grid');
+  afterDialogs(() => { app.exec(onRail ? 'organize.insertFiles' : 'file.openDropped', files); });
 });
 
 async function start() {
@@ -68,15 +81,31 @@ async function start() {
   const { openBuffer } = await import('./commands/file');
   let ready = false;
   const queued: OpenedFile[] = [];
-  onFileOpened((f) => { if (ready) void openBuffer(app, f.data, f.name, f.uri); else queued.push(f); });
+  onFileOpened((f) => { if (ready) afterDialogs(() => { void openBuffer(app, f.data, f.name, f.uri); }); else queued.push(f); });
   const lf = await launchFile();
   if (lf) await openBuffer(app, lf.data, lf.name, lf.uri);
-  const openedAny = !!lf || queued.length > 0;
+  let openedAny = !!lf || queued.length > 0;
   for (const f of queued.splice(0)) await openBuffer(app, f.data, f.name, f.uri);
   ready = true;
-  const drafts = await kvKeys('draft:');
+  // Installed web app: files opened with it from the system (manifest file_handlers) arrive on the launch queue.
+  const launchQueue = (window as any).launchQueue as { setConsumer(fn: (p: { files?: { getFile(): Promise<File> }[] }) => void): void } | undefined;
+  launchQueue?.setConsumer((p) => {
+    const handles = [...(p?.files || [])];
+    if (!handles.length) return;
+    openedAny = true;
+    afterDialogs(() => {
+      void (async () => {
+        for (const h of handles) {
+          try { const f = await h.getFile(); await openBuffer(app, await f.arrayBuffer(), f.name, null); }
+          catch (e: any) { toast(`Could not open the file: ${e?.message || e}`, { ms: 6000 }); }
+        }
+      })();
+    });
+  });
+  let drafts: string[] = [];
+  try { drafts = await recoverableDraftKeys(app); } catch { /* storage unavailable */ }
   if (drafts.length) toast(`${drafts.length} unsaved document(s) can be recovered.`, { action: 'Recover', onAction: () => app.exec('file.recoverUnsaved'), ms: 8000 });
-  if (app.prefs.firstRun && !openedAny) setTimeout(() => app.ui.tour(), 600);
+  if (app.prefs.firstRun && !openedAny) setTimeout(() => { if (!openedAny) void app.ui.tour(); }, 600);
   app.focus();
 }
 void start();

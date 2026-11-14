@@ -5,19 +5,61 @@ import type { Macro } from '../prefs';
 import { getCommand } from './registry';
 import { openDialog, toast, confirmDialog, promptDialog } from '../ui/dialog';
 import { h } from '../ui/dom';
-import { Dict, PdfStream, Ref, Name, PdfString, type PdfObj } from '../pdf/objects';
+import { Dict, PdfStream, Ref, Name, PdfString, nameText, type PdfObj } from '../pdf/objects';
 import { serialize } from '../pdf/writer';
-import { saveBytes, baseName, esc } from './util';
+import { saveBytes, baseName } from './util';
 
-async function runMacro(app: App, name: string): Promise<void> {
+/** How many macros may run inside each other. */
+const MACRO_DEPTH = 8;
+
+/**
+ * Runs a macro's steps in order and stops at the first step that fails or is refused. A macro that would
+ * start itself again (directly, through another macro, or through its macro: button id) is not started.
+ * `stack` holds the macros already running. True when every step ran.
+ */
+export async function runMacro(app: App, name: string, stack: string[] = []): Promise<boolean> {
   const m = app.prefs.macros.find((x) => x.name === name);
-  if (!m) { toast(`No macro named "${name}".`); return; }
-  for (const s of m.steps) {
-    if (s.id === 'dev.runMacro' && s.arg === name) continue; // never recurse into itself
-    if (!getCommand(s.id)) { toast(`Macro "${name}" stopped: the command ${s.id} no longer exists.`); return; }
-    const r = app.exec(s.id, s.arg);
-    if (r instanceof Promise) await r;
+  if (!m) { toast(`No macro named "${name}".`); return false; }
+  if (stack.includes(name) || stack.length >= MACRO_DEPTH) {
+    toast(`Macro "${name}" was not run: ${stack.includes(name) ? 'it would start itself again' : 'too many macros run inside each other'} (${[...stack, name].join(' → ')}).`, { ms: 7000 });
+    return false;
   }
+  for (const [i, s] of m.steps.entries()) {
+    const inner = s.id === 'dev.runMacro' && typeof s.arg === 'string' ? s.arg : s.id.startsWith('macro:') ? s.id.slice(6) : null;
+    if (inner !== null) { if (!(await runMacro(app, inner, [...stack, name]))) return false; continue; }
+    const c = getCommand(s.id);
+    if (!c) { toast(`Macro "${name}" stopped: the command ${s.id} no longer exists.`); return false; }
+    let r = app.exec(s.id, s.arg);
+    // exec has already reported a failure; here it only ends the macro.
+    if (r instanceof Promise) { try { r = await r; } catch { r = false; } }
+    if (r === false) { toast(`Macro "${name}" stopped at step ${i + 1} (${c.label}); the remaining steps were not run.`, { ms: 6000 }); return false; }
+  }
+  return true;
+}
+
+/** One macro step per line: a command id, then an optional JSON argument (kept exactly as typed). "#" starts a comment line. */
+export function parseMacroSteps(text: string): { steps: { id: string; arg?: any }[]; error: string | null } {
+  const steps: { id: string; arg?: any }[] = [];
+  for (const [i, line] of String(text).split('\n').entries()) {
+    const t = line.trim();
+    if (!t || t.startsWith('#')) continue;
+    const m = /^(\S+)\s*([\s\S]*)$/.exec(t)!;
+    if (!getCommand(m[1])) return { steps, error: `Line ${i + 1}: unknown command "${m[1]}".` };
+    if (!m[2]) { steps.push({ id: m[1] }); continue; }
+    try { steps.push({ id: m[1], arg: JSON.parse(m[2]) }); } catch { return { steps, error: `Line ${i + 1}: the argument is not valid JSON.` }; }
+  }
+  return { steps, error: null };
+}
+
+/** Points everything that names a macro (bar, shortcuts, custom tabs) at its new name, or removes it (next = null). */
+export function retargetMacro(app: App, old: string, next: string | null): void {
+  const from = `macro:${old}`, to = next === null ? null : `macro:${next}`;
+  const swap = (ids: string[]): string[] => ids.flatMap((id) => (id !== from ? [id] : to ? [to] : []));
+  const p = app.prefs;
+  p.qat = swap(p.qat);
+  p.pinnedCommands = swap(p.pinnedCommands);
+  p.keymap = Object.fromEntries(Object.entries(p.keymap).flatMap(([k, id]) => (id !== from ? [[k, id]] : to ? [[k, to]] : [])));
+  p.customTabs = p.customTabs.map((t) => ({ ...t, groups: t.groups.map((g) => ({ ...g, items: swap(g.items) })) }));
 }
 
 function stepsLabel(m: Macro): string {
@@ -27,7 +69,7 @@ function stepsLabel(m: Macro): string {
 /** A JSON-friendly dump of an object graph (depth-limited; streams as summaries). */
 export function toJsonish(doc: App['doc'], o: PdfObj, depth: number, seen = new Set<number>()): unknown {
   if (o instanceof Ref) { if (depth <= 0 || seen.has(o.num)) return `${o.num} ${o.gen} R`; seen.add(o.num); return { $ref: `${o.num} ${o.gen} R`, value: toJsonish(doc, doc.fetch(o), depth - 1, seen) }; }
-  if (o instanceof Name) return `/${o.name}`;
+  if (o instanceof Name) return `/${nameText(o.name)}`;
   if (o instanceof PdfString) return o.toText();
   if (o instanceof PdfStream) return { $stream: o.raw.length, dict: toJsonish(doc, o.dict, depth, seen) };
   if (o instanceof Dict) { const out: Record<string, unknown> = {}; for (const k of o.keys()) out[k] = depth > 0 ? toJsonish(doc, o.get(k)!, depth - 1, seen) : String(o.get(k)); return out; }
@@ -70,9 +112,14 @@ def([
       const m = ms.find((x) => x.name === r.m)!;
       if (r.act === 'run') await runMacro(app, m.name);
       else if (r.act === 'edit') app.exec('dev.macroEditor', m.name);
-      else if (r.act === 'rename') { const n = await promptDialog('Rename Macro', 'Name', m.name); if (n && !ms.some((x) => x.name === n)) { const old = m.name; m.name = n; app.prefs.qat = app.prefs.qat.map((q) => (q === `macro:${old}` ? `macro:${n}` : q)); app.savePrefs(); app.ui.renderQat(); } }
+      else if (r.act === 'rename') {
+        const n = (await promptDialog('Rename Macro', 'Name', m.name))?.trim();
+        if (!n || n === m.name) return;
+        if (ms.some((x) => x.name === n)) { toast(`There is already a macro named "${n}".`); return; }
+        retargetMacro(app, m.name, n); m.name = n; app.savePrefs(); app.ui.rebuild();
+      }
       else if (r.act === 'qat') { if (!app.prefs.qat.includes(`macro:${m.name}`)) app.prefs.qat = [...app.prefs.qat, `macro:${m.name}`]; app.savePrefs(); app.ui.renderQat(); }
-      else if (r.act === 'delete' && (await confirmDialog('Delete Macro', `Delete "${m.name}"?`, 'Delete'))) { app.prefs.macros = ms.filter((x) => x !== m); app.prefs.qat = app.prefs.qat.filter((q) => q !== `macro:${m.name}`); app.savePrefs(); app.ui.renderQat(); }
+      else if (r.act === 'delete' && (await confirmDialog('Delete Macro', `Delete "${m.name}"? Its Quick Access Bar buttons and keyboard shortcuts are removed too.`, 'Delete'))) { app.prefs.macros = app.prefs.macros.filter((x) => x !== m); retargetMacro(app, m.name, null); app.savePrefs(); app.ui.rebuild(); }
     },
   },
   { id: 'dev.runMacro', label: 'Run Macro', icon: 'play_arrow', tab: 'Developer', group: 'Code', internal: true, noRecord: true, edits: false, run: (app, name: string) => runMacro(app, name) },
@@ -91,6 +138,12 @@ def([
     },
   },
   {
+    id: 'dev.pauseRecording', label: 'Pause Recording', icon: 'pause', tab: 'Developer', group: 'Code', kind: 'toggle', noRecord: true, edits: false,
+    tip: 'While paused, the commands you run are not added to the macro; choose it again to go on recording',
+    isEnabled: (app) => !!app.recording, isActive: (app) => !!app.recording && app.recordingPaused,
+    run: (app) => { if (!app.recording) return; app.recordingPaused = !app.recordingPaused; app.ui.status?.(app.recordingPaused ? '⏸ Macro recording paused' : '● Recording macro'); },
+  },
+  {
     id: 'dev.stopRecording', label: 'Stop Recording', icon: 'stop', tab: 'Developer', group: 'Code', noRecord: true, edits: false, isEnabled: (app) => !!app.recording,
     run: (app) => {
       const rec = app.recording;
@@ -107,32 +160,36 @@ def([
     id: 'dev.macroEditor', label: 'Macro Editor', icon: 'code', tab: 'Developer', group: 'Code', noRecord: true, edits: false,
     tip: 'Edit a macro\'s steps (one command per line: id and an optional JSON argument)',
     run: async (app, name?: string) => {
-      const ms = app.prefs.macros;
-      const m = ms.find((x) => x.name === name) || ms[0];
+      let ms = app.prefs.macros;
+      let m = name === undefined ? undefined : ms.find((x) => x.name === name);
+      // Opened without a macro: ask which one to edit, or start a new one.
+      if (name === undefined && ms.length) {
+        const pick = await openDialog({ title: 'Macro Editor', fields: [{ key: 'm', label: 'Edit', type: 'list', options: [{ value: '', label: 'A new macro…' }, ...ms.map((x) => ({ value: x.name, label: `${x.name} — ${stepsLabel(x)}` }))], value: '' }], ok: 'Edit' });
+        if (!pick) return;
+        m = app.prefs.macros.find((x) => x.name === pick.m);
+      }
       const text = m ? m.steps.map((s) => (s.arg === undefined ? s.id : `${s.id} ${JSON.stringify(s.arg)}`)).join('\n') : 'organize.rotateRight\ncomment.flatten';
       const r = await openDialog({ title: m ? `Edit Macro: ${m.name}` : 'New Macro', wide: true, fields: [
         { key: 'name', label: 'Name', type: 'text', value: m?.name || `Macro${ms.length + 1}` },
         { key: 'desc', label: 'Description', type: 'text', value: m?.description || '' },
-        { key: 'steps', label: 'Steps', type: 'textarea', rows: 14, value: text, help: 'Find command ids in Help ▸ Command Reference or the Customize dialogs. Macros run Anne\'s Folio commands only; they cannot reach files, the network or other apps.' },
-      ], validate: (v) => {
-        for (const [i, line] of String(v.steps).split('\n').entries()) {
-          const t = line.trim(); if (!t || t.startsWith('#')) continue;
-          const [id, ...rest] = t.split(/\s+/);
-          if (!getCommand(id)) return `Line ${i + 1}: unknown command "${id}".`;
-          if (rest.length) { try { JSON.parse(rest.join(' ')); } catch { return `Line ${i + 1}: the argument is not valid JSON.`; } }
-        }
-        return v.name ? null : 'Give the macro a name.';
-      } });
+        { key: 'steps', label: 'Steps', type: 'textarea', rows: 14, value: text, help: 'One command per line: its id, then an optional JSON argument. Find command ids in Help ▸ Command Reference or the Customize dialogs. A macro can run any Anne\'s Folio command, nothing else.' },
+      ], validate: (v) => parseMacroSteps(v.steps).error || (String(v.name).trim() ? null : 'Give the macro a name.') });
       if (!r) return;
-      const steps = String(r.steps).split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#')).map((l) => { const [id, ...rest] = l.split(/\s+/); return rest.length ? { id, arg: JSON.parse(rest.join(' ')) } : { id }; });
-      app.prefs.macros = [...ms.filter((x) => x.name !== r.name && x !== m), { name: r.name, description: r.desc || undefined, steps, created: m?.created || Date.now() }];
+      const newName = String(r.name).trim();
+      ms = app.prefs.macros;
+      const clash = ms.find((x) => x.name === newName && x !== m);
+      if (clash && !(await confirmDialog('Macro Editor', `There is already a macro named "${newName}". Replace it?`, 'Replace'))) return;
+      const { steps } = parseMacroSteps(r.steps);
+      if (m && m.name !== newName) retargetMacro(app, m.name, newName);
+      app.prefs.macros = [...app.prefs.macros.filter((x) => x !== clash && x !== m), { name: newName, description: r.desc || undefined, steps, created: m?.created || Date.now() }];
       app.savePrefs();
-      toast(`Saved "${r.name}".`, { action: 'Run', onAction: () => void runMacro(app, r.name) });
+      app.ui.rebuild();
+      toast(`Saved "${newName}".`, { action: 'Run', onAction: () => void runMacro(app, newName) });
     },
   },
   {
     id: 'dev.macroSecurity', label: 'Macro Security', icon: 'admin_panel_settings', tab: 'Developer', group: 'Code', noRecord: true, edits: false,
-    run: async () => { await openDialog({ title: 'Macro Security', ok: 'Close', cancel: false, fields: [{ key: 'i', type: 'info', html: '<p><b>Anne\'s Folio macros are lists of Anne\'s Folio commands.</b> They can do only what you could do with the ribbon: mark up, organize pages, export. They cannot run code, read or write files on their own, or use the network.</p><p><b>JavaScript inside PDF files</b> (document scripts, field calculations, link actions) is <b>never run</b> by Anne\'s Folio. Developer ▸ Scripts in This Document lists what is there; Protect ▸ Remove JavaScript strips it.</p>' }] }); },
+    run: async () => { await openDialog({ title: 'Macro Security', ok: 'Close', cancel: false, fields: [{ key: 'i', type: 'info', html: '<p><b>Anne\'s Folio macros are lists of Anne\'s Folio commands.</b> A macro can do what you could do yourself with the ribbon, and nothing else: mark up, organize pages, save, export, share. That includes commands that send text out, such as the AI commands (to the AI service you set up) and Share or Email. A macro cannot run code of its own, and it cannot read or write files or use the network except through those commands. Look at a macro\'s steps (Developer ▸ Macros ▸ Edit) before you run one you did not record yourself; this applies to macros that arrive with imported settings.</p><p>A macro stops at the first step that fails or is refused, and it cannot start itself again.</p><p><b>JavaScript inside PDF files</b> (document scripts, field calculations, link actions) is <b>never run</b> by Anne\'s Folio. Developer ▸ Scripts in This Document lists what is there; Protect ▸ Remove JavaScript strips it.</p>' }] }); },
   },
   {
     id: 'dev.javaScriptInfo', label: 'Scripts in This Document', icon: 'code_off', tab: 'Developer', group: 'Code', noRecord: true, edits: false,
@@ -160,7 +217,7 @@ def([
       const walk = (o: PdfObj | undefined, depth: number) => { if (depth > 40 || n > 20000) return; const x = d.resolve(o); if (Array.isArray(x)) { for (const k of x) walk(k, depth + 1); return; } if (!(x instanceof Dict)) return; const s = d.getName(x, 'S'); if (s) { counts.set(s, (counts.get(s) || 0) + 1); n++; } walk(x.get('K'), depth + 1); };
       if (root) walk(root.get('K'), 0);
       const rows = [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}: ${v}`);
-      await openDialog({ title: 'Tag Structure', ok: 'Close', cancel: false, content: h('div', null, h('p', null, root ? `Tagged: ${mi && d.get(mi, 'Marked') === true ? 'yes (MarkInfo/Marked)' : 'structure tree present, MarkInfo not set'}; ${n} structure element(s).` : 'The document is not tagged (no StructTreeRoot). Anne\'s Folio cannot add tags to existing content.'), rows.length ? h('pre', { class: 'ql-notices' }, rows.join('\n')) : null, root && root.has('RoleMap') ? h('p', { class: 'ql-help' }, `Role map: ${esc(Object.entries(toJsonish(d, root.get('RoleMap')!, 1) as any).map(([k, v]) => `${k}→${v}`).join(', '))}`) : null) });
+      await openDialog({ title: 'Tag Structure', ok: 'Close', cancel: false, content: h('div', null, h('p', null, root ? `Tagged: ${mi && d.get(mi, 'Marked') === true ? 'yes (MarkInfo/Marked)' : 'structure tree present, MarkInfo not set'}; ${n} structure element(s).` : 'The document is not tagged (no StructTreeRoot). Anne\'s Folio cannot add tags to existing content.'), rows.length ? h('pre', { class: 'ql-notices' }, rows.join('\n')) : null, root && root.has('RoleMap') ? h('p', { class: 'ql-help' }, `Role map: ${Object.entries(toJsonish(d, root.get('RoleMap')!, 1) as any).map(([k, v]) => `${k}→${v}`).join(', ')}`) : null) });
     },
   },
   {

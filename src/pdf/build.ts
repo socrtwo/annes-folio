@@ -15,7 +15,9 @@ export const PAPER: Record<string, [number, number]> = { letter: [612, 792], leg
 export function stdFontRef(doc: PdfDocument, font: StdFont | string): Ref {
   const key = `__font_${font}`;
   const d = doc as any;
-  if (d[key]) return d[key];
+  // The remembered reference is used only while it still names this font: after an undo the object is
+  // gone and its number may have been given to something else.
+  if (d[key] instanceof Ref) { const o = doc.resolve<PdfObj>(d[key]); if (o instanceof Dict && doc.getName(o, 'Type') === 'Font' && doc.getName(o, 'BaseFont') === font) return d[key]; }
   const f = new Dict({ Type: Name.get('Font'), Subtype: Name.get('Type1'), BaseFont: Name.get(font) });
   if (!/Symbol|Dingbats/.test(font)) f.set('Encoding', Name.get('WinAnsiEncoding'));
   const ref = doc.register(f);
@@ -77,16 +79,36 @@ export function addBlankPage(doc: PdfDocument, size: [number, number] = PAPER.le
   const pagesRef = doc.pagesRootRef || doc.register(new Dict({ Type: Name.get('Pages'), Kids: [], Count: 0 }));
   if (!doc.pagesRootRef) { doc.catalog.set('Pages', pagesRef); doc.update(doc.catalogRef, doc.catalog); }
   const root = doc.resolve<Dict>(pagesRef);
-  const page = new Dict({ Type: Name.get('Page'), Parent: pagesRef, MediaBox: [0, 0, size[0], size[1]], Resources: new Dict() });
+  // `at` is a page index. The page tree may be nested, so the new page goes before the page that is at
+  // that index now, in that page's own parent node; with no such page it is added at the end of the root.
+  const target = at != null ? doc.pages[Math.max(0, at)] : undefined;
+  let parentRef = pagesRef, parent = root, idx = -1;
+  if (target?.ref) {
+    const pr = target.dict.get('Parent');
+    const pd = pr instanceof Ref ? doc.resolve<PdfObj>(pr) : null;
+    const i = pd instanceof Dict ? (doc.getArray(pd, 'Kids') || []).findIndex((k) => k instanceof Ref && k.num === target.ref!.num) : -1;
+    if (pr instanceof Ref && pd instanceof Dict && i >= 0) { parentRef = pr; parent = pd; idx = i; }
+    else idx = (doc.getArray(root, 'Kids') || []).findIndex((k) => k instanceof Ref && k.num === target.ref!.num);
+  }
+  const page = new Dict({ Type: Name.get('Page'), Parent: parentRef, MediaBox: [0, 0, size[0], size[1]], Resources: new Dict() });
   const ref = doc.register(page);
-  const kids = (doc.getArray(root, 'Kids') || []).slice();
-  if (at == null || at >= kids.length) kids.push(ref); else kids.splice(Math.max(0, at), 0, ref);
-  root.set('Kids', kids);
-  root.set('Count', doc.getNum(root, 'Count') + 1);
-  // Parent chain counts
-  let parent = doc.getDict(root, 'Parent'); let pref = root.get('Parent');
-  while (parent) { parent.set('Count', doc.getNum(parent, 'Count') + 1); if (pref instanceof Ref) doc.touch(pref); pref = parent.get('Parent'); parent = doc.getDict(parent, 'Parent'); }
-  doc.update(pagesRef, root);
+  const kids = (doc.getArray(parent, 'Kids') || []).slice();
+  if (idx >= 0) kids.splice(idx, 0, ref); else kids.push(ref);
+  parent.set('Kids', kids);
+  // One more page in this node and in every node above it. A blank page must not pick up a rotation or a
+  // crop box that those nodes hand down.
+  const seen = new Set<number>();
+  let nodeRef: PdfObj | undefined = parentRef, node: Dict | null = parent;
+  while (node && nodeRef instanceof Ref && !seen.has(nodeRef.num)) {
+    seen.add(nodeRef.num);
+    if (node.has('Rotate') && !page.has('Rotate')) page.set('Rotate', 0);
+    if (node.has('CropBox') && !page.has('CropBox')) page.set('CropBox', [0, 0, size[0], size[1]]);
+    node.set('Count', doc.getNum(node, 'Count') + 1);
+    doc.update(nodeRef, node);
+    nodeRef = node.get('Parent');
+    const up: PdfObj = nodeRef instanceof Ref ? doc.resolve<PdfObj>(nodeRef) : null;
+    node = up instanceof Dict ? up : null;
+  }
   doc.invalidatePages();
   return doc.pages.find((p) => p.ref?.num === ref.num)!;
 }

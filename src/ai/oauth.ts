@@ -6,8 +6,10 @@
  * OpenRouter accepts https callbacks and http://localhost / 127.0.0.1 on any port.
  *  - Browser build: the callback is this page (opened in a new tab), which finishes the
  *    exchange and tells the original tab through BroadcastChannel.
- *  - Android: QuillNative listens once on http://127.0.0.1:<port>/ and passes the redirect to
- *    the app.
+ *  - Android and desktop: the native bridge listens once on http://127.0.0.1:<port>/ and passes the
+ *    redirect to the app.
+ *  - iOS app: not available (the app has no address OpenRouter can redirect to); signInAvailable()
+ *    is false and the wizard offers pasting a key instead.
  * If neither works (for example a browser that blocks the local redirect), the user can paste
  * the address bar URL or the code shown by OpenRouter; parseOAuthInput() accepts both.
  *
@@ -15,7 +17,7 @@
  * parameter in the browser). Redirects without it are ignored: another app on the device could
  * otherwise end the sign-in with a bogus code, or hand Anne's Folio a code for an account of its own.
  */
-import { isNative, openExternal, startOAuthLoopback, stopOAuthLoopback, onOAuthCallback } from '../platform/native';
+import { isNative, isCapacitor, openExternal, startOAuthLoopback, stopOAuthLoopback, onOAuthCallback } from '../platform/native';
 
 const AUTH_URL = 'https://openrouter.ai/auth';
 const EXCHANGE_URL = 'https://openrouter.ai/api/v1/auth/keys';
@@ -59,9 +61,16 @@ export function parseOAuthInput(s: string): string | null {
   return /^[A-Za-z0-9._~-]{16,}$/.test(t) ? t : null;
 }
 
+/** False in the iOS app: its pages live at capacitor://localhost, which a browser cannot be redirected to. */
+export const signInAvailable = (): boolean => isNative() || !isCapacitor();
+
 export interface OAuthSession {
   /** Resolves with the API key, or rejects on timeout/cancel. */
   key: Promise<string>;
+  /** The sign-in address, for a link the user can click when `opened` is false. */
+  url: string;
+  /** False when the browser refused to open the sign-in tab (a pop-up blocker). */
+  opened: boolean;
   /** Finish manually with a pasted URL or code. */
   complete(input: string): Promise<string>;
   cancel(): void;
@@ -69,7 +78,13 @@ export interface OAuthSession {
 
 /** Start sign-in: opens openrouter.ai in the default browser. */
 export async function startOpenRouterSignIn(timeoutMs = 10 * 60 * 1000): Promise<OAuthSession> {
-  const { verifier, challenge } = await pkce();
+  if (!signInAvailable()) throw new Error('One-click sign-in is not available in the iOS app. Create a key on openrouter.ai and paste it here.');
+  // Browsers only let a page open a tab while it is handling the click, so the tab is opened before
+  // the first await and pointed at OpenRouter once the address is known.
+  let tab: Window | null = null;
+  if (!isNative()) { try { tab = window.open('about:blank', '_blank'); } catch { tab = null; } }
+  const closeTab = () => { try { tab?.close(); } catch { /* not ours to close any more */ } };
+  const { verifier, challenge } = await pkce().catch((e) => { closeTab(); throw e; });
   const nonce = b64url(crypto.getRandomValues(new Uint8Array(16)));
   let settle!: { resolve: (k: string) => void; reject: (e: Error) => void };
   const key = new Promise<string>((resolve, reject) => { settle = { resolve, reject }; });
@@ -117,11 +132,17 @@ export async function startOpenRouterSignIn(timeoutMs = 10 * 60 * 1000): Promise
   cleanup.push(() => clearTimeout(timer));
 
   const url = `${AUTH_URL}?callback_url=${encodeURIComponent(callback)}&code_challenge=${challenge}&code_challenge_method=S256`;
+  let opened = true;
   if (isNative()) openExternal(url);
-  else window.open(url, '_blank', 'noopener');
+  else if (tab) {
+    // The sign-in page must not be able to reach back into this window.
+    try { tab.opener = null; tab.location.href = url; } catch { opened = false; closeTab(); }
+  } else opened = false;
 
   return {
     key,
+    url,
+    opened,
     async complete(input: string) {
       const c = parseOAuthInput(input);
       if (!c) throw new Error('That does not look like an OpenRouter sign-in code or redirect address.');

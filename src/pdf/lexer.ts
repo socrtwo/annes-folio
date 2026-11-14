@@ -2,7 +2,7 @@
  * Tokenizer and object parser for PDF syntax (ISO 32000-1 §7.2–7.3). Tolerant by design: a
  * damaged file is parsed as far as it goes and the repair pipeline decides what to do with the rest.
  */
-import { Dict, Name, PdfObj, PdfStream, PdfString, Ref } from './objects';
+import { Dict, Name, PdfObj, PdfStream, PdfString, Ref, latin1 } from './objects';
 
 export type Token =
   | { t: 'num'; v: number }
@@ -19,6 +19,8 @@ for (const c of '()<>[]{}/%') DELIM[c.charCodeAt(0)] = 1;
 export const isWhite = (c: number): boolean => WS[c] === 1;
 export const isDelim = (c: number): boolean => DELIM[c] === 1;
 export const isRegular = (c: number): boolean => !WS[c] && !DELIM[c];
+const HEX = new Int8Array(256).fill(-1);
+for (let i = 0; i < 16; i++) { HEX['0123456789abcdef'.charCodeAt(i)] = i; HEX['0123456789ABCDEF'.charCodeAt(i)] = i; }
 
 export class Lexer {
   constructor(public buf: Uint8Array, public pos = 0) {}
@@ -36,37 +38,37 @@ export class Lexer {
   peekByte(): number { return this.pos < this.buf.length ? this.buf[this.pos] : -1; }
 
   next(): Token {
-    this.skipWs();
     const b = this.buf;
-    if (this.pos >= b.length) return { t: 'eof' };
-    const c = b[this.pos];
-    if ((c >= 0x30 && c <= 0x39) || c === 0x2b || c === 0x2d || c === 0x2e) return this.number();
-    if (c === 0x28) return { t: 'str', v: this.literalString() };
-    if (c === 0x2f) return { t: 'name', v: this.name() };
-    if (c === 0x3c) {
-      if (b[this.pos + 1] === 0x3c) { this.pos += 2; return { t: 'delim', v: '<<' }; }
-      return { t: 'str', v: this.hexString() };
+    // A loop, not recursion: a long run of stray ')' or '>' must not grow the stack.
+    for (;;) {
+      this.skipWs();
+      if (this.pos >= b.length) return { t: 'eof' };
+      const c = b[this.pos];
+      if ((c >= 0x30 && c <= 0x39) || c === 0x2b || c === 0x2d || c === 0x2e) return this.number();
+      if (c === 0x28) return { t: 'str', v: this.literalString() };
+      if (c === 0x2f) return { t: 'name', v: this.name() };
+      if (c === 0x3c) {
+        if (b[this.pos + 1] === 0x3c) { this.pos += 2; return { t: 'delim', v: '<<' }; }
+        return { t: 'str', v: this.hexString() };
+      }
+      if (c === 0x3e) {
+        if (b[this.pos + 1] === 0x3e) { this.pos += 2; return { t: 'delim', v: '>>' }; }
+        this.pos++; continue; // stray '>'
+      }
+      if (c === 0x5b) { this.pos++; return { t: 'delim', v: '[' }; }
+      if (c === 0x5d) { this.pos++; return { t: 'delim', v: ']' }; }
+      if (c === 0x7b) { this.pos++; return { t: 'delim', v: '{' }; }
+      if (c === 0x7d) { this.pos++; return { t: 'delim', v: '}' }; }
+      if (c === 0x29) { this.pos++; continue; } // stray ')'
+      const start = this.pos;
+      while (this.pos < b.length && isRegular(b[this.pos])) this.pos++;
+      if (this.pos === start) { this.pos++; continue; }
+      return { t: 'kw', v: latin1(b, start, this.pos) };
     }
-    if (c === 0x3e) {
-      if (b[this.pos + 1] === 0x3e) { this.pos += 2; return { t: 'delim', v: '>>' }; }
-      this.pos++; return this.next(); // stray '>'
-    }
-    if (c === 0x5b) { this.pos++; return { t: 'delim', v: '[' }; }
-    if (c === 0x5d) { this.pos++; return { t: 'delim', v: ']' }; }
-    if (c === 0x7b) { this.pos++; return { t: 'delim', v: '{' }; }
-    if (c === 0x7d) { this.pos++; return { t: 'delim', v: '}' }; }
-    if (c === 0x29) { this.pos++; return this.next(); } // stray ')'
-    const start = this.pos;
-    while (this.pos < b.length && isRegular(b[this.pos])) this.pos++;
-    if (this.pos === start) { this.pos++; return this.next(); }
-    let s = '';
-    for (let i = start; i < this.pos; i++) s += String.fromCharCode(b[i]);
-    return { t: 'kw', v: s };
   }
 
   private number(): Token {
     const b = this.buf;
-    const start = this.pos;
     let s = '';
     while (this.pos < b.length && isRegular(b[this.pos])) { s += String.fromCharCode(b[this.pos]); this.pos++; }
     // Tolerate things like "--5", "3.4.5", ".5", "6." and junk suffixes.
@@ -79,25 +81,23 @@ export class Lexer {
       if (!/^[+-.]+$/.test(s)) return { t: 'kw', v: s };
       v = 0;
     }
-    void start;
     return { t: 'num', v };
   }
 
+  /** A name as its bytes (one char per byte) so it is written back exactly; nameText() decodes it for display. */
   private name(): string {
     const b = this.buf;
     this.pos++; // '/'
-    const out: number[] = [];
+    let s = '';
     while (this.pos < b.length && isRegular(b[this.pos])) {
       let c = b[this.pos++];
       if (c === 0x23 && this.pos + 1 < b.length) {
-        const h = parseInt(String.fromCharCode(b[this.pos], b[this.pos + 1]), 16);
-        if (!isNaN(h)) { c = h; this.pos += 2; }
+        const hi = HEX[b[this.pos]], lo = HEX[b[this.pos + 1]];
+        if (hi >= 0 && lo >= 0) { c = hi * 16 + lo; this.pos += 2; } // a "#" without two hex digits stays a "#"
       }
-      out.push(c);
+      s += String.fromCharCode(c);
     }
-    let s = '';
-    for (const c of out) s += String.fromCharCode(c);
-    try { return decodeURIComponent(escape(s)); } catch { return s; }
+    return s;
   }
 
   private literalString(): PdfString {
@@ -108,6 +108,7 @@ export class Lexer {
     while (this.pos < b.length) {
       let c = b[this.pos++];
       if (c === 0x5c) { // backslash
+        if (this.pos >= b.length) break;
         c = b[this.pos++];
         switch (c) {
           case 0x6e: out.push(10); break; // n
@@ -180,7 +181,8 @@ export class Parser {
   lexer: Lexer;
   /** The last keyword the parser stopped at (e.g. 'endobj', 'stream'), for callers. */
   lastKeyword = '';
-  constructor(buf: Uint8Array, pos = 0, private resolve: LengthResolver = (o) => o) {
+  /** `refs: false` is for content streams, where "n g R" cannot occur and numbers need no lookahead. */
+  constructor(buf: Uint8Array, pos = 0, private resolve: LengthResolver = (o) => o, private refs = true) {
     this.lexer = new Lexer(buf, pos);
   }
   get pos(): number { return this.lexer.pos; }
@@ -192,16 +194,32 @@ export class Parser {
     switch (tok.t) {
       case 'eof': return { kw: 'EOF' };
       case 'num': {
-        // Look ahead for "gen R" (a reference).
+        // Look ahead for "gen R" (a reference). The usual case (digits and white space) is checked on the
+        // bytes, so a long array of numbers is not tokenized three times over.
+        if (!this.refs || !Number.isInteger(tok.v) || tok.v < 0) return tok.v;
+        const b = this.lexer.buf;
+        let p = this.lexer.pos;
+        while (p < b.length && isWhite(b[p])) p++;
+        if (b[p] !== 0x25) {
+          const d0 = p;
+          while (p < b.length && b[p] >= 0x30 && b[p] <= 0x39) p++;
+          if (p === d0 || p - d0 > 10 || p >= b.length || !(isWhite(b[p]) || b[p] === 0x25)) return tok.v;
+          if (b[p] !== 0x25) {
+            let gen = 0;
+            for (let i = d0; i < p; i++) gen = gen * 10 + (b[i] - 0x30);
+            while (p < b.length && isWhite(b[p])) p++;
+            if (b[p] !== 0x25) {
+              if (b[p] === 0x52 && (p + 1 >= b.length || !isRegular(b[p + 1]))) { this.lexer.pos = p + 1; return new Ref(tok.v, gen); }
+              return tok.v;
+            }
+          }
+        }
+        // A comment sits between the tokens: tokenize.
         const save = this.lexer.pos;
         const t2 = this.lexer.next();
-        if (t2.t === 'num' && Number.isInteger(tok.v) && tok.v >= 0 && Number.isInteger(t2.v) && t2.v >= 0) {
-          const save2 = this.lexer.pos;
+        if (t2.t === 'num' && Number.isInteger(t2.v) && t2.v >= 0) {
           const t3 = this.lexer.next();
           if (t3.t === 'kw' && t3.v === 'R') return new Ref(tok.v, t2.v);
-          this.lexer.pos = save2;
-          this.lexer.pos = save;
-          return tok.v;
         }
         this.lexer.pos = save;
         return tok.v;
@@ -286,9 +304,8 @@ export class Parser {
       dict.set('Length', len);
     }
     const raw = b.subarray(start, start + len);
-    let after = Lexer.find(b, 'endstream', start + len, start + len + 32);
+    const after = Lexer.find(b, 'endstream', start + len, start + len + 32);
     this.lexer.pos = after >= 0 ? after + 9 : start + len;
-    void after;
     return new PdfStream(dict, raw);
   }
 
@@ -299,7 +316,7 @@ export class Parser {
     const t3 = this.lexer.next();
     if (t1.t !== 'num' || t2.t !== 'num' || t3.t !== 'kw' || t3.v !== 'obj') return null;
     const v = this.parse();
-    const obj = v && typeof v === 'object' && 'kw' in v ? (v.kw === 'endobj' ? null : null) : (v as PdfObj);
+    const obj = v && typeof v === 'object' && 'kw' in v ? null : (v as PdfObj);
     // Skip to endobj if it is close by.
     const save = this.lexer.pos;
     const t = this.lexer.next();

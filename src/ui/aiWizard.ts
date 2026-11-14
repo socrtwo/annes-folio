@@ -13,10 +13,12 @@ import { h, icon, clear } from './dom';
 import { openDialog, toast, confirmDialog } from './dialog';
 import type { App } from '../app';
 import { PROVIDERS, providerById, detectKey, FREE_LABEL, type ProviderDef } from '../ai/providers';
-import { aiSettings, saveAiSettings, getApiKey, setApiKey, deleteApiKey, maskKey, resolveBaseUrl, type ProviderConfig } from '../ai/store';
+import { aiSettings, saveAiSettings, getApiKey, setApiKey, deleteApiKey, maskKey, resolveBaseUrl, keyStorage, type ProviderConfig, type KeyStorage } from '../ai/store';
+import { signInAvailable, startOpenRouterSignIn } from '../ai/oauth';
 import { listModels, pickModels, chat, AiError } from '../ai/client';
 import { costNote, normalizeEnsemble, MAX_MEMBERS, type EnsembleMode, type EnsembleSettings } from '../ai/ensemble';
 import { openExternal, readClipboardText, writeClipboardText, onAppResume, isNative, isCapacitor } from '../platform/native';
+import { escHtml } from '../util/sanitize';
 
 const SECTIONS: { title: string; help: string; ids: string[] }[] = [
   { title: 'Free, no account', help: 'Runs on this device. Nothing you write leaves it.', ids: ['device', 'builtin'] },
@@ -84,7 +86,9 @@ export async function openAiSetup(app: App, opts: { provider?: string; reason?: 
       say(msg);
     };
     const actions = h('div', { class: 'ql-ai-actions' });
-    if (p.oauth === 'openrouter') {
+    // Sign-in comes back through the page address (browser) or the native plugin's local listener (Android,
+    // desktop). In the Capacitor shell without that plugin (iOS) neither exists, so the button is not offered.
+    if (p.oauth === 'openrouter' && signInAvailable()) {
       actions.append(h('button', { class: 'ql-btn ql-primary', onclick: () => void signInOpenRouter() }, icon('login'), ' Sign in with OpenRouter (no copying)'));
     }
     if (p.links.download) actions.append(h('button', { class: 'ql-btn', onclick: () => open(p.links.download, `Install ${p.name} on your computer, start it, then come back and press Test & Save.`) }, icon('download'), ' Download'));
@@ -106,11 +110,14 @@ export async function openAiSetup(app: App, opts: { provider?: string; reason?: 
     }
 
     // Key field
-    const keyInput = h('input', { type: 'password', class: 'ql-input', autocomplete: 'off', spellcheck: 'false', placeholder: p.needsKey ? 'Paste the API key here' : 'API key (optional)' }) as HTMLInputElement;
+    const keyInput = h('input', { type: 'password', class: 'ql-input', autocomplete: 'new-password', spellcheck: 'false', placeholder: p.needsKey ? 'Paste the API key here' : 'API key (optional)' }) as HTMLInputElement;
     const showBtn = h('button', { class: 'ql-iconbtn', title: 'Show or hide', onclick: () => { keyInput.type = keyInput.type === 'password' ? 'text' : 'password'; } }, icon('visibility'));
     const pasteBtn = h('button', { class: 'ql-btn', onclick: () => void fromClip(true) }, icon('content_paste'), ' Paste');
     if (p.needsKey || p.id === 'custom' || p.id === 'lmstudio' || p.id === 'ollama') {
-      root.append(h('label', { class: 'ql-field' }, h('span', null, p.keyLabel || 'API key'), h('div', { class: 'ql-row' }, keyInput, showBtn, pasteBtn)));
+      // Where the key will be kept on this device, said before it is entered; a warning when it is not encrypted or does not last.
+      const where = h('small', { class: 'ql-help ql-ai-keynote' });
+      root.append(h('label', { class: 'ql-field' }, h('span', null, p.keyLabel || 'API key'), h('div', { class: 'ql-row' }, keyInput, showBtn, pasteBtn)), where);
+      void keyStorage().then((k) => { where.textContent = k.note; if (!k.encrypted || !k.persistent) where.className = 'ql-warn ql-ai-keynote'; }).catch(() => undefined);
       void getApiKey(p.id).then((k) => { if (k) { keyInput.placeholder = `Saved key ${maskKey(k)} (leave empty to keep)`; } });
     }
     const watch = h('input', { type: 'checkbox', checked: aiSettings().clipboardWatch, onchange: () => saveAiSettings((s) => { s.clipboardWatch = watch.checked; }) }) as HTMLInputElement;
@@ -126,6 +133,9 @@ export async function openAiSetup(app: App, opts: { provider?: string; reason?: 
       if (hit && hit.provider === p.id) {
         keyInput.value = hit.key;
         fromClipboard = true;
+        // A key with no distinctive prefix is only a guess (any 32- or 40-character token matches): it is put
+        // in the field, but nothing from the clipboard is sent to the service until the user says so.
+        if (p.weakKey) { say(`The clipboard holds text that could be a ${p.name} key (${maskKey(hit.key)}). It is in the key field; press Test & Save if it is the key.`); return; }
         say(`Found a ${p.name} key in the clipboard (${maskKey(hit.key)}). Testing…`);
         await testAndSave();
       } else if (hit) {
@@ -164,13 +174,13 @@ export async function openAiSetup(app: App, opts: { provider?: string; reason?: 
         if (!existing || !models.includes(cfg.model)) cfg.model = picked.quality;
         if (!existing || !cfg.fastModel || !models.includes(cfg.fastModel)) cfg.fastModel = picked.fast;
         cfg.verified = Date.now();
-        if (key) await setApiKey(p.id, key);
+        const stored = key ? await setApiKey(p.id, key) : null;
         saveAiSettings((s) => { s.providers[p.id] = cfg; if (makeActive.checked || !s.active) s.active = p.id; });
         configured = true;
         if (fromClipboard && aiSettings().clearClipboard) {
           if (await writeClipboardText('', true)) toast('Key saved and removed from the clipboard');
         }
-        showDone(p);
+        showDone(p, stored);
       } catch (e: any) {
         const msg = e instanceof AiError ? e.message : String(e?.message || e);
         say(msg, 'err');
@@ -179,11 +189,16 @@ export async function openAiSetup(app: App, opts: { provider?: string; reason?: 
 
     const signInOpenRouter = async () => {
       try {
-        const { startOpenRouterSignIn } = await import('../ai/oauth');
         const session = await startOpenRouterSignIn();
-        say('Sign in on openrouter.ai in your browser. Anne\'s Folio receives the key automatically when you approve.');
+        if (session.opened) say('Sign in on openrouter.ai in your browser. Anne\'s Folio receives the key automatically when you approve.');
+        else {
+          // A pop-up blocker stopped the tab: a link the user clicks is always allowed.
+          say('The browser did not open the sign-in page. ', 'err');
+          status.append(h('button', { class: 'ql-link', type: 'button', onclick: () => openExternal(session.url) }, 'Open the OpenRouter sign-in page'), ' and approve there; Anne\'s Folio then receives the key.');
+        }
         const manual = h('input', { type: 'text', class: 'ql-input', placeholder: 'If nothing happens: paste the address from the browser (…?code=…) here' }) as HTMLInputElement;
         const go = h('button', { class: 'ql-btn', onclick: () => session.complete(manual.value).catch((err) => say(String(err.message || err), 'err')) }, 'Finish');
+        root.querySelector('.ql-ai-manual')?.remove(); // one row, however often the button is pressed
         status.after(h('div', { class: 'ql-row ql-ai-manual' }, manual, go));
         cleanup.push(() => session.cancel());
         const key = await session.key;
@@ -195,6 +210,8 @@ export async function openAiSetup(app: App, opts: { provider?: string; reason?: 
       }
     };
 
+    // Enter in the key field tests and saves the key (the dialog's own Enter would only close the wizard).
+    keyInput.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); void testAndSave(); } });
     if (opts.provider === p.id) setTimeout(() => keyInput.focus(), 50);
   };
 
@@ -270,11 +287,13 @@ export async function openAiSetup(app: App, opts: { provider?: string; reason?: 
   };
 
   // ---------------------------------------------------------------- finished
-  const showDone = (p: ProviderDef) => {
+  const showDone = (p: ProviderDef, stored: KeyStorage | null = null) => {
     reset();
     clear(root);
     const cfg = aiSettings().providers[p.id];
     root.append(h('h3', null, icon('check_circle'), ` ${p.name} is ready`));
+    // Where the key went, said loudly when it is not encrypted or will be gone when the tab closes.
+    if (stored) root.append(h('p', { class: stored.encrypted && stored.persistent ? 'ql-help' : 'ql-warn' }, stored.note));
     if (cfg?.models?.length && p.kind !== 'local' && p.kind !== 'builtin') {
       const sel = (val: string, onch: (v: string) => void) => {
         const s = h('select', { class: 'ql-input', onchange: (e: Event) => onch((e.target as HTMLSelectElement).value) }) as HTMLSelectElement;
@@ -401,7 +420,7 @@ function ensembleSection(app: App, draft: EnsembleSettings, preferMode?: Ensembl
   const update = () => {
     draft.members = ids.filter((id) => boxes.get(id)!.checked).map((id) => (modelSel.get(id)!.value ? { provider: id, model: modelSel.get(id)!.value } : { provider: id }));
     const n = draft.members.length;
-    for (const [id, cb] of boxes) cb.disabled = !cb.checked && n >= MAX_MEMBERS;
+    for (const cb of boxes.values()) cb.disabled = !cb.checked && n >= MAX_MEMBERS;
     for (const [id, sel] of modelSel) sel.disabled = !boxes.get(id)!.checked;
     lastMode = (modeRadios.find((r) => r.checked)?.value as 'master' | 'consensus') || lastMode;
     enable.disabled = n < 2;
@@ -442,6 +461,8 @@ export async function openAiSettings(app: App, opts: { section?: 'ensemble'; mod
   const s = aiSettings();
   const s0 = normalizeEnsemble(s.ensemble);
   const draft = normalizeEnsemble(s.ensemble);
+  // Stored settings are numbers, but they come from localStorage: shown as numbers and escaped, whatever is there.
+  const count = (v: unknown) => escHtml((Number(v) || 0).toLocaleString());
   const section = ensembleSection(app, draft, opts.mode);
   const r = await openDialog({
     onOpen: (ctl) => {
@@ -450,17 +471,16 @@ export async function openAiSettings(app: App, opts: { section?: 'ensemble'; mod
     },
     title: 'AI Settings', wide: true, fields: [
       { key: 'enabled', label: 'AI features are on', type: 'checkbox', value: s.enabled },
-      { key: 'confirmDocument', label: 'Ask before sending a large range (about 5,000 cells or more) to a cloud service', type: 'checkbox', value: s.confirmDocument },
-      { key: 'info', type: 'info', html: '<p class="ql-help">AI output that changes cells is always previewed first and applied as one step you can undo.</p>' },
+      { key: 'info', type: 'info', html: '<p class="ql-help">AI output that changes the document is always previewed first and applied as one step you can undo.</p>' },
       { key: 'language', label: 'Language for generated text', type: 'combo', options: ['auto', 'English', 'English (American)', 'English (British)', 'English (Canadian)', 'English (Australian)', 'English (Indian)', 'Spanish', 'French', 'German', 'Italian', 'Portuguese', 'Dutch', 'Chinese (Simplified)', 'Japanese', 'Korean'], value: s.language, half: true },
       { key: 'clipboardWatch', label: 'During setup, look for a copied API key when I return to the app', type: 'checkbox', value: s.clipboardWatch },
       { key: 'clearClipboard', label: 'Remove a recognized key from the clipboard after saving it', type: 'checkbox', value: s.clearClipboard },
-      { key: 'usage', type: 'info', html: `<p class="ql-help">Requests this device has sent: ${s.usage.requests.toLocaleString()} · tokens in/out (where reported): ${s.usage.tokensIn.toLocaleString()} / ${s.usage.tokensOut.toLocaleString()} · since ${new Date(s.usage.since).toLocaleDateString()}</p>` },
+      { key: 'usage', type: 'info', html: `<p class="ql-help">Requests this device has sent: ${count(s.usage?.requests)} · tokens in/out (where reported): ${count(s.usage?.tokensIn)} / ${count(s.usage?.tokensOut)} · since ${escHtml(new Date(Number(s.usage?.since) || Date.now()).toLocaleDateString())}</p>` },
     ],
   });
   if (!r) return;
   saveAiSettings((x) => {
-    x.enabled = !!r.enabled; x.confirmDocument = !!r.confirmDocument;
+    x.enabled = !!r.enabled;
     x.language = String(r.language || 'auto');
     x.clipboardWatch = !!r.clipboardWatch; x.clearClipboard = !!r.clearClipboard;
     x.ensemble = normalizeEnsemble(draft);

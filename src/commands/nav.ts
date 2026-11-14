@@ -1,10 +1,9 @@
 /** Page navigation. */
 import { def } from './registry';
-import type { App } from '../app';
+import type { App, DocTab } from '../app';
 import { openDialog, toast } from '../ui/dialog';
 
-const go = (app: App, i: number) => app.tab.ui.goToPage(Math.max(0, Math.min(app.doc.pageCount - 1, i)));
-
+const go = (app: App, i: number, tab: DocTab = app.tab) => tab.ui.goToPage(Math.max(0, Math.min(tab.doc.pageCount - 1, i)));
 def([
   { id: 'nav.first', label: 'First Page', icon: 'first_page', tab: 'Home', group: 'Pages', keys: ['Mod-Home'], noRecord: true, edits: false, isEnabled: (app) => app.page > 0, run: (app) => go(app, 0) },
   { id: 'nav.prev', label: 'Previous Page', icon: 'navigate_before', tab: 'Home', group: 'Pages', keys: ['Alt-ArrowLeft'], noRecord: true, edits: false, isEnabled: (app) => app.page > 0, run: (app) => go(app, app.page - 1) },
@@ -27,8 +26,9 @@ def([
   {
     id: 'nav.goTo', label: 'Go to Page…', icon: 'my_location', tab: 'Home', group: 'Pages', keys: ['Mod-g', 'Mod-Shift-n'], noRecord: true, edits: false,
     run: async (app) => {
-      const r = await openDialog({ title: 'Go to Page', fields: [{ key: 'n', label: `Page (1–${app.doc.pageCount})`, type: 'number', min: 1, max: app.doc.pageCount, value: app.page + 1, autofocus: true }] });
-      if (r) go(app, (+r.n || 1) - 1);
+      const tab = app.tab;
+      const r = await openDialog({ title: 'Go to Page', fields: [{ key: 'n', label: `Page (1–${tab.doc.pageCount})`, type: 'number', min: 1, max: tab.doc.pageCount, value: tab.ui.page + 1, autofocus: true }] });
+      if (r && app.docs.includes(tab)) go(app, (+r.n || 1) - 1, tab);
     },
   },
   { id: 'nav.back', label: 'Back', icon: 'arrow_back', tab: 'Home', group: 'Pages', keys: ['Alt-ArrowUp'], noRecord: true, edits: false, tip: 'Return to the page you came from (after following a link or bookmark)', isEnabled: (app) => history(app).length > 0, run: (app) => { const h = history(app); const i = h.pop(); if (i != null) { forward(app).push(app.page); app.tab.ui.goToPage(i); } } },

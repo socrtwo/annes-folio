@@ -1,12 +1,12 @@
 /**
  * Spelling Dictionaries wizard: find, download, use and remove free Hunspell dictionaries for any
  * language (see proof/dictionaries.ts for sources and verification). The chosen language is the
- * spelling language (prefs.language) that Review ▸ Spelling checks cell text with.
+ * spelling language (prefs.language) that Review ▸ Spelling checks comments and form fields with.
  */
 import { h, clear } from './dom';
 import { openDialog, toast, confirmDialog } from './dialog';
 import type { App } from '../app';
-import { CATALOG, installedDictionaries, installDictionary, removeDictionary, isHeavy, dictionaryFor, type DictInfo } from '../proof/dictionaries';
+import { CATALOG, installedDictionaries, installDictionary, removeDictionary, isHeavy, dictionaryFor, dictionaryUpdateAvailable, type DictInfo } from '../proof/dictionaries';
 import { unloadDictionary, isEnglish } from '../proof/proofing';
 
 const mb = (d: DictInfo) => ((d.aff.size + d.dic.size) / 1e6).toFixed(1) + ' MB';
@@ -52,12 +52,36 @@ export async function openDictionaryWizard(app: App): Promise<void> {
       h('div', { class: 'ql-help' }, `${mb(d)} · ${d.license} · version ${d.version}`, isHeavy(d) ? h('span', { class: 'ql-warn-inline' }, ` · large: about ${d.memoryMB || '?'} MB of memory, ${Math.ceil((d.loadSec || 1) * 3)} s to start on a phone`) : null));
     const actions = h('div', { class: 'ql-dict-actions' });
     const progress = h('progress', { max: 1, value: 0, hidden: true }) as HTMLProgressElement;
+    // Download (or, for an installed dictionary whose catalog version changed, download again). A second press cancels.
+    const fetchIt = async (btn: HTMLButtonElement, done: string) => {
+      if (busy.has(d.id)) { busy.get(d.id)!.abort(); return; }
+      if (isHeavy(d) && !(await confirmDialog('Large dictionary', `${d.name} is a large dictionary (${mb(d)}, about ${d.memoryMB || '?'} MB of memory when loaded). Checking may start slowly, and older phones may not have enough memory. Download it anyway?`, 'Download'))) return;
+      const ctl = new AbortController();
+      busy.set(d.id, ctl);
+      btn.textContent = 'Cancel';
+      progress.hidden = false;
+      try {
+        await installDictionary(d.id, (p) => { progress.max = p.total || 1; progress.value = p.loaded; btn.title = p.phase; }, ctl.signal);
+        await unloadDictionary(d.id); // the next check loads the new files
+        installed = await installedDictionaries();
+        toast(`${d.name} dictionary ${done}`, { action: 'Use for spelling', onAction: () => { useLanguage(app, d); showCurrent(); draw(); } });
+      } catch (err) {
+        if ((err as Error)?.name !== 'AbortError') toast(`Could not install ${d.name}: ${(err as Error)?.message || err}`, { ms: 8000 });
+      } finally {
+        busy.delete(d.id);
+        showCurrent();
+        draw();
+      }
+    };
     if (d.bundled) actions.append(h('span', { class: 'ql-badge' }, status), useButton(d));
     else if (installed.has(d.id)) {
-      actions.append(h('span', { class: 'ql-badge' }, status), useButton(d), h('button', {
+      const update = h('button', { class: 'ql-btn', title: `Version ${d.version} is available`, style: 'display:none', onclick: (e: Event) => void fetchIt(e.currentTarget as HTMLButtonElement, `updated to version ${d.version}`) }, 'Update') as HTMLButtonElement;
+      void dictionaryUpdateAvailable(d.id).then((yes) => { update.style.display = yes ? '' : 'none'; }).catch(() => undefined);
+      actions.append(progress, h('span', { class: 'ql-badge' }, status), useButton(d), update, h('button', {
         class: 'ql-btn', onclick: async () => {
           if (!(await confirmDialog('Remove dictionary', `Remove the ${d.name} dictionary from this device? You can download it again later.`, 'Remove'))) return;
-          await removeDictionary(d.id);
+          try { await removeDictionary(d.id); }
+          catch (err) { toast(`The ${d.name} dictionary could not be removed: ${(err as Error)?.message || err}`, { ms: 8000 }); return; }
           await unloadDictionary(d.id);
           installed = await installedDictionaries();
           showCurrent();
@@ -65,28 +89,7 @@ export async function openDictionaryWizard(app: App): Promise<void> {
         },
       }, 'Remove'));
     } else {
-      actions.append(progress, h('button', {
-        class: 'ql-btn ql-primary', onclick: async (e: Event) => {
-          const btn = e.currentTarget as HTMLButtonElement;
-          if (busy.has(d.id)) { busy.get(d.id)!.abort(); return; }
-          if (isHeavy(d) && !(await confirmDialog('Large dictionary', `${d.name} is a large dictionary (${mb(d)}, about ${d.memoryMB || '?'} MB of memory when loaded). Checking may start slowly, and older phones may not have enough memory. Download it anyway?`, 'Download'))) return;
-          const ctl = new AbortController();
-          busy.set(d.id, ctl);
-          btn.textContent = 'Cancel';
-          progress.hidden = false;
-          try {
-            await installDictionary(d.id, (p) => { progress.max = p.total || 1; progress.value = p.loaded; btn.title = p.phase; }, ctl.signal);
-            installed = await installedDictionaries();
-            toast(`${d.name} dictionary installed`, { action: 'Use for spelling', onAction: () => { useLanguage(app, d); showCurrent(); draw(); } });
-          } catch (err) {
-            if ((err as Error)?.name !== 'AbortError') toast(`Could not install ${d.name}: ${(err as Error)?.message || err}`, { ms: 8000 });
-          } finally {
-            busy.delete(d.id);
-            showCurrent();
-            draw();
-          }
-        },
-      }, 'Download'));
+      actions.append(progress, h('button', { class: 'ql-btn ql-primary', onclick: (e: Event) => void fetchIt(e.currentTarget as HTMLButtonElement, 'installed') }, 'Download'));
     }
     return h('div', { class: 'ql-dict-row', role: 'listitem' }, info, actions);
   };
@@ -109,7 +112,7 @@ export async function openDictionaryWizard(app: App): Promise<void> {
   search.addEventListener('input', draw);
 
   root.append(
-    h('p', { class: 'ql-help' }, 'Download free spelling dictionaries for the languages you write in, then choose "Use for spelling". Review ▸ Spelling (F7) checks the text in cells with that language. English (United States, United Kingdom, Canada, Australia) is built in. Dictionaries are stored on this device and work offline.'),
+    h('p', { class: 'ql-help' }, 'Download free spelling dictionaries for the languages you write in, then choose "Use for spelling". Review ▸ Spelling (F7) checks the text of comments and form fields with that language. English (United States, United Kingdom, Canada, Australia) is built in. Dictionaries are stored on this device and work offline.'),
     current, search, list,
     h('p', { class: 'ql-help ql-small' }, 'Source: the wooorm/dictionaries project (Hunspell dictionaries from LibreOffice, Mozilla and the language communities), downloaded from cdn.jsdelivr.net or the npm registry. Every file is checked against a published checksum before it is used. Each dictionary keeps its own license, shown in the list.'),
   );

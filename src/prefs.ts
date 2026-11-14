@@ -115,6 +115,7 @@ export function defaultPrefs(): Prefs {
     highContrastUI: false, uiScale: 1, pinnedCommands: [], firstRun: true, touchMode: false, miniToolbar: true,
     viewMode: 'continuous', defaultZoom: 'fit-width', showThumbnails: false, smoothScroll: true, nightMode: false, grayscale: false, renderDpiCap: 3,
     highlightColor: '#FFEB3B', penColor: '#E53935', penWidth: 2, noteColor: '#FFD54F', stampOpacity: 0.85, measureUnit: 'in',
+    measureScale: 1, measureScaleUnit: '',
     highlightFields: true, saveMode: 'incremental', ocrLanguage: 'eng', printDpi: 150,
   };
 }
@@ -137,6 +138,11 @@ const ENUMS: Partial<Record<keyof Prefs, readonly string[]>> = {
   qatPosition: ['top', 'below', 'bottom'], theme: ['system', 'light', 'dark'], ribbon: ['full', 'tabs', 'hidden'],
   spellDialect: ['any', 'document', 'en-US', 'en-GB', 'en-CA', 'en-AU'], viewMode: ['continuous', 'single', 'facing', 'book'], defaultZoom: ['fit-width', 'fit-page', 'actual'], saveMode: ['incremental', 'rewrite'], measureUnit: ['pt', 'in', 'mm', 'cm'],
 };
+/** Allowed ranges of the numeric preferences; values outside are pulled to the nearest bound. */
+const RANGES: Partial<Record<keyof Prefs, readonly [number, number]>> = {
+  autosaveSeconds: [3, 3600], readAloudRate: [0.1, 10], uiScale: [0.5, 2], renderDpiCap: [1, 4], penWidth: [0.1, 72],
+  stampOpacity: [0.05, 1], printDpi: [36, 1200], measureScale: [1e-9, 1e9],
+};
 const isObj = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v);
 const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
 
@@ -146,20 +152,40 @@ export function sanitizePrefs(raw: unknown): Partial<Prefs> {
   const d = defaultPrefs() as Record<string, any>;
   const out: Record<string, any> = {};
   for (const [k, v] of Object.entries(raw)) {
-    if (!(k in d)) continue;
+    // Own keys only: "__proto__", "constructor" and the like are names every object answers to.
+    if (!Object.hasOwn(d, k)) continue;
     const def = d[k];
     if (Array.isArray(def) ? Array.isArray(v) : isObj(def) ? isObj(v) : typeof v === typeof def && (typeof v !== 'number' || Number.isFinite(v))) out[k] = v;
   }
   for (const [k, ok] of Object.entries(ENUMS)) if (k in out && !ok!.includes(out[k])) delete out[k];
+  for (const [k, [lo, hi]] of Object.entries(RANGES)) if (k in out) out[k] = Math.min(hi, Math.max(lo, out[k]));
   for (const k of ['qat', 'hiddenTabs', 'tabOrder', 'dictionary', 'ignoredWords', 'pinnedCommands']) if (k in out) out[k] = strings(out[k]);
   for (const k of ['keymap', 'replacements']) if (k in out) out[k] = Object.fromEntries(Object.entries(out[k]).filter(([, x]) => typeof x === 'string'));
   if (out.customTabs) {
     out.customTabs = out.customTabs.filter((t: any) => isObj(t) && typeof t.id === 'string' && Array.isArray(t.groups))
       .map((t: any) => ({ ...t, label: String(t.label ?? t.id), groups: t.groups.filter(isObj).map((g: any) => ({ ...g, id: String(g.id ?? ''), label: String(g.label ?? ''), items: strings(g.items) })) }));
   }
-  if (out.recent) out.recent = out.recent.filter((r: any) => isObj(r) && typeof r.key === 'string' && typeof r.name === 'string');
-  if (out.macros) out.macros = out.macros.filter((m: any) => isObj(m) && typeof m.name === 'string' && Array.isArray(m.steps) && m.steps.every((s: any) => isObj(s) && typeof s.id === 'string'));
+  if (out.recent) out.recent = out.recent.filter((r: any) => isObj(r) && typeof r.key === 'string' && typeof r.name === 'string' && (r.uri == null || typeof r.uri === 'string'));
+  if (out.macros) out.macros = out.macros.filter((m: any) => isObj(m) && typeof m.name === 'string' && Array.isArray(m.steps) && m.steps.length <= 500 && m.steps.every((s: any) => isObj(s) && typeof s.id === 'string'));
   return out as Partial<Prefs>;
+}
+
+/**
+ * What importing settings would add that can act on documents: macros, key bindings and bar entries that run
+ * macros, and switched-off safeguards. One plain line each, for a confirmation before the import is applied.
+ */
+export function describeSettingsImport(current: Prefs, incoming: Partial<Prefs>): string[] {
+  const out: string[] = [];
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+  const macros = (incoming.macros || []).filter((m) => !current.macros.some((c) => c.name === m.name && same(c.steps, m.steps)));
+  if (macros.length) out.push(`${macros.length} macro(s): ${macros.slice(0, 8).map((m) => `${m.name} (${m.steps.map((s) => s.id).slice(0, 4).join(', ')}${m.steps.length > 4 ? ', …' : ''})`).join('; ')}${macros.length > 8 ? '; …' : ''}`);
+  const keys = Object.entries(incoming.keymap || {}).filter(([k, id]) => id && current.keymap[k] !== id);
+  if (keys.length) out.push(`${keys.length} keyboard shortcut(s): ${keys.slice(0, 8).map(([k, id]) => `${k} → ${id}`).join('; ')}${keys.length > 8 ? '; …' : ''}`);
+  const bar = (incoming.qat || []).filter((id) => id.startsWith('macro:') && !current.qat.includes(id));
+  if (bar.length) out.push(`Quick Access Bar buttons that run macros: ${bar.map((id) => id.slice(6)).join(', ')}`);
+  if (incoming.confirmClose === false && current.confirmClose) out.push('Turns off the question before closing a document with unsaved changes');
+  if (incoming.autosave === false && current.autosave) out.push('Turns off automatic drafts');
+  return out;
 }
 
 export function savePrefs(p: Prefs): void {

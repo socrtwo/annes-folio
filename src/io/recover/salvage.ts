@@ -43,9 +43,18 @@ function isSig(b: Uint8Array, k: number): boolean {
   return (c === 1 && d === 2) || (c === 3 && d === 4) || (c === 5 && d === 6) || (c === 7 && d === 8) || (c === 6 && d === 6) || (c === 6 && d === 7);
 }
 
-/** Byte-level ZIP recovery: every entry whose local header survives. */
-export function scanZipBytes(u8: Uint8Array): Map<string, SalvagedEntry> {
+export interface ZipScanOptions {
+  /** Decode only entries this accepts; `head` is the start of the entry's data (up to 1 KB, decompressed). Default: every entry. */
+  want?: (name: string, head: Uint8Array) => boolean;
+  /** Stop decoding once this many bytes are held in total (default 512 MB), so a small archive cannot exhaust memory. */
+  maxTotal?: number;
+}
+
+/** Byte-level ZIP recovery: every entry whose local header survives. Encrypted entries are skipped (their data cannot be read). */
+export function scanZipBytes(u8: Uint8Array, opts: ZipScanOptions = {}): Map<string, SalvagedEntry> {
   const out = new Map<string, SalvagedEntry>();
+  const maxTotal = opts.maxTotal ?? 512 * 1024 * 1024;
+  let total = 0;
   const dec = new TextDecoder('utf-8', { fatal: false });
   let offset = 0;
   while (offset < u8.length - 30) {
@@ -71,12 +80,19 @@ export function scanZipBytes(u8: Uint8Array): Map<string, SalvagedEntry> {
       for (let k = dStart; k < u8.length - 4; k++) if (isSig(u8, k)) { next = k; break; }
     }
     const raw = u8.subarray(dStart, next);
+    const skip = () => { offset = Math.max(next, offset + 1); };
+    if (flags & 0x01) { skip(); continue; }
+    if (opts.want && !opts.want(name, meth === 0 ? raw.subarray(0, 1024) : immortalInflate(raw, { maxOutput: 1024 }).data)) { skip(); continue; }
+    const room = maxTotal - total;
+    if (room <= 0) break;
     let data: Uint8Array | null = null, isCorrupt = false;
-    if (meth === 0) data = raw;
+    if (meth === 0) data = raw.length > room ? raw.subarray(0, room) : raw;
     else {
       let best: InflateResult = { data: new Uint8Array(0), isCorrupt: true }, bestScore = 0, bestShift = 0;
-      for (let shift = 0; shift < 48 && shift < raw.length; shift++) {
-        const r = immortalInflate(raw.subarray(shift));
+      // Realignment retries decode the entry again each time: a large entry gets only a few.
+      const tries = raw.length > 32 * 1024 * 1024 ? 4 : 48;
+      for (let shift = 0; shift < tries && shift < raw.length; shift++) {
+        const r = immortalInflate(raw.subarray(shift), { maxOutput: room });
         if (!r.data.length) continue;
         if (shift === 0 && !r.isCorrupt) { best = r; break; }
         const score = rateQuality(r.data, name) + (r.isCorrupt ? 0 : 100);
@@ -86,14 +102,14 @@ export function scanZipBytes(u8: Uint8Array): Map<string, SalvagedEntry> {
       if (!best.isCorrupt && crc && !(flags & 0x08) && crc32(best.data) !== crc) best = { ...best, isCorrupt: true };
       // A damaged XML stream: skip the bad region and keep decoding the deflate blocks after it.
       if (best.isCorrupt && /\.(xml|rels)$/i.test(name)) {
-        const r = immortalInflate(raw.subarray(bestShift), { resync: true, validateText: true, strictBlocks: true });
+        const r = immortalInflate(raw.subarray(bestShift), { resync: true, validateText: true, strictBlocks: true, maxOutput: room });
         if (r.data.length > best.data.length * 0.5 || r.gaps) best = { ...r, isCorrupt: true };
       }
       data = best.data; isCorrupt = best.isCorrupt;
     }
     if (data && data.length) {
       const prev = out.get(name);
-      if (!prev || prev.data.length < data.length) out.set(name, { data, isCorrupt, offset });
+      if (!prev || prev.data.length < data.length) { total += data.length - (prev ? prev.data.length : 0); out.set(name, { data, isCorrupt, offset }); }
     }
     offset = Math.max(next, offset + 1);
   }

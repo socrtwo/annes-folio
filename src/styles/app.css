@@ -11,9 +11,14 @@
   --sal: max(env(safe-area-inset-left, 0px), var(--safe-area-inset-left, 0px));
   --sar: max(env(safe-area-inset-right, 0px), var(--safe-area-inset-right, 0px));
   --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", Arial, sans-serif;
+  /* One colour for the title bar, the tab strip and the File page's side bar, in both themes. */
+  --chrome: #A6303B;
+  /* Names used by the AI, recovery and dictionary styles (shared with the other suite apps). */
+  --ql-bg: var(--surface); --ql-bg2: var(--surface2); --ql-border: var(--border);
   color-scheme: light;
 }
 :root[data-theme=dark] {
+  --chrome: #4a1c22;
   --bg: #1b1f27; --surface: #232833; --surface2: #2b313d; --text: #e6e9ef; --muted: #a3abba; --border: #3a4150;
   --accent: #e8838d; --accent-soft: #4a2328; --on: #5c2a30; --canvas: #12151b; --shadow: 0 1px 3px rgba(0,0,0,.5);
   color-scheme: dark;
@@ -32,8 +37,7 @@ textarea { width: 100%; resize: vertical; font-family: ui-monospace, "Cousine", 
 
 /* App frame -------------------------------------------------------------------------- */
 .ql-app { display: flex; flex-direction: column; height: 100vh; height: 100dvh; padding: var(--sat) var(--sar) var(--sab) var(--sal); }
-.ql-titlebar { display: flex; align-items: center; gap: 2px; background: var(--accent); color: #fff; min-height: calc(46px * var(--ql-ui-scale)); padding: 0 4px; flex: none; }
-:root[data-theme=dark] .ql-titlebar { background: #4a1c0c; }
+.ql-titlebar { display: flex; align-items: center; gap: 2px; background: var(--chrome); color: #fff; min-height: calc(46px * var(--ql-ui-scale)); padding: 0 4px; flex: none; }
 .ql-titlebar .ql-iconbtn { color: #fff; }
 .ql-title { background: transparent; border: 0; color: #fff; font-weight: 600; font-size: 15px; max-width: 34vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
 .ql-title:hover { background: rgba(255,255,255,.12); }
@@ -55,8 +59,7 @@ textarea { width: 100%; resize: vertical; font-family: ui-monospace, "Cousine", 
 .ql-qat .ql-split-arrow { background: transparent; border: 0; color: inherit; width: 18px; padding: 0; cursor: pointer; }
 .ql-qat-sep { width: 1px; height: 22px; background: rgba(255,255,255,.4); margin: 0 3px; }
 /* The ▾ that opens the Quick Access Bar choices stays in view however many commands the bar holds. */
-.ql-qat .ql-qat-customize { position: sticky; right: 0; z-index: 1; background: var(--accent); }
-:root[data-theme=dark] .ql-titlebar .ql-qat-customize { background-color: #17402a; }
+.ql-qat .ql-qat-customize { position: sticky; right: 0; z-index: 1; background: var(--chrome); }
 .ql-qat .ql-qat-customize:hover { background-image: linear-gradient(rgba(255,255,255,.15), rgba(255,255,255,.15)); }
 .ql-qat-bottom { display: none; background: var(--surface); border-top: 1px solid var(--border); padding: 2px 6px; }
 .ql-qat-bottom .ql-cmd, .ql-qat-bottom .ql-iconbtn { color: var(--text) !important; }
@@ -74,8 +77,7 @@ textarea { width: 100%; resize: vertical; font-family: ui-monospace, "Cousine", 
 .ql-touch .ql-tab { padding-top: 10px; padding-bottom: 10px; }
 
 /* Tabs */
-.ql-tabs { display: flex; overflow-x: auto; scrollbar-width: none; background: var(--accent); flex: none; padding: 0 4px; }
-:root[data-theme=dark] .ql-tabs { background: #17402a; }
+.ql-tabs { display: flex; overflow-x: auto; scrollbar-width: none; background: var(--chrome); flex: none; padding: 0 4px; }
 .ql-tabs::-webkit-scrollbar { display: none; }
 .ql-tab { background: transparent; border: 0; color: rgba(255,255,255,.88); padding: 8px 12px 7px; font-size: 13.5px; white-space: nowrap; cursor: pointer; border-radius: 8px 8px 0 0; border-bottom: 3px solid transparent; }
 .ql-tab:hover { background: rgba(255,255,255,.1); }
@@ -183,9 +185,10 @@ textarea { width: 100%; resize: vertical; font-family: ui-monospace, "Cousine", 
 .ql-overlay { position: fixed; inset: 0; z-index: 900; background: rgba(15,20,30,.42); display: flex; align-items: center; justify-content: center; padding: calc(12px + var(--sat)) calc(12px + var(--sar)) calc(12px + max(var(--sab), var(--kb, 0px))) calc(12px + var(--sal)); animation: ql-fade .12s ease-out; }
 .ql-overlay.ql-out { opacity: 0; transition: opacity .12s; }
 @keyframes ql-fade { from { opacity: 0; } }
-.ql-dialog { background: var(--surface); color: var(--text); border-radius: 14px; box-shadow: 0 20px 60px rgba(0,0,0,.35); width: min(480px, 100%); max-height: calc(100dvh - 24px - var(--sat) - max(var(--sab), var(--kb, 0px))); display: flex; flex-direction: column; }
+.ql-dialog { background: var(--surface); color: var(--text); border-radius: 14px; box-shadow: 0 20px 60px rgba(0,0,0,.35); width: min(480px, 100%); max-height: calc(100vh - 24px - var(--sat) - max(var(--sab), var(--kb, 0px))); max-height: calc(100dvh - 24px - var(--sat) - max(var(--sab), var(--kb, 0px))); display: flex; flex-direction: column; }
 .ql-dialog.ql-wide { width: min(760px, 100%); }
-.ql-dialog.ql-full { width: min(1080px, 100%); height: calc(100dvh - 24px - var(--sat) - max(var(--sab), var(--kb, 0px))); }
+.ql-dialog.ql-full { width: min(1080px, 100%); height: calc(100vh - 24px - var(--sat) - max(var(--sab), var(--kb, 0px))); height: calc(100dvh - 24px - var(--sat) - max(var(--sab), var(--kb, 0px))); }
+.ql-dialog:focus { outline: none; }
 .ql-dialog-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px 6px 18px; }
 .ql-dialog-head h2 { font-size: 17px; margin: 0; }
 .ql-dialog-body { padding: 4px 18px 10px; overflow: auto; flex: 1; display: flex; flex-direction: column; gap: 8px; }
@@ -319,8 +322,7 @@ textarea { width: 100%; resize: vertical; font-family: ui-monospace, "Cousine", 
 /* Backstage */
 .ql-backstage { position: fixed; inset: 0; z-index: 700; background: var(--surface); display: none; padding: var(--sat) var(--sar) var(--sab) var(--sal); }
 .ql-backstage-open .ql-backstage { display: flex; }
-.ql-bs-nav { width: 210px; background: var(--accent); color: #fff; display: flex; flex-direction: column; padding: 8px 0; overflow: auto; flex: none; }
-:root[data-theme=dark] .ql-bs-nav { background-color: #17402a; }
+.ql-bs-nav { width: 210px; background: var(--chrome); color: #fff; display: flex; flex-direction: column; padding: 8px 0; overflow: auto; flex: none; }
 .ql-bs-back, .ql-bs-item { background: transparent; border: 0; color: #fff; text-align: left; padding: 11px 18px; cursor: pointer; display: flex; align-items: center; gap: 8px; font-size: 15px; }
 .ql-bs-item:hover, .ql-bs-back:hover { background: rgba(255,255,255,.12); } .ql-bs-item.ql-on { background: rgba(255,255,255,.22); font-weight: 600; }
 .ql-bs-body { flex: 1; overflow: auto; padding: 18px 28px 40px; }
@@ -346,8 +348,8 @@ textarea { width: 100%; resize: vertical; font-family: ui-monospace, "Cousine", 
   .ql-pane-head { position: relative; padding-top: 12px; }
   .ql-ribbon .ql-cmd { min-width: calc(50px * var(--ql-ui-scale)); }
   .ql-group-label { font-size: 10px; }
-  .ql-dialog { border-radius: 16px 16px 0 0; align-self: flex-end; width: 100%; max-height: calc(92dvh - var(--sat) - var(--kb, 0px)); padding-bottom: var(--sab); }
-  .ql-dialog.ql-full { height: calc(92dvh - var(--sat) - var(--kb, 0px)); }
+  .ql-dialog { border-radius: 16px 16px 0 0; align-self: flex-end; width: 100%; max-height: calc(92vh - var(--sat) - var(--kb, 0px)); max-height: calc(92dvh - var(--sat) - var(--kb, 0px)); padding-bottom: var(--sab); }
+  .ql-dialog.ql-full { height: calc(92vh - var(--sat) - var(--kb, 0px)); height: calc(92dvh - var(--sat) - var(--kb, 0px)); }
   .ql-overlay { padding: var(--sat) var(--sar) var(--kb, 0px) var(--sal); align-items: flex-end; }
   .ql-palette-overlay { align-items: flex-start; padding: calc(8px + var(--sat)) calc(8px + var(--sar)) calc(8px + var(--sab)) calc(8px + var(--sal)); }
   .ql-row2 { grid-template-columns: 1fr; }
@@ -434,6 +436,7 @@ body.ql-zen .ql-zen-exit { display: inline-flex !important; }
 .ql-ai-status.ql-ai-ok { color: #2e7d32; }
 .ql-ai-status.ql-ai-err { color: #c62828; }
 .ql-ai-manual { margin-top: 6px; }
+.ql-ai-keynote { display: block; }
 .ql-ai-progress { width: 100%; height: 10px; margin-top: 8px; }
 .ql-ai-models .ql-check { display: block; margin: 6px 0; }
 .ql-ai-prov { border: 1px solid var(--ql-border, #ddd); border-radius: 8px; padding: 8px 10px; margin: 6px 0; }
@@ -459,13 +462,14 @@ body.ql-zen .ql-zen-exit { display: inline-flex !important; }
 .ql-ai-busy .ql-link { color: #90caf9; }
 .ql-spin { width: 14px; height: 14px; border: 2px solid rgba(255,255,255,.35); border-top-color: #fff; border-radius: 50%; animation: ql-spin .8s linear infinite; }
 @keyframes ql-spin { to { transform: rotate(360deg); } }
-@media (prefers-color-scheme: dark) {
-  .ql-ai-device, .ql-ai-local { background: #1e3a24; color: #a5d6a7; }
-  .ql-ai-free { background: #102a4c; color: #90caf9; }
-  .ql-ai-trial { background: #3d3000; color: #ffe082; }
-  .ql-ai-paid { background: #333; color: #ccc; }
-  .ql-warn { background: #3d2c00; color: #ffcc80; }
-}
+/* The app's own theme (which the user can set against the system's), not the system's. */
+:root[data-theme=dark] .ql-ai-device, :root[data-theme=dark] .ql-ai-local { background: #1e3a24; color: #a5d6a7; }
+:root[data-theme=dark] .ql-ai-free { background: #102a4c; color: #90caf9; }
+:root[data-theme=dark] .ql-ai-trial { background: #3d3000; color: #ffe082; }
+:root[data-theme=dark] .ql-ai-paid { background: #333; color: #ccc; }
+:root[data-theme=dark] .ql-warn { background: #3d2c00; color: #ffcc80; }
+:root[data-theme=dark] .ql-ai-set, :root[data-theme=dark] .ql-ai-status.ql-ai-ok { color: #81c784; }
+:root[data-theme=dark] .ql-ai-status.ql-ai-err { color: #ef9a9a; }
 
 /* Spelling Dictionaries wizard */
 .ql-dict-wizard { display: flex; flex-direction: column; gap: 8px; min-width: min(640px, 86vw); }
@@ -477,7 +481,7 @@ body.ql-zen .ql-zen-exit { display: inline-flex !important; }
 .ql-dict-native { opacity: .8; }
 .ql-dict-actions, .ql-dict-use { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
 .ql-dict-actions progress { width: 110px; }
-.ql-badge { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--accent-pale, #e6edf8); }
+.ql-badge { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--accent-soft); }
 .ql-warn-inline { color: #b25e00; }
 .ql-small { font-size: 12px; }
 
@@ -526,8 +530,11 @@ body.ql-fullscreen .ql-titlebar, body.ql-fullscreen .ql-tabs, body.ql-fullscreen
 
 /* ===== Scroll cues (ui/scrollcue.css): each container's own background, so the edge shadows blend in ===== */
 :root[data-theme=dark] { --sc-on-accent: #0e1726; --sc-thumb: rgba(170, 180, 195, .5); --sc-thumb-hover: rgba(200, 208, 220, .8); }
-.ql-bs-nav { --sc-bg: var(--accent); --sc-thumb: rgba(255, 255, 255, .45); --sc-thumb-hover: rgba(255, 255, 255, .75); }
-:root[data-theme=dark] .ql-bs-nav { --sc-bg: #17402a; }
+.ql-bs-nav { --sc-bg: var(--chrome); --sc-thumb: rgba(255, 255, 255, .45); --sc-thumb-hover: rgba(255, 255, 255, .75); }
+/* The thumbnail rail and the Organize grid keep their own backgrounds under the scroll cue. */
+.qf-rail { --sc-bg: var(--surface2); }
+.qf-grid { --sc-bg: var(--canvas); }
+.qf-night .qf-grid { --sc-bg: #0b0d12; }
 .ql-dialog-preview { --sc-bg: #fff; }
 .ql-ai-out { --sc-bg: var(--ql-bg2, #fafafa); }
 .ql-spell-context, .ql-macro-out { --sc-bg: var(--surface2); }
@@ -537,6 +544,13 @@ body.ql-fullscreen .ql-titlebar, body.ql-fullscreen .ql-tabs, body.ql-fullscreen
 /* ===== Anne's Folio: shared pieces kept from the suite shell (the viewer itself is in folio.css) ===== */
 .ql-qat-below { display: none; background: var(--surface2); border-bottom: 1px solid var(--border); padding: 0 4px; min-height: 34px; align-items: center; flex: none; }
 .ql-qat-below-ribbon .ql-qat-below { display: flex; }
+.ql-qat-below .ql-qat-customize { background: var(--surface2); }
+.ql-qat-below .ql-qat-customize:hover { background-image: linear-gradient(var(--accent-soft), var(--accent-soft)); }
+.ql-qat-below .ql-cmd:hover { background: var(--accent-soft); }
+.ql-qat-below .ql-cmd.ql-on { background: var(--on); }
+.ql-qat-below .ql-qat-sep { background: var(--border); }
+/* Customize lists are focusable (arrow keys move the selection): show where the keyboard is. */
+.ql-cmdlist:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .ql-present { background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.35); color: #fff; display: inline-flex; align-items: center; gap: 4px; padding: 4px 12px; border-radius: 18px; margin: 0 4px; cursor: pointer; }
 .ql-present:hover { background: rgba(255,255,255,.24); }
 @media (max-width: 700px) { .ql-present-label { display: none; } .ql-present { padding: 4px 8px; } }

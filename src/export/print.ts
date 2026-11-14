@@ -16,8 +16,13 @@ export async function printPages(app: App, o: PrintOptions = {}): Promise<void> 
   if (pages.length > 400) { toast('Printing is limited to 400 pages at a time; print a range.'); return; }
   app.ui.status?.('● Preparing pages for printing…');
   const urls: string[] = [];
+  // Page sizes in points, for printing at actual size.
+  const sizes = pages.map((i) => { const p = app.doc.pages[i]; return p ? [p.width, p.height] : [612, 792]; });
   try {
     for (const i of pages) { const blob = await pageImage(app, i, dpi); urls.push(URL.createObjectURL(blob)); }
+  } catch (e) {
+    for (const u of urls) URL.revokeObjectURL(u); // nothing will print: do not keep the rendered pages
+    throw e;
   } finally { app.ui.status?.(''); }
   const frame = document.createElement('iframe');
   frame.setAttribute('aria-hidden', 'true');
@@ -25,18 +30,21 @@ export async function printPages(app: App, o: PrintOptions = {}): Promise<void> 
   document.body.appendChild(frame);
   const doc = frame.contentDocument!;
   const per = o.nUp || 1;
-  const css = `@page{margin:${o.scale === 'actual' ? '0' : '8mm'}} body{margin:0} .p{page-break-after:always;display:grid;grid-template-columns:repeat(${per === 4 ? 2 : per},1fr);gap:4mm;height:${o.scale === 'actual' ? 'auto' : '100vh'};align-items:center;justify-items:center;${o.grayscale ? 'filter:grayscale(1);' : ''}} .p:last-child{page-break-after:auto} img{max-width:100%;max-height:100%;object-fit:contain}`;
+  // "Actual size" gives each page its real dimensions; with several pages per sheet they are fitted instead.
+  const actual = o.scale === 'actual' && per === 1;
+  const css =`@page{margin:${o.scale === 'actual' ? '0' : '8mm'}} body{margin:0} .p{page-break-after:always;display:grid;grid-template-columns:repeat(${per === 4 ? 2 : per},1fr);gap:4mm;height:${o.scale === 'actual' ? 'auto' : '100vh'};align-items:center;justify-items:center;${o.grayscale ? 'filter:grayscale(1);' : ''}} .p:last-child{page-break-after:auto} img{max-width:100%;max-height:100%;object-fit:contain} img.a{max-width:none;max-height:none}`;
   doc.open();
   doc.write(`<!doctype html><html><head><meta charset="utf-8"><title>${(app.tab.displayName || 'Document').replace(/[<&]/g, '')}</title><style>${css}</style></head><body></body></html>`);
   doc.close();
   const order = o.booklet ? bookletOrder(urls.length) : urls.map((_, k) => k);
   for (let k = 0; k < order.length; k += per) {
     const sheet = doc.createElement('div'); sheet.className = 'p';
-    for (let j = 0; j < per; j++) { const idx = order[k + j]; if (idx == null || idx < 0) { sheet.appendChild(doc.createElement('div')); continue; } const img = doc.createElement('img'); img.src = urls[idx]; sheet.appendChild(img); }
+    for (let j = 0; j < per; j++) { const idx = order[k + j]; if (idx == null || idx < 0) { sheet.appendChild(doc.createElement('div')); continue; } const img = doc.createElement('img'); img.src = urls[idx]; if (actual) { img.className = 'a'; img.style.width = `${sizes[idx][0]}pt`; img.style.height = `${sizes[idx][1]}pt`; } sheet.appendChild(img); }
     doc.body.appendChild(sheet);
   }
   await Promise.all([...doc.images].map((im) => (im.complete ? Promise.resolve() : new Promise<void>((res) => { im.onload = () => res(); im.onerror = () => res(); }))));
-  const cleanup = () => { setTimeout(() => { frame.remove(); for (const u of urls) URL.revokeObjectURL(u); }, 1500); };
+  let cleaned = false;
+  const cleanup = () => { if (cleaned) return; cleaned = true; setTimeout(() => { frame.remove(); for (const u of urls) URL.revokeObjectURL(u); }, 1500); };
   if (isNative() && !(window as any).quillDesktop) {
     // Android: the native plugin prints the current WebView; show the sheets in the page instead of a hidden frame.
     frame.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;border:0;background:#fff;z-index:99999';
@@ -44,10 +52,13 @@ export async function printPages(app: App, o: PrintOptions = {}): Promise<void> 
     return;
   }
   const w = frame.contentWindow!;
+  // The frame stays until printing is over: where the print dialog does not block scripts, a
+  // one-minute timer removed the pages while the dialog was still open.
   w.onafterprint = cleanup;
+  window.addEventListener('afterprint', cleanup, { once: true });
   w.focus();
   w.print();
-  setTimeout(cleanup, 60000);
+  setTimeout(cleanup, 15 * 60000);
 }
 
 /** Sheet order for a saddle-stitched booklet printed two-up: [last, first, second, second-to-last, …]. */

@@ -28,8 +28,11 @@ export class Ref {
 export class PdfString {
   constructor(public bytes: Uint8Array, public hex = false) {}
   static fromText(s: string, forceUtf16 = false): PdfString {
-    // PDFDocEncoding covers Latin text; anything else becomes UTF-16BE with a byte-order mark.
-    if (!forceUtf16 && [...s].every((c) => c.charCodeAt(0) < 256 && c.charCodeAt(0) >= 32 || c === '\n' || c === '\r' || c === '\t')) {
+    // Bytes that mean the same character in PDFDocEncoding and Latin-1 are written as they are (0x7F–0xA0
+    // and 0xAD differ or are undefined there); anything else becomes UTF-16BE with a byte-order mark.
+    const plain = (c: number) => (c >= 0x20 && c <= 0x7e) || (c >= 0xa1 && c <= 0xff && c !== 0xad) || c === 10 || c === 13 || c === 9;
+    const looksLikeBom = s.startsWith('\u00fe\u00ff') || s.startsWith('\u00ff\u00fe') || s.startsWith('\u00ef\u00bb\u00bf');
+    if (!forceUtf16 && !looksLikeBom && [...s].every((c) => plain(c.codePointAt(0)!))) {
       const b = new Uint8Array(s.length);
       for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i);
       return new PdfString(b);
@@ -50,13 +53,18 @@ export class PdfString {
       for (let i = 2; i + 1 < b.length; i += 2) s += String.fromCharCode((b[i] << 8) | b[i + 1]);
       return s;
     }
+    if (b.length >= 2 && b[0] === 0xff && b[1] === 0xfe) { // UTF-16LE: not allowed, but some writers emit it
+      let s = '';
+      for (let i = 2; i + 1 < b.length; i += 2) s += String.fromCharCode((b[i + 1] << 8) | b[i]);
+      return s;
+    }
     if (b.length >= 3 && b[0] === 0xef && b[1] === 0xbb && b[2] === 0xbf) { try { return new TextDecoder('utf-8', { fatal: true }).decode(b.subarray(3)); } catch { /* fall through */ } }
     let s = '';
     for (let i = 0; i < b.length; i++) s += PDFDOC[b[i]] ?? String.fromCharCode(b[i]);
     return s;
   }
   /** Bytes as a Latin-1 string (for keys, dates, binary comparison). */
-  toLatin1(): string { let s = ''; for (let i = 0; i < this.bytes.length; i++) s += String.fromCharCode(this.bytes[i]); return s; }
+  toLatin1(): string { return latin1(this.bytes); }
   toString(): string { return this.toText(); }
 }
 
@@ -113,11 +121,14 @@ export function dictOf(o: PdfObj | undefined): Dict | null {
   return null;
 }
 
-/** Deep copy of an object graph (refs are shared, which is what copies within one document want). */
+/**
+ * Deep copy of an object graph. Refs are shared (what copies within one document want), and so are a
+ * stream's bytes: `raw` and `decoded` are replaced, never written into, so copies can share them.
+ */
 export function cloneObj(o: PdfObj): PdfObj {
   if (Array.isArray(o)) return o.map(cloneObj);
   if (o instanceof Dict) { const d = new Dict(); for (const [k, v] of o.map) d.map.set(k, cloneObj(v)); return d; }
-  if (o instanceof PdfStream) { const s = new PdfStream(cloneObj(o.dict) as Dict, o.raw.slice()); s.decoded = o.decoded ? o.decoded.slice() : null; return s; }
+  if (o instanceof PdfStream) { const s = new PdfStream(cloneObj(o.dict) as Dict, o.raw); s.decoded = o.decoded; return s; }
   if (o instanceof PdfString) return new PdfString(o.bytes.slice(), o.hex);
   return o;
 }
@@ -127,7 +138,7 @@ export function pdfDate(d = new Date()): PdfString {
   const p = (n: number) => String(n).padStart(2, '0');
   const tz = -d.getTimezoneOffset();
   const sign = tz >= 0 ? '+' : '-';
-  return PdfString.fromText(`D:${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}${sign}${p(Math.floor(Math.abs(tz) / 60))}'${p(Math.abs(tz) % 60)}'`);
+  return PdfString.fromText(`D:${String(d.getFullYear()).padStart(4, '0')}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}${sign}${p(Math.floor(Math.abs(tz) / 60))}'${p(Math.abs(tz) % 60)}'`);
 }
 
 /** Parses a PDF date string; null when it is not one. */
@@ -137,14 +148,27 @@ export function parsePdfDate(s: string | PdfString | undefined | null): Date | n
   const m = /^D:(\d{4})(\d{2})?(\d{2})?(\d{2})?(\d{2})?(\d{2})?([Zz+-])?(\d{2})?'?(\d{2})?/.exec(t);
   if (!m) { const d = new Date(t); return isNaN(d.getTime()) ? null : d; }
   const [, y, mo = '01', d = '01', h = '00', mi = '00', se = '00', sign, oh = '00', om = '00'] = m;
-  let ms = Date.UTC(+y, +mo - 1, +d, +h, +mi, +se);
+  // Date.UTC and the Date constructor read years 0–99 as 1900–1999, so the year is set separately.
+  const utc = new Date(Date.UTC(2000, +mo - 1, +d, +h, +mi, +se)); utc.setUTCFullYear(+y);
+  let ms = utc.getTime();
   if (sign === '+' || sign === '-') ms -= (sign === '+' ? 1 : -1) * ((+oh) * 60 + (+om)) * 60000;
-  else if (!sign) { const local = new Date(+y, +mo - 1, +d, +h, +mi, +se); return isNaN(local.getTime()) ? null : local; }
+  else if (!sign) { const local = new Date(2000, +mo - 1, +d, +h, +mi, +se); local.setFullYear(+y); return isNaN(local.getTime()) ? null : local; }
   const out = new Date(ms);
   return isNaN(out.getTime()) ? null : out;
 }
 
-export const latin1 = (u8: Uint8Array, from = 0, to = u8.length): string => { let s = ''; for (let i = from; i < Math.min(to, u8.length); i++) s += String.fromCharCode(u8[i]); return s; };
+/** Bytes as a Latin-1 string, built in chunks (one character at a time makes a rope with a node per byte). */
+export const latin1 = (u8: Uint8Array, from = 0, to = u8.length): string => {
+  const end = Math.min(to, u8.length);
+  let s = '';
+  for (let i = Math.max(0, from); i < end; i += 0x2000) s += String.fromCharCode.apply(null, u8.subarray(i, Math.min(end, i + 0x2000)) as unknown as number[]);
+  return s;
+};
+/** A name for display: names are kept as their bytes (so they round-trip), and this decodes UTF-8 when it is valid. */
+export const nameText = (name: string): string => {
+  if (!/[\x80-\xff]/.test(name) || /[^\x00-\xff]/.test(name)) return name;
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytesOf(name)); } catch { return name; }
+};
 export const bytesOf = (s: string): Uint8Array => { const b = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i) & 0xff; return b; };
 export const utf8 = (s: string): Uint8Array => new TextEncoder().encode(s);
 export const concat = (parts: Uint8Array[]): Uint8Array => { let n = 0; for (const p of parts) n += p.length; const out = new Uint8Array(n); let o = 0; for (const p of parts) { out.set(p, o); o += p.length; } return out; };

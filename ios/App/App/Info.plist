@@ -245,11 +245,16 @@
 			</dict>
 		</dict>
 	</array>
-	<!-- Saved documents go to the app's Documents folder; these make it appear in the Files app. -->
+	<!-- Saved documents go to the app's Documents folder. UIFileSharingEnabled shows that folder in Finder's
+	     file sharing. It would also appear in the Files app only with LSSupportsOpeningDocumentsInPlace on,
+	     but then iOS hands over other apps' files in place (security-scoped), which the Capacitor file
+	     reader cannot open; with it off, iOS copies an opened file into Documents/Inbox first. -->
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
 	<false/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Anne's Folio records sound only while you record an Audio Comment.</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<false/>
 	<key>UILaunchStoryboardName</key>

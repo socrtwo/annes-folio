@@ -55,15 +55,15 @@ import java.util.concurrent.Executors;
  *   <li>readUri({uri}) -> {uri, name, mime, data}</li>
  *   <li>print({jobName}) -> void</li>
  *   <li>share({name, mime, data, title}) -> void</li>
- *   <li>getLaunchFile() -> {uri?, name, mime, data} | {} (consumed once)</li>
+ *   <li>getLaunchFile() -> {uri?, name, mime, data} | {} (consumed once; when several files were shared at once,
+ *       the others follow as "fileOpened" events)</li>
  *   <li>keepAwake({on: boolean}) -> void</li>
  *   <li>event "fileOpened" -> same payload as getLaunchFile, for files opened while running</li>
  *   <li>secureSet({key, value}) / secureGet({key}) -> {value} / secureRemove({key}): Keystore-encrypted secrets</li>
  *   <li>readClipboard() -> {text} / writeClipboard({text, sensitive})</li>
  *   <li>startLoopback({timeoutMs, successHtml, path}) -> {port}; event "oauthCallback" {url} (requests for path only); stopLoopback()</li>
- *   <li>openInApp({packageName, name, mime, data}) -> {opened: true} | {opened: false, reason: "not-installed"}:
- *       hands a document to a sibling Anne's Office app (Anne's Pen, Anne's Post, Anne's Folio) with ACTION_VIEW</li>
  * </ul>
+ * Only content: URIs of other apps' providers are read or written (see {@link #isAllowedUri}).
  */
 @CapacitorPlugin(name = "QuillNative")
 public class QuillNativePlugin extends Plugin {
@@ -338,6 +338,10 @@ public class QuillNativePlugin extends Plugin {
             call.reject("writeUri requires 'uri' and 'data'");
             return;
         }
+        if (!isAllowedUri(Uri.parse(uriString))) {
+            call.reject("This address cannot be written to: only documents chosen in the file picker or opened from another app");
+            return;
+        }
         io.execute(() -> {
             try {
                 writeBytes(Uri.parse(uriString), decodeBase64(data));
@@ -355,6 +359,10 @@ public class QuillNativePlugin extends Plugin {
         final String uriString = call.getString("uri");
         if (uriString == null || uriString.isEmpty()) {
             call.reject("readUri requires 'uri'");
+            return;
+        }
+        if (!isAllowedUri(Uri.parse(uriString))) {
+            call.reject("This address cannot be read: only documents chosen in the file picker or opened from another app");
             return;
         }
         io.execute(() -> {
@@ -448,63 +456,6 @@ public class QuillNativePlugin extends Plugin {
         });
     }
 
-    /** Sibling apps that may receive a document; any other package is refused. */
-    private static final java.util.Set<String> SIBLING_APPS = new java.util.HashSet<>(java.util.Arrays.asList(
-        "io.github.socrtwo.quillpen", "io.github.socrtwo.quillpost", "io.github.socrtwo.quillfolio"));
-
-    @PluginMethod
-    public void openInApp(PluginCall call) {
-        final String pkg = call.getString("packageName", "");
-        final String name = sanitizeFileName(call.getString("name", "document"));
-        final String mime = call.getString("mime", "application/octet-stream");
-        final String data = call.getString("data");
-        if (!SIBLING_APPS.contains(pkg)) {
-            call.reject("openInApp only opens the Anne's Office apps");
-            return;
-        }
-        if (data == null) {
-            call.reject("openInApp requires 'data'");
-            return;
-        }
-        io.execute(() -> {
-            try {
-                Context context = getContext();
-                File dir = new File(context.getCacheDir(), SHARE_DIR);
-                if (!dir.isDirectory() && !dir.mkdirs()) {
-                    throw new IOException("Cannot create " + dir.getAbsolutePath());
-                }
-                pruneOldShares(dir);
-                File file = new File(dir, name);
-                try (FileOutputStream out = new FileOutputStream(file)) {
-                    out.write(decodeBase64(data));
-                }
-                Uri uri = FileProvider.getUriForFile(context, context.getPackageName() + ".fileprovider", file);
-                final Intent view = new Intent(Intent.ACTION_VIEW);
-                view.setDataAndType(uri, mime == null || mime.isEmpty() ? "application/octet-stream" : mime);
-                view.setPackage(pkg);
-                view.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
-                final Activity activity = getActivity();
-                if (activity == null) {
-                    call.reject("The app is not in the foreground");
-                    return;
-                }
-                activity.runOnUiThread(() -> {
-                    JSObject ret = new JSObject();
-                    try {
-                        activity.startActivity(view);
-                        ret.put("opened", true);
-                    } catch (ActivityNotFoundException e) {
-                        ret.put("opened", false);
-                        ret.put("reason", "not-installed");
-                    }
-                    call.resolve(ret);
-                });
-            } catch (Throwable e) {
-                call.reject("Could not open the document: " + e.getMessage(), asException(e));
-            }
-        });
-    }
-
     @PluginMethod
     public void keepAwake(PluginCall call) {
         final boolean on = Boolean.TRUE.equals(call.getBoolean("on", Boolean.TRUE));
@@ -537,15 +488,22 @@ public class QuillNativePlugin extends Plugin {
                 launchIntent = activity != null ? activity.getIntent() : null;
             }
         }
-        if (launchIntent == null || !isFileIntent(launchIntent)) {
+        // Reopened from Recents after Android closed the app: the system hands over the old intent again.
+        // The file was already opened then (unsaved work comes back as a draft), so it is not opened twice.
+        boolean fromHistory = launchIntent != null && (launchIntent.getFlags() & Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0;
+        if (launchIntent == null || fromHistory || !isFileIntent(launchIntent)) {
             call.resolve(new JSObject());
             return;
         }
         final Intent intent = launchIntent;
         io.execute(() -> {
             try {
-                JSObject file = readIntent(intent);
-                call.resolve(file != null ? file : new JSObject());
+                List<JSObject> files = readIntent(intent);
+                call.resolve(files.isEmpty() ? new JSObject() : files.get(0));
+                // Several files shared at once: the others arrive as fileOpened events.
+                for (int i = 1; i < files.size(); i++) {
+                    notifyListeners(EVENT_FILE_OPENED, files.get(i), true);
+                }
             } catch (Throwable e) {
                 call.reject("Could not read the launch file: " + e.getMessage(), asException(e));
             }
@@ -569,12 +527,12 @@ public class QuillNativePlugin extends Plugin {
         }
         io.execute(() -> {
             try {
-                JSObject file = readIntent(intent);
-                if (file != null) {
+                for (JSObject file : readIntent(intent)) {
                     // retainUntilConsumed: delivered later if the web app has not subscribed yet.
                     notifyListeners(EVENT_FILE_OPENED, file, true);
                 }
-            } catch (Exception e) {
+            } catch (Throwable e) {
+                // Throwable: a file too large for memory must not take the app down.
                 Log.e(TAG, "Could not read incoming file", e);
             }
         });
@@ -582,27 +540,36 @@ public class QuillNativePlugin extends Plugin {
 
     private static boolean isFileIntent(Intent intent) {
         String action = intent.getAction();
-        if (Intent.ACTION_VIEW.equals(action)) {
+        if (Intent.ACTION_VIEW.equals(action) || Intent.ACTION_EDIT.equals(action)) {
             return intent.getData() != null;
         }
         if (Intent.ACTION_SEND.equals(action)) {
             return streamExtra(intent) != null || intent.getCharSequenceExtra(Intent.EXTRA_TEXT) != null;
         }
+        if (Intent.ACTION_SEND_MULTIPLE.equals(action)) {
+            return !streamExtras(intent).isEmpty();
+        }
         return false;
     }
 
-    private JSObject readIntent(Intent intent) throws IOException {
+    /** The files an "Open with" / "Edit with" / "Share to" intent carries, in order (several for ACTION_SEND_MULTIPLE). */
+    private List<JSObject> readIntent(Intent intent) throws IOException {
+        List<JSObject> out = new ArrayList<>();
         String action = intent.getAction();
-        Uri uri = null;
-        if (Intent.ACTION_VIEW.equals(action)) {
-            uri = intent.getData();
+        List<Uri> uris = new ArrayList<>();
+        if (Intent.ACTION_VIEW.equals(action) || Intent.ACTION_EDIT.equals(action)) {
+            if (intent.getData() != null) {
+                uris.add(intent.getData());
+            }
         } else if (Intent.ACTION_SEND.equals(action)) {
-            uri = streamExtra(intent);
-            if (uri == null) {
+            Uri uri = streamExtra(intent);
+            if (uri != null) {
+                uris.add(uri);
+            } else {
                 // Plain text shared without a file: hand it over as a .txt file (opens as text import) (no uri).
                 CharSequence text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT);
                 if (text == null) {
-                    return null;
+                    return out;
                 }
                 String subject = intent.getStringExtra(Intent.EXTRA_SUBJECT);
                 String base = subject != null && !subject.trim().isEmpty() ? sanitizeFileName(subject.trim()) : "Shared text";
@@ -610,14 +577,33 @@ public class QuillNativePlugin extends Plugin {
                 ret.put("name", base + ".txt");
                 ret.put("mime", "text/plain");
                 ret.put("data", Base64.encodeToString(text.toString().getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP));
-                return ret;
+                out.add(ret);
+                return out;
+            }
+        } else if (Intent.ACTION_SEND_MULTIPLE.equals(action)) {
+            uris.addAll(streamExtras(intent));
+        }
+        IOException first = null;
+        for (Uri uri : uris) {
+            if (!isAllowedUri(uri)) {
+                Log.w(TAG, "Ignored a file address that is not a content: URI of another app");
+                continue;
+            }
+            try {
+                takePersistablePermission(uri);
+                // The intent's type describes a single file; with several, each is identified on its own.
+                out.add(readDocument(uri, uris.size() == 1 ? intent.getType() : null));
+            } catch (IOException e) {
+                Log.w(TAG, "Could not read " + uri, e);
+                if (first == null) {
+                    first = e;
+                }
             }
         }
-        if (uri == null) {
-            return null;
+        if (out.isEmpty() && first != null) {
+            throw first;
         }
-        takePersistablePermission(uri);
-        return readDocument(uri, intent.getType());
+        return out;
     }
 
     private static Uri streamExtra(Intent intent) {
@@ -631,19 +617,47 @@ public class QuillNativePlugin extends Plugin {
         return uri;
     }
 
+    private static List<Uri> streamExtras(Intent intent) {
+        List<Uri> out = new ArrayList<>();
+        ArrayList<Uri> list = IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri.class);
+        if (list != null) {
+            for (Uri uri : list) {
+                if (uri != null) {
+                    out.add(uri);
+                }
+            }
+        }
+        if (out.isEmpty()) {
+            ClipData clip = intent.getClipData();
+            for (int i = 0; clip != null && i < clip.getItemCount(); i++) {
+                Uri uri = clip.getItemAt(i).getUri();
+                if (uri != null) {
+                    out.add(uri);
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Only content: URIs served by another app's provider are read or written. A file: URI, or a URI of this
+     * app's own file provider, can name a file in the app's private storage: a crafted "Open with" intent would
+     * make the app show it, and Save would then overwrite it.
+     */
+    private boolean isAllowedUri(Uri uri) {
+        if (uri == null || !ContentResolver.SCHEME_CONTENT.equals(uri.getScheme())) {
+            return false;
+        }
+        String host = uri.getHost();
+        return host != null && !host.equals(getContext().getPackageName() + ".fileprovider");
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------------------------------
 
     private JSObject readDocument(Uri uri, String hintMime) throws IOException {
         ContentResolver resolver = getContext().getContentResolver();
-        byte[] bytes;
-        try (InputStream in = resolver.openInputStream(uri)) {
-            if (in == null) {
-                throw new IOException("Unable to open " + uri);
-            }
-            bytes = readAll(in);
-        }
         String name = queryDisplayName(uri);
         if (name == null || name.isEmpty()) {
             name = "Untitled";
@@ -652,7 +666,15 @@ public class QuillNativePlugin extends Plugin {
         ret.put("uri", uri.toString());
         ret.put("name", name);
         ret.put("mime", resolveMime(resolver, uri, name, hintMime));
-        ret.put("data", Base64.encodeToString(bytes, Base64.NO_WRAP));
+        try (InputStream in = resolver.openInputStream(uri)) {
+            if (in == null) {
+                throw new IOException("Unable to open " + uri);
+            }
+            // The file crosses to the web app as one base64 string, so it is held in memory several times over.
+            ret.put("data", Base64.encodeToString(readAll(in), Base64.NO_WRAP));
+        } catch (OutOfMemoryError e) {
+            throw new IOException("The file is too large for this device's memory");
+        }
         return ret;
     }
 

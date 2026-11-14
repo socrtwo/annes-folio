@@ -3,7 +3,7 @@
  * objects dropped, streams optionally recompressed, optional encryption) and incremental updates
  * (the original bytes untouched, changed objects and a new cross-reference section appended).
  */
-import { Dict, Name, PdfObj, PdfStream, PdfString, Ref, bytesOf, concat, isName, pdfDate, nameObj } from './objects';
+import { Dict, Name, PdfObj, PdfStream, PdfString, Ref, bytesOf, concat, dictOf, isName, latin1, nameObj, utf8 } from './objects';
 import { deflateZlib } from './filters';
 import { SecurityHandler, Permissions } from './crypt';
 import type { PdfDocument } from './document';
@@ -28,7 +28,9 @@ export interface SaveOptions {
 
 const NAME_ESC = /[^\x21-\x7e]|[#()<>\[\]{}\/%]/g;
 
+/** A name is a byte string (one char per byte, as the lexer reads it); one made in code with wider characters is written as UTF-8. */
 export function serializeName(n: string): string {
+  if (/[^\x00-\xff]/.test(n)) n = latin1(utf8(n));
   return '/' + n.replace(NAME_ESC, (c) => '#' + c.charCodeAt(0).toString(16).padStart(2, '0').toUpperCase());
 }
 
@@ -48,10 +50,19 @@ export function serializeString(s: PdfString): string {
   return out + ')';
 }
 
+/**
+ * A number in PDF syntax: no exponent, and eight significant digits (more than the single-precision
+ * reals most readers use), so that small values such as a 1/2048 font matrix survive being rewritten.
+ */
 export function fmtNum(n: number): string {
   if (!isFinite(n)) return '0';
-  if (Number.isInteger(n)) return String(n);
-  let s = n.toFixed(4).replace(/0+$/, '').replace(/\.$/, '');
+  if (Number.isInteger(n)) return Math.abs(n) < 1e21 ? String(n) : BigInt(n).toString();
+  const a = Math.abs(n);
+  if (a < 1e-30) return '0';
+  if (a >= 1e21) return BigInt(Math.round(n)).toString();
+  const decimals = Math.max(0, 7 - Math.floor(Math.log10(a)));
+  let s = n.toFixed(decimals);
+  if (s.includes('.')) s = s.replace(/0+$/, '').replace(/\.$/, '');
   if (s === '-0') s = '0';
   return s;
 }
@@ -90,10 +101,11 @@ function reachable(doc: PdfDocument, roots: PdfObj[]): Set<number> {
   const stack: PdfObj[] = [...roots];
   while (stack.length) {
     const v = stack.pop()!;
+    // Pushed one by one: spreading a very large array or dictionary into push() overflows the call stack.
     if (v instanceof Ref) { if (seen.has(v.num)) continue; seen.add(v.num); stack.push(doc.fetch(v)); }
-    else if (Array.isArray(v)) stack.push(...v);
-    else if (v instanceof Dict) stack.push(...v.map.values());
-    else if (v instanceof PdfStream) stack.push(...v.dict.map.values());
+    else if (Array.isArray(v)) { for (const x of v) stack.push(x); }
+    else if (v instanceof Dict) { for (const x of v.map.values()) stack.push(x); }
+    else if (v instanceof PdfStream) { for (const x of v.dict.map.values()) stack.push(x); }
   }
   return seen;
 }
@@ -112,14 +124,18 @@ const IMAGE_OR_FONT = new Set(['DCTDecode', 'JPXDecode', 'CCITTFaxDecode', 'JBIG
 function recompressed(doc: PdfDocument, s: PdfStream): PdfStream {
   const f = s.dict.get('Filter');
   const names = isName(f) ? [f.name] : Array.isArray(f) ? f.filter(nameObj).map((n) => (n as Name).name) : [];
-  if (names.some((n) => IMAGE_OR_FONT.has(n)) || isName(s.dict.get('Type'), 'XRef')) return s;
+  // /F means the data is in another file: there is nothing here to recompress.
+  if (names.some((n) => IMAGE_OR_FONT.has(n)) || isName(s.dict.get('Type'), 'XRef') || s.dict.has('F')) return s;
   if (names.length === 1 && names[0] === 'FlateDecode' && !s.dict.has('DecodeParms')) return s; // already Flate without predictor
   let data: Uint8Array;
+  // `corrupt` also covers a predictor that could not be undone: such data must keep its /DecodeParms.
   try { const r = doc.decode(s); if (r.imageFilter || r.corrupt) return s; data = r.data; } catch { return s; }
-  const d = s.dict.clone();
-  d.delete('DecodeParms'); d.delete('DP'); d.delete('F');
-  d.set('Filter', Name.get('FlateDecode'));
   const raw = deflateZlib(data);
+  // Never make a stream bigger (a predictor often compresses an image better than plain Flate does).
+  if (raw.length >= s.raw.length) return s;
+  const d = s.dict.clone();
+  d.delete('DecodeParms');
+  d.set('Filter', Name.get('FlateDecode'));
   d.set('Length', raw.length);
   const out = new PdfStream(d, raw);
   out.decoded = data;
@@ -128,41 +144,62 @@ function recompressed(doc: PdfDocument, s: PdfStream): PdfStream {
 
 export function writeFull(doc: PdfDocument, opts: SaveOptions = {}): Uint8Array {
   const trailer = doc.trailer;
-  const roots: PdfObj[] = [trailer.get('Root') ?? null, trailer.get('Info') ?? null];
-  let nums = opts.keepUnused ? doc.objectNumbers() : [...reachable(doc, roots)].sort((a, b) => a - b);
   const encRef = trailer.get('Encrypt');
-  nums = nums.filter((n) => !(encRef instanceof Ref && encRef.num === n));
-  // Renumber 1..n in order.
-  const map = new Map<number, number>();
-  nums.forEach((n, i) => map.set(n, i + 1));
-  const mapRef = (r: Ref): Ref => (map.has(r.num) ? new Ref(map.get(r.num)!, 0) : new Ref(0, 0));
   // Encryption for the new file.
   const ids = doc.resolve(trailer.get('ID'));
-  let id0 = Array.isArray(ids) && ids[0] instanceof PdfString ? ids[0].bytes : md5(concat([randomBytes(16), bytesOf(String(Date.now()))]));
-  const id1 = md5(concat([id0, randomBytes(16), bytesOf(String(Date.now()))]));
+  const oldId0 = Array.isArray(ids) && ids[0] instanceof PdfString ? ids[0].bytes : null;
+  const freshId = (): Uint8Array => md5(concat([randomBytes(16), bytesOf(String(Date.now()))]));
+  let id0: Uint8Array | null = oldId0;
   let security: SecurityHandler | null = null;
   let encDict: Dict | null = null;
   if (opts.encrypt) {
-    id0 = md5(concat([randomBytes(16), bytesOf(String(Date.now()))]));
+    id0 = freshId();
     const e = SecurityHandler.createAes256(opts.encrypt.userPassword, opts.encrypt.ownerPassword, opts.encrypt.permissions, id0, opts.encrypt.encryptMetadata !== false);
     security = e.handler; encDict = e.dict;
   } else if (doc.security && !opts.removeSecurity) {
     security = doc.security;
     encDict = security.dict;
   }
+  // An RC4 or AES-128 key is derived from ID[0]. A file with no /ID was encrypted with an empty one, so
+  // giving it an ID now would make its own password stop working.
+  const keepNoId = !oldId0 && !!security && security === doc.security && security.R < 5;
+  if (!id0 && !keepNoId) id0 = freshId();
+  const roots: PdfObj[] = [trailer.get('Root') ?? null, trailer.get('Info') ?? null];
+  // What a kept encryption dictionary refers to has to be written and renumbered like everything else.
+  if (encDict && !opts.encrypt) for (const v of encDict.map.values()) roots.push(v);
+  // Left out before numbering, so the new file has no gaps (and so no free entries): the old /Encrypt
+  // dictionary (written again below), old xref streams, and object streams (their contents are written directly).
+  const dropped = (n: number): boolean => {
+    if (encRef instanceof Ref && encRef.num === n) return true;
+    const o = doc.fetch(new Ref(n, doc.genOf(n)));
+    return o instanceof PdfStream && (isName(o.dict.get('Type'), 'XRef') || isName(o.dict.get('Type'), 'ObjStm'));
+  };
+  const nums = (opts.keepUnused ? doc.objectNumbers() : [...reachable(doc, roots)].sort((a, b) => a - b)).filter((n) => !dropped(n));
+  // Renumber 1..n in order.
+  const map = new Map<number, number>();
+  nums.forEach((n, i) => map.set(n, i + 1));
+  const mapRef = (r: Ref): Ref => (map.has(r.num) ? new Ref(map.get(r.num)!, 0) : new Ref(0, 0));
+  // The header has to admit what the file uses, unless the caller chose a version.
+  let version = opts.version || versionOf(doc);
+  const atLeast = (v: string) => { if (!opts.version && version < v) version = v; };
+  if (opts.objectStreams) atLeast('1.5');
+  if (security) atLeast(security.R >= 5 ? '1.7' : security.method === 'aesv2' || security.stringMethod === 'aesv2' ? '1.6' : security.V >= 4 ? '1.5' : '1.4');
+  // AES-256 with revision 6 is PDF 2.0; in a 1.7 file it is declared as Adobe extension level 8.
+  const rootRef = trailer.get('Root');
+  const declareR6 = !!opts.encrypt && version < '2.0';
   const out: Uint8Array[] = [];
   let pos = 0;
   const push = (b: Uint8Array) => { out.push(b); pos += b.length; };
-  push(bytesOf(`%PDF-${opts.version || versionOf(doc)}\n%\xe2\xe3\xcf\xd3\n`));
+  push(bytesOf(`%PDF-${version}\n%\xe2\xe3\xcf\xd3\n`));
   const offsets = new Map<number, number>();
   const objStmCandidates: [number, Uint8Array][] = [];
   for (const n of nums) {
     const newNum = map.get(n)!;
     let obj = doc.fetch(new Ref(n, doc.genOf(n)));
-    obj = remapRefs(obj, mapRef);
+    if (declareR6 && rootRef instanceof Ref && rootRef.num === n && obj instanceof Dict) obj = withExtensionLevel8(doc, obj);
+    // Recompressed before renumbering: decoding may follow references (/DecodeParms), which are still the document's.
     if (obj instanceof PdfStream && opts.recompress) obj = recompressed(doc, obj);
-    if (obj instanceof PdfStream && isName(obj.dict.get('Type'), 'XRef')) continue; // old xref streams are dropped
-    if (obj instanceof PdfStream && isName(obj.dict.get('Type'), 'ObjStm')) continue; // their contents are written directly
+    obj = remapRefs(obj, mapRef);
     if (security) obj = security.encryptObject(obj, new Ref(newNum, 0));
     if (opts.objectStreams && !(obj instanceof PdfStream) && !security) { objStmCandidates.push([newNum, serialize(obj)]); continue; }
     offsets.set(newNum, pos);
@@ -194,14 +231,13 @@ export function writeFull(doc: PdfDocument, opts: SaveOptions = {}): Uint8Array 
   if (encDict) {
     encNum = size++;
     offsets.set(encNum, pos);
-    push(bytesOf(`${encNum} 0 obj\n`)); push(serialize(encDict)); push(bytesOf('\nendobj\n'));
+    push(bytesOf(`${encNum} 0 obj\n`)); push(serialize(opts.encrypt ? encDict : remapRefs(encDict, mapRef))); push(bytesOf('\nendobj\n'));
   }
   const newTrailer = new Dict();
-  const root = trailer.get('Root');
-  newTrailer.set('Root', root instanceof Ref ? mapRef(root) : (root ?? null) as PdfObj);
+  newTrailer.set('Root', rootRef instanceof Ref ? mapRef(rootRef) : (rootRef ?? null) as PdfObj);
   const info = trailer.get('Info');
   if (info instanceof Ref && map.has(info.num)) newTrailer.set('Info', mapRef(info));
-  newTrailer.set('ID', [new PdfString(id0, true), new PdfString(id1, true)]);
+  if (id0) newTrailer.set('ID', [new PdfString(id0, true), new PdfString(md5(concat([id0, randomBytes(16), bytesOf(String(Date.now()))])), true)]);
   if (encNum) newTrailer.set('Encrypt', new Ref(encNum, 0));
   const xrefPos = pos;
   if (opts.objectStreams || xrefStmEntries.length) {
@@ -214,7 +250,7 @@ export function writeFull(doc: PdfDocument, opts: SaveOptions = {}): Uint8Array 
     for (const [n, t, f2, f3] of xrefStmEntries) entryFor.set(n, [t, f2, f3]);
     entryFor.set(xnum, [1, xrefPos, 0]);
     for (let n = 0; n < size; n++) {
-      const e = entryFor.get(n) || [0, 0, 0];
+      const e = entryFor.get(n) || [0, 0, n === 0 ? 65535 : 0]; // object 0 heads the (empty) free list with generation 65535
       rows.push(Uint8Array.from([e[0], (e[1] >>> 24) & 255, (e[1] >>> 16) & 255, (e[1] >>> 8) & 255, e[1] & 255, (e[2] >> 8) & 255, e[2] & 255]));
     }
     const data = concat(rows);
@@ -233,8 +269,7 @@ export function writeFull(doc: PdfDocument, opts: SaveOptions = {}): Uint8Array 
   return concat(out);
 }
 
-export function writeIncremental(doc: PdfDocument, opts: SaveOptions = {}): Uint8Array {
-  void opts;
+export function writeIncremental(doc: PdfDocument, _opts: SaveOptions = {}): Uint8Array {
   const base = doc.buf;
   const out: Uint8Array[] = [base];
   let pos = base.length;
@@ -243,27 +278,36 @@ export function writeIncremental(doc: PdfDocument, opts: SaveOptions = {}): Uint
   const changed = [...doc.changed.entries()].sort((a, b) => a[0] - b[0]);
   const offsets = new Map<number, number>();
   const deleted: number[] = [];
+  let size = doc.size;
   for (const [n, obj] of changed) {
-    if (obj === null) { deleted.push(n); continue; }
+    if (n >= size) size = n + 1;
+    if (obj === null) { if (n > 0) deleted.push(n); continue; }
     const gen = doc.genOf(n);
     let o: PdfObj = obj;
     if (doc.security) o = doc.security.encryptObject(o, new Ref(n, gen));
     offsets.set(n, pos);
     push(bytesOf(`${n} ${gen} obj\n`)); push(serialize(o)); push(bytesOf('\nendobj\n'));
   }
-  const size = Math.max(doc.size, ...changed.map(([n]) => n + 1));
-  const ids = doc.resolve(doc.trailer.get('ID'));
-  const id0 = Array.isArray(ids) && ids[0] instanceof PdfString ? ids[0] : new PdfString(md5(bytesOf(String(Date.now()))), true);
-  const id1 = new PdfString(md5(concat([id0.bytes, bytesOf(String(Date.now()) + pos)])), true);
   const t = new Dict();
   for (const k of ['Root', 'Info', 'Encrypt']) if (doc.trailer.has(k)) t.set(k, doc.trailer.get(k)!);
-  t.set('ID', [id0, id1]);
+  // ID[0] stays, ID[1] is new. A file without an /ID gets one, except when it is encrypted with a key
+  // derived from the ID (RC4, AES-128): that key was made from an empty ID and must go on working.
+  const ids = doc.resolve(doc.trailer.get('ID'));
+  const oldId0 = Array.isArray(ids) && ids[0] instanceof PdfString ? ids[0] : null;
+  if (oldId0 || !(doc.security && doc.security.R < 5)) {
+    const id0 = oldId0 ?? new PdfString(md5(concat([randomBytes(16), bytesOf(String(Date.now()))])), true);
+    t.set('ID', [id0, new PdfString(md5(concat([id0.bytes, randomBytes(16), bytesOf(String(Date.now()) + pos)])), true)]);
+  }
   t.set('Size', size);
   if (doc.startxref >= 0) t.set('Prev', doc.startxref);
+  // The free list: object 0 heads it, each deleted object names the next one, and the last names 0.
+  const nextFree = new Map<number, number>();
+  deleted.forEach((n, i) => nextFree.set(n, deleted[i + 1] ?? 0));
+  const freeGen = (n: number): number => Math.min(65535, doc.genOf(n) + 1);
   const xrefPos = pos;
   if (doc.usesXrefStream) {
     const xnum = size;
-    const nums = [...offsets.keys(), ...deleted, xnum].sort((a, b) => a - b);
+    const nums = [...(deleted.length ? [0] : []), ...offsets.keys(), ...deleted, xnum].sort((a, b) => a - b);
     const rows: Uint8Array[] = [];
     const index: number[] = [];
     // Index: runs of consecutive numbers.
@@ -273,7 +317,7 @@ export function writeIncremental(doc: PdfDocument, opts: SaveOptions = {}): Uint
       if (n !== prev + 1) { flush(); runStart = n; runLen = 0; }
       runLen++; prev = n;
       const o = n === xnum ? xrefPos : offsets.get(n);
-      const e: [number, number, number] = o != null ? [1, o, n === xnum ? 0 : doc.genOf(n)] : [0, 0, 0];
+      const e: [number, number, number] = o != null ? [1, o, n === xnum ? 0 : doc.genOf(n)] : n === 0 ? [0, deleted[0], 65535] : [0, nextFree.get(n) ?? 0, freeGen(n)];
       rows.push(Uint8Array.from([e[0], (e[1] >>> 24) & 255, (e[1] >>> 16) & 255, (e[1] >>> 8) & 255, e[1] & 255, (e[2] >> 8) & 255, e[2] & 255]));
     }
     flush();
@@ -283,14 +327,19 @@ export function writeIncremental(doc: PdfDocument, opts: SaveOptions = {}): Uint
     for (const [k, v] of t.map) if (k !== 'Size') xd.set(k, v);
     push(bytesOf(`${xnum} 0 obj\n`)); push(serialize(new PdfStream(xd, raw))); push(bytesOf('\nendobj\n'));
   } else {
-    const nums = [...offsets.keys(), ...deleted].sort((a, b) => a - b);
+    // Every section starts with object 0 (the head of the free list), as readers expect of a table.
+    const nums = [0, ...[...offsets.keys(), ...deleted].filter((n) => n > 0)].sort((a, b) => a - b);
+    const pad = (v: number, w: number) => String(v).padStart(w, '0');
     let x = 'xref\n';
     let i = 0;
     while (i < nums.length) {
       let j = i;
       while (j + 1 < nums.length && nums[j + 1] === nums[j] + 1) j++;
       x += `${nums[i]} ${j - i + 1}\n`;
-      for (let k = i; k <= j; k++) { const n = nums[k]; const o = offsets.get(n); x += o != null ? `${String(o).padStart(10, '0')} ${String(doc.genOf(n)).padStart(5, '0')} n \n` : `0000000000 ${String(Math.min(65535, doc.genOf(n) + 1)).padStart(5, '0')} f \n`; }
+      for (let k = i; k <= j; k++) {
+        const n = nums[k]; const o = offsets.get(n);
+        x += o != null && n > 0 ? `${pad(o, 10)} ${pad(doc.genOf(n), 5)} n \n` : n === 0 ? `${pad(deleted[0] ?? 0, 10)} 65535 f \n` : `${pad(nextFree.get(n) ?? 0, 10)} ${pad(freeGen(n), 5)} f \n`;
+      }
       i = j + 1;
     }
     push(bytesOf(x));
@@ -300,6 +349,19 @@ export function writeIncremental(doc: PdfDocument, opts: SaveOptions = {}): Uint
   return concat(out);
 }
 
+/** The catalog with /Extensions /ADBE declaring extension level 8 (unless it already declares that or more). */
+function withExtensionLevel8(doc: PdfDocument, cat: Dict): Dict {
+  const ext = dictOf(doc.resolve(cat.get('Extensions')));
+  const adbe = ext ? dictOf(doc.resolve(ext.get('ADBE'))) : null;
+  const level = adbe ? doc.resolve(adbe.get('ExtensionLevel')) : null;
+  if (typeof level === 'number' && level >= 8) return cat;
+  const e = ext ? ext.clone() : new Dict();
+  e.set('ADBE', new Dict({ BaseVersion: Name.get('1.7'), ExtensionLevel: 8 }));
+  const c = cat.clone();
+  c.set('Extensions', e);
+  return c;
+}
+
 function versionOf(doc: PdfDocument): string {
   const m = /%PDF-(\d\.\d)/.exec(doc.report.header);
   const v = doc.catalog.get('Version');
@@ -307,5 +369,3 @@ function versionOf(doc: PdfDocument): string {
   const best = [m?.[1] || '1.4', cv].filter(Boolean).sort().pop() || '1.4';
   return best < '1.4' ? '1.4' : best;
 }
-
-export const nowDate = pdfDate;

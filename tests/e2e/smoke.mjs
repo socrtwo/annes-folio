@@ -27,7 +27,8 @@ try {
   const errs = [];
   p.on('pageerror', (e) => errs.push('pageerror: ' + e.message));
   p.on('console', (m) => { if (m.type() === 'error') errs.push('console: ' + m.text()); });
-  await p.addInitScript(() => localStorage.setItem('quillfolio.prefs.v1', JSON.stringify({ firstRun: false })));
+  // window.qf and the __qf* hooks exist only in dev or with this key set.
+  await p.addInitScript(() => { localStorage.setItem('quillfolio.prefs.v1', JSON.stringify({ firstRun: false })); localStorage.setItem('quillfolio.debugHooks', '1'); });
   await p.goto(url, { waitUntil: 'networkidle' });
   await p.waitForSelector('.qf-page canvas');
   await p.waitForTimeout(800);
@@ -55,6 +56,32 @@ try {
   await p.waitForSelector('.qf-page[data-i="2"]');
   const text = await p.evaluate(() => qf.viewer.pageText(0));
   check('text layer', /Hello Anne's Folio/.test(text), true);
+
+  // The text layer lies on the text: a span is as wide as its text item, and selecting it gives a rectangle
+  // of that width. (Without the pdf.js text-layer CSS every span is 16px and selections miss the words.)
+  const geo = await p.evaluate(async () => {
+    const v = qf.viewer;
+    v.setZoom(1.5);
+    await new Promise((r) => setTimeout(r, 1200));
+    const slot = v.slots[0];
+    const items = await v.items(0);
+    const out = [];
+    for (const span of [...slot.text.querySelectorAll('span')].filter((s) => s.textContent.trim().length > 6).slice(0, 2)) {
+      const it = items.find((i) => i.str === span.textContent);
+      if (!it) continue;
+      const a = v.toCss(slot, it.x, it.y), b = v.toCss(slot, it.x + it.w, it.y);
+      const range = document.createRange(); range.selectNodeContents(span);
+      const sel = getSelection(); sel.removeAllRanges(); sel.addRange(range);
+      const sr = v.selectionRects;
+      sel.removeAllRanges();
+      out.push({ span: span.getBoundingClientRect().width / Math.abs(b[0] - a[0]), selection: sr ? (sr.rects[0][2] - sr.rects[0][0]) / it.w : 0 });
+    }
+    v.setZoom('fit-width');
+    return out;
+  });
+  check('text layer spans measured', geo.length > 0, true);
+  check('text layer span width matches its text', geo.every((g) => g.span > 0.93 && g.span < 1.07), true);
+  check('selection rectangle covers the selected text', geo.every((g) => g.selection > 0.93 && g.selection < 1.07), true);
 
   // Annotate: a note, a highlight and a text field through the engine commands.
   await p.evaluate(() => { void qf.exec('comment.toolDone', { tool: 'note', page: 0, start: [100, 700], end: [100, 700], rect: [100, 700, 100, 700], pts: [[100, 700]], click: true, opts: {} }); });
@@ -90,6 +117,27 @@ try {
   check('undo', await p.evaluate(() => qf.doc.pages[2].rotate), 0);
   await p.evaluate(() => qf.exec('edit.redo'));
   check('redo', await p.evaluate(() => qf.doc.pages[2].rotate), 90);
+
+  // The rotated page is shown turned (the page's /Rotate counts, not only the view rotation), its thumbnail
+  // too, and a file that already carries /Rotate 90 opens that way.
+  const shown = async () => p.evaluate(async () => {
+    const v = qf.viewer;
+    v.goToPage(2);
+    for (let i = 0; i < 40 && !(v.slots[2].canvas.width > 1); i++) await new Promise((r) => setTimeout(r, 100));
+    const s = v.slots[2], upright = v.slots[0];
+    const img = new Image(); img.src = await v.thumb(2); await img.decode();
+    return { page: s.el.clientWidth > s.el.clientHeight, canvas: s.canvas.width > s.canvas.height, thumb: img.naturalWidth > img.naturalHeight, other: upright.el.clientWidth < upright.el.clientHeight };
+  });
+  check('rotated page is displayed turned', await shown(), { page: true, canvas: true, thumb: true, other: true });
+  await p.evaluate(async () => {
+    const bytes = qf.doc.save({ incremental: false });
+    await qf.exec('file.openDropped', [new File([bytes], 'rotated.pdf', { type: 'application/pdf' })]);
+    await new Promise((r) => setTimeout(r, 1200));
+  });
+  check('opened copy', await p.evaluate(() => [qf.tab.fileName, qf.doc.pages[2].rotate]), ['rotated.pdf', 90]);
+  check('a /Rotate 90 page opens turned', await shown(), { page: true, canvas: true, thumb: true, other: true });
+  await p.evaluate(async () => { qf.closeTab(qf.tab); await new Promise((r) => setTimeout(r, 300)); qf.viewer.goToPage(0); });
+  check('back on the first document', await p.evaluate(() => qf.tab.fileName), 'smoke.pdf');
 
   // Save (incremental and rewritten) and reopen each.
   const round = await p.evaluate(async () => {

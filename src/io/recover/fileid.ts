@@ -211,9 +211,24 @@ const BOUNDARY_SIGS: { ext: string; sig: number[] }[] = [
   { ext: 'rtf', sig: SIG.RTF }, { ext: '7z', sig: SIG.SEVENZ }, { ext: 'rar', sig: SIG.RAR }, { ext: 'sqlite', sig: SIG.SQLITE }, { ext: 'pst', sig: SIG.PST },
 ];
 
-interface SegState { start: number; kind: string; walkClean?: boolean; guard: number }
+const STREAM = ascii('stream'), EOF_MARK = ascii('%%EOF');
+/** True when `pos` comes right after a PDF end-of-file marker (only line ends in between). */
+function afterPdfEof(b: Uint8Array, pos: number): boolean {
+  let i = pos - 1;
+  while (i >= 0 && (b[i] === 0x0a || b[i] === 0x0d || b[i] === 0x20)) i--;
+  return matches(b, i - 4, EOF_MARK);
+}
+/** True when `pos` lies in the data of a PDF stream: the nearest "stream" keyword before it is not an "endstream". */
+function insidePdfStream(b: Uint8Array, start: number, pos: number): boolean {
+  const floor = Math.max(start, pos - (1 << 20));
+  for (let i = pos - 6; i >= floor; i--) if (b[i] === 0x73 && matches(b, i, STREAM)) return !(b[i - 3] === 0x65 && b[i - 2] === 0x6e && b[i - 1] === 0x64);
+  return floor > start; // nothing within 1 MB: a stream longer than that
+}
+
+interface SegState { start: number; kind: string; walkClean?: boolean; guard: number; /** JPEG: where its first end-of-image marker is (-1 none), found once. */ eoi?: number }
 function segState(b: Uint8Array, start: number): SegState {
   if (matches(b, start, SIG.ZIP_LOCAL)) { const w = walkZipEntries(b, start); return { start, kind: 'zip', walkClean: w.clean, guard: Math.max(start + 4, w.end) }; }
+  if (matches(b, start, SIG.PDF)) return { start, kind: 'pdf', guard: start + 5 };
   if (matches(b, start, SIG.OLE2)) return { start, kind: 'ole', guard: start + 512 };
   if (matches(b, start, SIG.JPEG)) return { start, kind: 'jpg', guard: start + 4 };
   return { start, kind: 'other', guard: start + 1 };
@@ -235,7 +250,11 @@ export function scan(b: Uint8Array): { segments: Segment[]; multiple: boolean } 
       let accept = true;
       if (cur.kind === 'zip') accept = hit.ext === 'zip' ? !!cur.walkClean : !!cur.walkClean || hit.sig.length >= 5;
       else if (cur.kind === 'ole') accept = (pos - cur.start) % 512 === 0 || hit.sig.length >= 6;
-      else if (cur.kind === 'jpg' && hit.ext === 'jpg') accept = indexOfBytes(b, [0xff, 0xd9], cur.start, pos) !== -1;
+      else if (cur.kind === 'jpg' && hit.ext === 'jpg') { if (cur.eoi === undefined) cur.eoi = indexOfBytes(b, [0xff, 0xd9], cur.start); accept = cur.eoi !== -1 && cur.eoi < pos; }
+      // A PDF holds JPEGs, embedded files and the like in its streams: those are not other files. A
+      // signature inside stream data only counts when a whole, consistent ZIP starts there (a
+      // truncated PDF with an archive fused on); after the PDF's %%EOF anything counts.
+      else if (cur.kind === 'pdf') accept = afterPdfEof(b, pos) || !insidePdfStream(b, cur.start, pos) || (hit.ext === 'zip' && walkZipEntries(b, pos).clean);
       if (accept) { starts.push(pos); cur = segState(b, pos); pos = Math.max(pos + 1, cur.guard); continue; }
     }
     pos++;

@@ -40,7 +40,10 @@ export interface Command {
   menu?: (app: App) => MenuEntry[];
   /** Do not record while recording a macro (navigation, UI toggles). */
   noRecord?: boolean;
-  /** Requires an editable document. Defaults to true for anything that changes the document. */
+  /**
+   * Whether the command changes the document. Anything not marked `edits: false` is refused on a read-only
+   * document (App.exec), so viewing, navigation, export, copy, pane and settings commands must say `false`.
+   */
   edits?: boolean;
   /** Feature heritage note shown in the command reference (e.g. "WordPerfect Reveal Codes"). */
   origin?: string;
@@ -69,9 +72,15 @@ export function getCommand(id: string): Command | undefined {
   if (c) return c;
   if (id.startsWith('macro:')) {
     const name = id.slice(6);
-    return { id, label: name, icon: 'smart_button', tab: 'Macros', group: 'Macros', noRecord: true, run: (app) => app.exec('dev.runMacro', name) };
+    // Each step of the macro passes the read-only gate itself.
+    return { id, label: name, icon: 'smart_button', tab: 'Macros', group: 'Macros', noRecord: true, edits: false, run: (app) => app.exec('dev.runMacro', name) };
   }
   return undefined;
+}
+
+/** Every registered command, internal ones included. */
+export function registeredCommands(): Command[] {
+  return [...registry.values()];
 }
 
 export function allCommands(): Command[] {

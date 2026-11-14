@@ -6,7 +6,7 @@ An original, open-source PDF app for Android, iOS, Windows, macOS, Linux, Chrome
 
 > **Status: first working version (0.1.0, milestone M1 with much of M2 and M3).** The app builds for the web, Android, iOS and desktop with the same CI and release workflows as the sister apps. What works today:
 >
-> - **354 commands**; 359 of the 379 ids in the plan are implemented, and the rest are listed in [docs/COMMANDS.md](docs/COMMANDS.md). A command is registered only when it works.
+> - **355 commands**; 359 of the 379 ids in the plan are implemented, and the rest are listed in [docs/COMMANDS.md](docs/COMMANDS.md). A command is registered only when it works.
 > - **Engine:** a clean-room ISO 32000 object model with a tolerant parser, every standard filter except the image codecs, cross-reference tables and streams, object streams, RC4 and AES decryption, AES-256 encryption, incremental updates and full rewrites, and a reconstruction path for damaged files. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 > - **Viewing:** continuous, single, facing and book layouts, zoom and fit modes, rotation, thumbnails with drag reordering, an Organize Pages grid, search with highlights, text selection, read, presentation and full-screen modes, night mode and grayscale, side-by-side windows, panes for bookmarks, attachments, layers, comments, signatures, fields, search and a structure inspector.
 > - **Commenting:** highlight, underline, strikeout, squiggly, notes with replies and status, text boxes and callouts, pen, highlighter, shapes and clouds, stamps (text and picture), file and audio attachments, measurements with a drawing scale, properties, flatten, XFDF in and out.
@@ -27,7 +27,7 @@ An original, open-source PDF app for Android, iOS, Windows, macOS, Linux, Chrome
 - **Customize Tabs and Keyboard:** create tabs and groups, put any command in them, rename, reorder or hide built-in tabs, and rebind any command with conflict display. Layouts can be exported and imported.
 - **Its own engine, plus pdf.js for pixels.** Anne's Folio's engine (src/pdf) is the document of record: it parses, repairs, edits and writes PDFs from the ISO 32000 specification. pdf.js (Apache 2.0) only rasterizes pages and extracts positioned text for display, selection and search. Saves append an incremental update by default, so the original bytes and any signatures stay intact; a full rewrite is one option away.
 - **Innovations from other PDF software,** credited in [docs/INNOVATIONS.md](docs/INNOVATIONS.md): a repair report with a diff of what was rebuilt and lost, a structure inspector with raw object view, a redaction log that travels with the file, review packages, a plain-language accessibility fixer, document similarity, batch processing, and more.
-- **AI tab (optional).** Summaries, questions over the pages that match them best, key points, tables and entities, labels for form fields, translation, comment rewriting and replies, OCR clean-up, alt text, redaction suggestions, bookmarks and an assistant. The setup wizard covers free and paid providers, local servers, and a **free on-device model** that works offline after one download. Several AIs can work on one request. Nothing is sent anywhere until you run an AI command.
+- **AI tab (optional).** Summaries, questions over the pages that match them best, key points, tables and entities, labels for form fields, translation, comment rewriting and replies, OCR clean-up, alt text, redaction suggestions, bookmarks and an assistant. The setup wizard covers free and paid providers, local servers, and a **free on-device model** that works offline after one download of its model files (the program that runs it is part of the app). Several AIs can work on one request. Nothing is sent anywhere until you run an AI command.
 - **Spelling in many languages** for comments and form field values: offline dictionaries for every variety of English, and a **Spelling Dictionaries** wizard that downloads freely licensed dictionaries for 90+ other languages.
 - **Corrupt-file repair.** Damaged PDFs go through a pipeline descended from the author's [Immortal Zip](https://socrtwo.github.io/Immortal-Zip/), [XML Truncator-Fixer](https://socrtwo.github.io/xmltrncatorfixr-SF/app/) and [Word Recovery](https://github.com/socrtwo/wordrecovery-SF) tools: identification from the bytes, header and end-of-file repair, cross-reference reconstruction, catalog and page-tree recovery, stream length recovery, partial inflation of damaged streams, salvage of PDFs fused with other data or inside damaged ZIPs, and text scans as a last resort. The recovered document opens as a new, unsaved file with a report.
 
@@ -53,15 +53,15 @@ See [docs/FORMATS.md](docs/FORMATS.md).
 Each release has builds for:
 - **Android** (APK and AAB);
 - **iOS/iPadOS** (an unsigned .ipa you sign with your Apple ID);
-- **Windows** (installer for x64 or ARM, or portable);
-- **macOS** (universal);
+- **Windows** 10 or later (installer for x64 or ARM, or portable);
+- **macOS** 12 or later (universal);
 - **Linux** (AppImage or .deb for x64, arm64 and armv7l, which covers **Raspberry Pi OS**);
 - **ChromeOS** (Android app, Linux app or web app);
 - the **web** (static files; offline-capable and installable).
 
 On Android, Anne's Folio registers for *Open with* and *Share to* on PDFs, pictures and text files and uses the system file picker, so files on the device, SD card and cloud providers all work. **Save** writes back to the same file.
 
-CI type-checks, tests and builds the web app and an APK on every push, and the **Release** workflow builds every platform and publishes them together from a tag `v*`, a manual run, or a `[release]` commit, as in the sister apps. See [docs/BUILD.md](docs/BUILD.md), [docs/INSTALL.md](docs/INSTALL.md) and [docs/ANDROID.md](docs/ANDROID.md).
+CI type-checks, runs the unit tests and a browser smoke test, and builds the web app and an APK on every push. The **Release** workflow runs the same checks, then builds every platform and publishes them together from a tag `v*`, a manual run, or a `[release]` commit, as in the sister apps. See [docs/BUILD.md](docs/BUILD.md), [docs/INSTALL.md](docs/INSTALL.md) and [docs/ANDROID.md](docs/ANDROID.md).
 
 ## The Anne's Office suite
 
@@ -73,9 +73,9 @@ CI type-checks, tests and builds the web app and an APK on every push, and the *
 | **Anne's Stage** | Presentations | https://github.com/socrtwo/QuillStage |
 | **Anne's Loom** | Web sites | https://github.com/socrtwo/QuillLoom |
 | **Anne's Press** | Desktop publishing | https://github.com/socrtwo/QuillPress |
-| **Anne's Folio** | PDF (this project) | https://github.com/socrtwo/QuillFolio |
+| **Anne's Folio** | PDF (this project) | https://github.com/socrtwo/annes-folio |
 
-The apps share one application shell: the command registry, Quick Access Bar, customizable tabs and keyboard, command search, macro recorder, AI setup wizard and providers, spelling dictionaries, recovery engine and platform layer. The other apps export PDFs that Anne's Folio opens, and Anne's Folio hands documents to them through the share sheet and *Open with*.
+The apps share one application shell: the command registry, Quick Access Bar, customizable tabs and keyboard, command search, macro recorder, AI setup wizard and providers, spelling dictionaries, recovery engine and platform layer. The other apps export PDFs that Anne's Folio opens, and Anne's Folio hands documents to them through the share sheet.
 
 ## Documentation
 

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 11 and earlier (android:fullBackupContent). Left out of backups:
+     - the encrypted API keys: their Keystore key never leaves the device, so a restored copy could not be read;
+     - the WebView's IndexedDB: drafts, recent-file copies and signature pictures, i.e. document contents.
+     Settings (WebView local storage) are still backed up. -->
+<full-backup-content>
+    <exclude domain="sharedpref" path="quillfolio.secure.xml" />
+    <exclude domain="root" path="app_webview/Default/IndexedDB" />
+</full-backup-content>

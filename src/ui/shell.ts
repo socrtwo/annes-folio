@@ -2,7 +2,7 @@
 import type { App, DocTab } from '../app';
 import { getCommand, allCommands, searchCommands, type Command, type MenuEntry } from '../commands/registry';
 import { h, icon, clear, isPhone } from './dom';
-import { showMenu, closeMenus, openDialog, toast } from './dialog';
+import { showMenu, closeMenus, openDialog, openModal, toast } from './dialog';
 import { DEFAULT_TABS, tabsFor, type RibbonTab } from './ribbonLayout';
 import { prettyKey, canonicalKey, keyName } from '../util/keys';
 import { PANES, type PaneDef } from './panes';
@@ -49,11 +49,21 @@ export class Shell {
     const fileBtn = h('button', { class: 'ql-iconbtn ql-filebtn', title: 'File', 'aria-label': 'File menu', onclick: () => this.showBackstage() }, icon('menu'));
     this.qatEl = h('div', { class: 'ql-qat', role: 'toolbar', 'aria-label': 'Quick Access Bar' });
     this.titleBtn = h('button', { class: 'ql-title', title: 'Rename / document properties', onclick: () => this.renameDoc() }, 'Document');
-    const search = h('button', { class: 'ql-iconbtn', title: 'Search commands (Alt+Q)', 'aria-label': 'Search commands', onclick: () => this.commandPalette() }, icon('search'));
-    const read = h('button', { class: 'ql-btn ql-present', title: 'Read Mode (Ctrl+H)', onclick: () => this.app.exec('view.readMode') }, icon('menu_book'), h('span', { class: 'ql-present-label' }, ' Read'));
+    // The shortcut hints come from the commands, so they stay right when a key changes.
+    const search = h('button', { class: 'ql-iconbtn', title: `Search commands${this.keyHint('view.cmdSearch')}`, 'aria-label': 'Search commands', onclick: () => this.commandPalette() }, icon('search'));
+    const read = h('button', { class: 'ql-btn ql-present', title: `Read Mode${this.keyHint('view.readMode')}`, onclick: () => this.app.exec('view.readMode') }, icon('menu_book'), h('span', { class: 'ql-present-label' }, ' Read'));
     const more = h('button', { class: 'ql-iconbtn', title: 'More', 'aria-label': 'More', onclick: (e: MouseEvent) => this.moreMenu(e.currentTarget as HTMLElement) }, icon('more_vert'));
     this.titlebar.append(fileBtn, this.qatEl, this.titleBtn, h('span', { class: 'ql-spacer' }), search, read, more);
-    this.tabsEl = h('nav', { class: 'ql-tabs', role: 'tablist' });
+    this.tabsEl = h('nav', { class: 'ql-tabs', role: 'tablist', 'aria-label': 'Ribbon tabs' });
+    // Left and Right move between the tabs, as in any tab list.
+    this.tabsEl.addEventListener('keydown', (e) => {
+      if (e.key !== 'ArrowRight' && e.key !== 'ArrowLeft') return;
+      const tabs = [...this.tabsEl.querySelectorAll<HTMLElement>('button')].filter((b) => b.style.display !== 'none');
+      const at = tabs.indexOf(document.activeElement as HTMLElement);
+      if (at < 0) return;
+      e.preventDefault();
+      tabs[(at + (e.key === 'ArrowRight' ? 1 : tabs.length - 1)) % tabs.length].focus();
+    });
     this.ribbonEl = h('div', { class: 'ql-ribbon', role: 'toolbar' });
     this.qatBelow = h('div', { class: 'ql-qat ql-qat-below', role: 'toolbar', 'aria-label': 'Quick Access Bar' });
     this.docTabsEl = h('div', { class: 'ql-doctabs' });
@@ -63,13 +73,22 @@ export class Shell {
     this.qatBottom = h('div', { class: 'ql-qat ql-qat-bottom', role: 'toolbar', 'aria-label': 'Quick Access Bar' });
     this.statusEl = h('footer', { class: 'ql-status' });
     this.backstageEl = h('div', { class: 'ql-backstage', 'aria-hidden': 'true' });
-    this.root.append(this.titlebar, this.tabsEl, this.ribbonEl, this.qatBelow, this.docTabsEl, main, this.qatBottom, this.statusEl, this.backstageEl, h('div', { class: 'ql-toasts' }));
+    // Toasts live in <body> (dialog.ts makes their box): the app root is inert while a dialog is open.
+    this.root.append(this.titlebar, this.tabsEl, this.ribbonEl, this.qatBelow, this.docTabsEl, main, this.qatBottom, this.statusEl, this.backstageEl);
+    this.status_ = null;
     this.renderQat();
     this.renderTabs();
     this.renderRibbon();
   }
 
   rebuild(): void { this.renderQat(); this.renderTabs(); this.renderRibbon(); this.refresh(); }
+
+  /** " (Ctrl+F)" for a command's first key (a custom key first), or '' when it has none. */
+  private keyHint(id: string, bare = false): string {
+    const custom = Object.entries(this.app.prefs.keymap).find(([, v]) => v === id)?.[0];
+    const k = custom || getCommand(id)?.keys?.find((x) => this.app.prefs.keymap[canonicalKey(x)] === undefined);
+    return k ? (bare ? prettyKey(k) : ` (${prettyKey(k)})`) : '';
+  }
 
   mountTab(tab: DocTab): void {
     const v = new Viewer(this.app, tab);
@@ -138,9 +157,9 @@ export class Shell {
 
   renderTabs(): void {
     clear(this.tabsEl);
-    this.tabsEl.appendChild(h('button', { class: 'ql-tab ql-tab-file', role: 'tab', onclick: () => this.showBackstage() }, 'File'));
+    this.tabsEl.appendChild(h('button', { class: 'ql-tab ql-tab-file', 'aria-haspopup': 'true', onclick: () => this.showBackstage() }, 'File'));
     for (const t of tabsFor(this.app)) {
-      const b = h('button', { class: 'ql-tab' + (t.contextual ? ' ql-contextual' : '') + (t.id === this.currentTab ? ' ql-active' : ''), role: 'tab', 'data-tab': t.id, style: t.accent ? `--tab-accent:${t.accent}` : '' }, t.label);
+      const b = h('button', { class: 'ql-tab' + (t.contextual ? ' ql-contextual' : '') + (t.id === this.currentTab ? ' ql-active' : ''), role: 'tab', 'aria-selected': String(t.id === this.currentTab), 'data-tab': t.id, style: t.accent ? `--tab-accent:${t.accent}` : '' }, t.label);
       b.addEventListener('click', () => {
         if (this.currentTab === t.id && this.app.prefs.ribbon !== 'hidden') { this.ribbonOpen = !this.ribbonOpen; this.root.classList.toggle('ql-ribbon-closed', !this.ribbonOpen); return; }
         this.currentTab = t.id; this.ribbonOpen = true; this.root.classList.remove('ql-ribbon-closed');
@@ -316,8 +335,10 @@ export class Shell {
       let active = false, enabled = true;
       try { active = !!c.isActive?.(app); enabled = c.isEnabled ? c.isEnabled(app) : true; } catch { /* */ }
       b.classList.toggle('ql-on', active);
-      b.setAttribute('aria-pressed', String(active));
+      // Only commands with an on/off state are toggle buttons; the rest would all be announced as "not pressed".
+      if (c.isActive) b.setAttribute('aria-pressed', String(active)); else b.removeAttribute('aria-pressed');
       b.classList.toggle('ql-disabled', !enabled);
+      b.setAttribute('aria-disabled', String(!enabled));
     }
     this.root.querySelectorAll<HTMLInputElement>('input[data-combo]').forEach((inp) => {
       if (document.activeElement === inp) return;
@@ -340,34 +361,63 @@ export class Shell {
   // ----------------------------------------------------------------------------------------
   // Status bar
 
+  /** The status bar's elements, made once and updated in place: a rebuild on every refresh would drop the zoom slider in mid-drag and the keyboard focus. */
+  private status_: { page: HTMLElement; tool: HTMLElement; rec: HTMLElement; lock: HTMLElement; repair: HTMLElement; ro: HTMLElement; msg: HTMLElement; views: [string, HTMLElement][]; night: HTMLElement; slider: HTMLInputElement; zoom: HTMLElement } | null = null;
+
+  private buildStatus(): NonNullable<Shell['status_']> {
+    const app = this.app;
+    clear(this.statusEl);
+    const item = (onclick: () => void, title: string, cls = '') => h('button', { class: 'ql-status-item ' + cls, onclick, title, type: 'button' });
+    const page = item(() => app.exec('nav.goTo'), 'Go to page…');
+    const tool = item(() => app.exec('home.select'), 'Back to the Select tool', 'ql-status-mode');
+    const rec = item(() => app.exec('dev.stopRecording'), 'Stop recording macro', 'ql-status-rec');
+    const lock = item(() => app.exec('protect.securityInfo'), 'Encrypted: security settings');
+    lock.textContent = '🔒'; lock.setAttribute('aria-label', 'Encrypted: security settings');
+    const repair = item(() => app.exec('file.recoveryReport'), 'This document was repaired; see the report');
+    repair.textContent = 'Recovered';
+    const ro = h('span', { class: 'ql-status-msg' }, 'Read-only');
+    const msg = h('span', { class: 'ql-status-msg', role: 'status' });
+    const viewDefs: [string, string, string, string][] = [['continuous', 'view.continuous', 'view_agenda', 'Continuous'], ['single', 'view.single', 'crop_portrait', 'Single Page'], ['facing', 'view.facing', 'auto_stories', 'Facing Pages']];
+    const views = viewDefs.map(([m, id, ic, l]) => [m, h('button', { class: 'ql-iconbtn ql-status-view', title: l, 'aria-label': l, type: 'button', onclick: () => app.exec(id) }, icon(ic))] as [string, HTMLElement]);
+    const night = h('button', { class: 'ql-iconbtn ql-status-view', title: 'Night Mode', 'aria-label': 'Night Mode', type: 'button', onclick: () => app.exec('view.nightMode') }, icon('dark_mode'));
+    const slider = h('input', { type: 'range', class: 'ql-zoom-slider', min: '10', max: '400', step: '5', 'aria-label': 'Zoom' }) as HTMLInputElement;
+    slider.addEventListener('input', () => app.tab?.ui.setZoom(+slider.value / 100));
+    const zoom = h('button', { class: 'ql-status-item ql-zoom', title: 'Zoom…', type: 'button', onclick: () => app.exec('view.zoom') });
+    this.statusEl.append(page, tool, rec, lock, repair, ro, msg, h('span', { class: 'ql-spacer' }), ...views.map((v) => v[1]), night,
+      h('button', { class: 'ql-iconbtn', title: 'Zoom out', 'aria-label': 'Zoom out', type: 'button', onclick: () => app.exec('view.zoomOut') }, icon('remove')), slider,
+      h('button', { class: 'ql-iconbtn', title: 'Zoom in', 'aria-label': 'Zoom in', type: 'button', onclick: () => app.exec('view.zoomIn') }, icon('add')), zoom,
+      h('button', { class: 'ql-iconbtn', title: 'Fit Width', 'aria-label': 'Fit width', type: 'button', onclick: () => app.exec('view.fitWidth') }, icon('fit_width')),
+      h('button', { class: 'ql-iconbtn', title: 'Fit Page', 'aria-label': 'Fit page', type: 'button', onclick: () => app.exec('view.fitPage') }, icon('fit_screen')));
+    return { page, tool, rec, lock, repair, ro, msg, views, night, slider, zoom };
+  }
+
   renderStatus(): void {
     const app = this.app;
     const tab = app.tab;
-    clear(this.statusEl);
-    const item = (text: string, onclick?: () => void, title?: string, cls = '') => h('button', { class: 'ql-status-item ' + cls, onclick, title: title || text, type: 'button' }, text);
+    if (!tab) return;
+    const st = (this.status_ ||= this.buildStatus());
+    const set = (el: HTMLElement, text: string) => { if (el.textContent !== text) el.textContent = text; };
+    const show = (el: HTMLElement, on: boolean) => { const d = on ? '' : 'none'; if (el.style.display !== d) el.style.display = d; };
     const n = tab.doc.pageCount;
     const labels = (tab.ui as Viewer).pageLabels?.() || [];
     const cur = app.page;
-    this.statusEl.appendChild(item(n ? `Page ${labels[cur] ? `${labels[cur]} (${cur + 1})` : cur + 1} of ${n}` : 'No pages', () => app.exec('nav.goTo'), 'Go to page…'));
+    set(st.page, n ? `Page ${labels[cur] ? `${labels[cur]} (${cur + 1})` : cur + 1} of ${n}` : 'No pages');
     const tool = (tab.ui as Viewer).tool;
-    if (tool && tool !== 'select') this.statusEl.appendChild(item(`Tool: ${tool.replace(/^field-/, 'field ')}`, () => app.exec('home.select'), 'Back to the Select tool', 'ql-status-mode'));
-    if (app.recording) this.statusEl.appendChild(item(app.recordingPaused ? '⏸ Paused' : '● REC', () => app.exec('dev.stopRecording'), 'Stop recording macro', 'ql-status-rec'));
-    if (tab.doc.security) this.statusEl.appendChild(item('🔒', () => app.exec('protect.securityInfo'), 'Encrypted: security settings'));
-    if (tab.repair) this.statusEl.appendChild(item('Recovered', () => app.exec('file.recoveryReport'), 'This document was repaired; see the report'));
-    if (tab.readOnly) this.statusEl.appendChild(h('span', { class: 'ql-status-msg' }, 'Read-only'));
-    if (this.statusMsg) this.statusEl.appendChild(h('span', { class: 'ql-status-msg' }, this.statusMsg));
-    this.statusEl.appendChild(h('span', { class: 'ql-spacer' }));
-    const views: [string, string, string, string][] = [['continuous', 'view.continuous', 'view_agenda', 'Continuous'], ['single', 'view.single', 'crop_portrait', 'Single Page'], ['facing', 'view.facing', 'auto_stories', 'Facing Pages']];
-    for (const [m, id, ic, l] of views) this.statusEl.appendChild(h('button', { class: 'ql-iconbtn ql-status-view' + (tab.view === m ? ' ql-on' : ''), title: l, 'aria-label': l, onclick: () => app.exec(id) }, icon(ic)));
-    this.statusEl.appendChild(h('button', { class: 'ql-iconbtn ql-status-view' + (app.prefs.nightMode ? ' ql-on' : ''), title: 'Night Mode', 'aria-label': 'Night Mode', onclick: () => app.exec('view.nightMode') }, icon('dark_mode')));
-    const z = tab.ui?.zoom || 1;
-    const slider = h('input', { type: 'range', class: 'ql-zoom-slider', min: '10', max: '400', step: '5', value: String(Math.round(z * 100)), 'aria-label': 'Zoom' }) as HTMLInputElement;
-    slider.addEventListener('input', () => tab.ui.setZoom(+slider.value / 100));
-    this.statusEl.append(h('button', { class: 'ql-iconbtn', title: 'Zoom out', 'aria-label': 'Zoom out', onclick: () => app.exec('view.zoomOut') }, icon('remove')), slider,
-      h('button', { class: 'ql-iconbtn', title: 'Zoom in', 'aria-label': 'Zoom in', onclick: () => app.exec('view.zoomIn') }, icon('add')),
-      h('button', { class: 'ql-status-item ql-zoom', title: 'Zoom…', onclick: () => app.exec('view.zoom') }, `${Math.round(z * 100)}%`),
-      h('button', { class: 'ql-iconbtn', title: 'Fit Width', 'aria-label': 'Fit width', onclick: () => app.exec('view.fitWidth') }, icon('fit_width')),
-      h('button', { class: 'ql-iconbtn', title: 'Fit Page', 'aria-label': 'Fit page', onclick: () => app.exec('view.fitPage') }, icon('fit_screen')));
+    show(st.tool, !!tool && tool !== 'select');
+    set(st.tool, `Tool: ${(tool || '').replace(/^field-/, 'field ')}`);
+    show(st.rec, !!app.recording);
+    set(st.rec, app.recordingPaused ? '⏸ Paused' : '● REC');
+    show(st.lock, !!tab.doc.security);
+    show(st.repair, !!tab.repair);
+    show(st.ro, !!tab.readOnly);
+    show(st.msg, !!this.statusMsg);
+    set(st.msg, this.statusMsg);
+    for (const [m, b] of st.views) { b.classList.toggle('ql-on', tab.view === m); b.setAttribute('aria-pressed', String(tab.view === m)); }
+    st.night.classList.toggle('ql-on', !!app.prefs.nightMode); st.night.setAttribute('aria-pressed', String(!!app.prefs.nightMode));
+    const pct = Math.round((tab.ui?.zoom || 1) * 100);
+    // The slider snaps to its 5% steps; while it is being dragged or keyed it already shows what the user chose.
+    if (document.activeElement !== st.slider && st.slider.value !== String(pct)) st.slider.value = String(pct);
+    set(st.zoom, `${pct}%`);
   }
 
   status(msg: string): void {
@@ -397,10 +447,14 @@ export class Shell {
   async renameDoc(): Promise<void> {
     const tab = this.app.tab;
     const r = await openDialog({ title: 'Document', fields: [{ key: 'name', label: 'File name', type: 'text', value: tab.fileName || tab.title }, { key: 'title', label: 'Title property', type: 'text', value: tab.doc.title }] });
-    if (!r) return;
-    tab.fileName = r.name; tab.title = r.name.replace(/\.[^.]+$/, '');
-    if (r.title !== tab.doc.title) this.app.edit('Title', (doc) => { const { PdfString } = requireObjects(); doc.ensureInfo().set('Title', PdfString.fromText(r.title)); });
+    if (!r || !this.app.docs.includes(tab)) return;
+    // An empty name would leave a blank, unclickable title: keep the old one.
+    const name = String(r.name).trim();
+    if (name) { tab.fileName = name; tab.title = name.replace(/\.[^.]+$/, '') || name; }
+    else toast('The file name was left as it was: a name cannot be empty.');
+    if (r.title !== tab.doc.title && this.app.tab === tab) this.app.edit('Title', (doc) => { const { PdfString } = requireObjects(); doc.ensureInfo().set('Title', PdfString.fromText(r.title)); });
     this.tabsChanged();
+    if (this.app.tab === tab) document.title = `${tab.displayName}${tab.dirty ? ' •' : ''} – Anne's Folio`;
   }
 
   moreMenu(anchor: HTMLElement): void {
@@ -454,16 +508,27 @@ export class Shell {
   // ----------------------------------------------------------------------------------------
   // Backstage
 
+  private backstageReturn: HTMLElement | null = null;
   showBackstage(page = 'home'): void {
     closeMenus();
+    const wasOpen = this.root.classList.contains('ql-backstage-open');
+    if (!wasOpen) this.backstageReturn = document.activeElement as HTMLElement | null;
     this.backstageEl.setAttribute('aria-hidden', 'false');
     this.root.classList.add('ql-backstage-open');
+    // The backstage covers the whole window: what is under it takes no keys and is not read out.
+    for (const c of this.root.children) if (c !== this.backstageEl) c.toggleAttribute('inert', true);
     renderBackstage(this.app, this.backstageEl, page);
+    if (!wasOpen) (this.backstageEl.querySelector<HTMLElement>('.ql-bs-item.ql-on') || this.backstageEl.querySelector<HTMLElement>('button'))?.focus();
   }
   hideBackstage(): void {
+    if (!this.root.classList.contains('ql-backstage-open')) return;
     this.backstageEl.setAttribute('aria-hidden', 'true');
     this.root.classList.remove('ql-backstage-open');
+    for (const c of this.root.children) c.removeAttribute('inert');
     clear(this.backstageEl);
+    const back = this.backstageReturn;
+    this.backstageReturn = null;
+    if (back?.isConnected && back !== document.body) back.focus(); else this.app.focus();
   }
 
   customizeQat(): void { customizeQat(this.app); }
@@ -477,13 +542,15 @@ export class Shell {
     const app = this.app;
     const overlay = h('div', { class: 'ql-overlay ql-palette-overlay' });
     const input = h('input', { class: 'ql-palette-input', placeholder: `Search ${allCommands().length} commands… (e.g. "redact", "rotate", "fill")`, 'aria-label': 'Search commands' }) as HTMLInputElement;
-    const list = h('div', { class: 'ql-palette-list', role: 'listbox' });
-    const box = h('div', { class: 'ql-palette', role: 'dialog' }, input, list);
+    const list = h('div', { class: 'ql-palette-list', role: 'listbox', 'aria-label': 'Commands' });
+    const box = h('div', { class: 'ql-palette', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Search commands', tabindex: '-1' }, input, list);
     overlay.appendChild(box);
     document.body.appendChild(overlay);
     let results: Command[] = [];
     let sel = 0;
-    const close = () => { overlay.remove(); app.focus(); };
+    // Modal like a dialog: Escape closes it from anywhere inside (also the Android Back button), Tab stays in it.
+    const end = openModal(overlay, box, () => close());
+    const close = () => { end(); overlay.remove(); app.focus(); };
     const run = (c: Command) => { close(); if (c.kind === 'menu' && c.menu) this.openCommandMenu(c, this.anchorFor(c.id)); else app.exec(c.id); };
     const draw = () => {
       clear(list);
@@ -491,7 +558,7 @@ export class Shell {
       results = q ? searchCommands(q, 80) : [...app.prefs.pinnedCommands.map((id) => getCommand(id)!).filter(Boolean), ...allCommands().filter((c) => c.popular).slice(0, 40)];
       results.forEach((c, i) => {
         const pinned = app.prefs.qat.includes(c.id);
-        const row = h('div', { class: 'ql-palette-row' + (i === sel ? ' ql-sel' : ''), role: 'option' },
+        const row = h('div', { class: 'ql-palette-row' + (i === sel ? ' ql-sel' : ''), role: 'option', 'aria-selected': String(i === sel) },
           icon(c.icon), h('span', { class: 'ql-palette-label' }, c.label), h('span', { class: 'ql-palette-tab' }, `${c.tab === 'Backstage' ? 'File' : c.tab}${c.group ? ' ▸ ' + c.group : ''}`),
           c.keys?.[0] ? h('kbd', null, prettyKey(c.keys[0])) : null,
           h('button', { class: 'ql-iconbtn ql-palette-pin', title: pinned ? 'Remove from Quick Access Bar' : 'Add to Quick Access Bar', onclick: (e: Event) => { e.stopPropagation(); app.prefs.qat = pinned ? app.prefs.qat.filter((x) => x !== c.id) : [...app.prefs.qat, c.id]; app.savePrefs(); this.renderQat(); draw(); } }, icon(pinned ? 'push_pin' : 'keep')));
@@ -505,7 +572,6 @@ export class Shell {
       if (e.key === 'ArrowDown') { sel = Math.min(results.length - 1, sel + 1); draw(); list.children[sel]?.scrollIntoView({ block: 'nearest' }); e.preventDefault(); }
       if (e.key === 'ArrowUp') { sel = Math.max(0, sel - 1); draw(); list.children[sel]?.scrollIntoView({ block: 'nearest' }); e.preventDefault(); }
       if (e.key === 'Enter' && results[sel]) { e.preventDefault(); run(results[sel]); }
-      if (e.key === 'Escape') close();
     });
     overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) close(); });
     draw();
@@ -555,6 +621,9 @@ export class Shell {
     const p = this.app.prefs;
     const dark = p.theme === 'dark' || (p.theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches);
     document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+    // The browser or system chrome around the app (address bar, task switcher) takes the colour of the title bar.
+    const chrome = getComputedStyle(document.documentElement).getPropertyValue('--chrome').trim();
+    if (chrome) document.querySelector('meta[name="theme-color"]')?.setAttribute('content', chrome);
     this.root.classList.toggle('ql-ribbon-collapsed', p.ribbon !== 'full');
     this.root.classList.toggle('ql-qat-at-bottom', p.qatPosition === 'bottom');
     this.root.classList.toggle('ql-qat-below-ribbon', p.qatPosition === 'below');
@@ -571,18 +640,38 @@ export class Shell {
   globalKey(e: KeyboardEvent): void {
     const k = keyName(e);
     if (!k) return;
-    if (e.key === 'Escape') {
-      if (document.querySelector('.ql-menu')) { closeMenus(); return; }
-      if (this.root.classList.contains('ql-backstage-open')) { this.hideBackstage(); return; }
-    }
+    // A dialog or the command palette is open: every key is theirs, Escape included (it must not also close what is behind them).
     if (document.querySelector('.ql-overlay')) return;
     const t = e.target as HTMLElement;
-    const inField = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
+    const inField = !!t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
+    if (e.key === 'Escape') {
+      if (document.querySelector('.ql-menu')) { closeMenus(); return; }
+      if (this.root.classList.contains('ql-backstage-open')) { this.hideBackstage(); e.preventDefault(); return; }
+      // In the page view Escape first drops a drawing in progress or the annotation selection.
+      if (!inField && (this.app.tab?.ui as Viewer | undefined)?.escape?.()) { e.preventDefault(); e.stopPropagation(); return; }
+    }
     const id = this.app.keyIndex.get(canonicalKey(k));
     if (!id) return;
     if (inField) { if (!/^(file\.|view\.cmdSearch|edit\.find)/.test(id) || !(e.ctrlKey || e.metaKey || /^F\d+$/.test(e.key))) return; }
-    e.preventDefault();
-    this.app.exec(id);
+    if (this.nativeCopyOrSelectAll(e)) return;
+    // With the keyboard on the page thumbnails, Delete and Ctrl/Cmd+A are about pages: the thumbnails handle them.
+    if (t?.closest?.('.qf-rail, .qf-grid') && (e.key === 'Delete' || (e.key.toLowerCase() === 'a' && (e.ctrlKey || e.metaKey)))) return;
+    // handleKey runs the command only when it is enabled; a key that did nothing keeps its browser meaning.
+    // A key that ran a command stops here, so the page view's own key handling cannot act on it a second time.
+    if (this.app.handleKey(k)) { e.preventDefault(); e.stopPropagation(); }
+  }
+
+  /** Ctrl/Cmd+C and Ctrl/Cmd+A stay the browser's when they are about text outside the page view: a selection in a pane or dialog text, or the focus in a pane, the backstage or a menu. */
+  private nativeCopyOrSelectAll(e: KeyboardEvent): boolean {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return false;
+    const key = e.key.toLowerCase();
+    if (key !== 'c' && key !== 'a') return false;
+    const view = this.app.tab?.ui?.el;
+    const inView = (n: Node | null | undefined) => !!n && !!view && view.contains(n);
+    const active = document.activeElement;
+    if (active && active !== document.body && !inView(active) && active.closest('.ql-pane, .ql-backstage, .ql-menu')) return true;
+    const sel = document.getSelection();
+    return key === 'c' && !!sel && !sel.isCollapsed && !inView(sel.anchorNode);
   }
 
   async showShortcuts(): Promise<void> {
@@ -611,8 +700,9 @@ export class Shell {
   }
 
   async tour(): Promise<void> {
+    const searchKey = this.keyHint('view.cmdSearch', true);
     const steps = [
-      ['Everything is a command', 'Every feature of Anne\'s Folio is a command you can find with the search button (or Alt+Q), place on the Quick Access Bar, put on your own tab, assign a key, or record in a macro.'],
+      ['Everything is a command', `Every feature of Anne's Folio is a command you can find with the search button${searchKey ? ` (or ${searchKey})` : ''}, place on the Quick Access Bar, put on your own tab, assign a key, or record in a macro.`],
       ['Quick Access Bar', 'Tap ▾ at the end of the Quick Access Bar to add common commands, or choose More Commands… to pick from the full library. Long-press or right-click any ribbon button to add it. You can move the bar below the ribbon or to the bottom, near the keyboard.'],
       ['Reading and marking up', 'Select text and use the Selected Text tab (or right-click) to highlight, underline, redact or look it up. The Comment tab has notes, text boxes, drawings, stamps and measurements. Double-click an annotation for its properties.'],
       ['Pages and forms', 'Organize Pages shows every page as a thumbnail you can drag, rotate, delete, extract or merge. The Forms tab fills existing fields and adds new ones; Fill & Sign puts your signature on any page.'],

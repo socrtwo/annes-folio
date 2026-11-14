@@ -9,7 +9,7 @@ All platforms share one web build (`npm run build` → `dist/`). Each platform w
 | Windows, macOS, Linux, Raspberry Pi OS | Electron (`electron/`) | `npm run desktop:dist` | the target OS (macOS builds need a Mac) |
 | iOS / iPadOS | Capacitor (`ios/`) | `npm run ios:sync`, then Xcode | macOS with Xcode |
 
-**Releases:** run the **Release** workflow (Actions tab ▸ Release ▸ Run workflow) or push a tag `v<version>`. GitHub Actions builds every platform and publishes them as one release (`.github/workflows/release.yml`).
+**Releases:** run the **Release** workflow (Actions tab ▸ Release ▸ Run workflow) or push a tag `v<version>`. GitHub Actions builds every platform and publishes them as one release (`.github/workflows/release.yml`). A tag typed into a manual run must be `v<version in package.json>`, optionally with a `-suffix`, and must not exist yet. A tagged or manual release needs the Android release keystore secret ([ANDROID.md](ANDROID.md#signing)); without it the Android build fails and the release is published without the APK.
 
 ## Checks
 
@@ -17,13 +17,14 @@ All platforms share one web build (`npm run build` → `dist/`). Each platform w
 npm run typecheck    # tsc --noEmit
 npm test             # vitest unit tests
 npm run build        # production web build
+npm run e2e          # browser smoke test against the build (Playwright Chromium)
 ```
 
-CI runs these three before building any platform.
+CI runs these four before building any platform: on every push in the Android workflow, and in the first job of the Release workflow, which every release job waits for. `npm test` also includes the tests of the desktop shell (`electron/main.cjs` against a stand-in for Electron) and of the workflow files.
 
 ## Prerequisites
 
-- Node.js 22 (`node -v`), then `npm ci` in the repository.
+- Node.js 22 or later (`node -v`; `package.json` declares it), then `npm ci` in the repository.
 - Android: JDK 21 and the Android SDK (platform 36, build-tools 36.0.0).
 - iOS: Xcode 16 or later.
 
@@ -31,9 +32,11 @@ CI runs these three before building any platform.
 
 ```bash
 npm ci
-npm run build        # dist/ (also writes public/third-party-notices.txt)
+npm run build        # dist/ (first writes public/third-party-notices.txt and copies the pdf.js, OCR and ONNX Runtime files into public/)
 npx vite preview     # http://localhost:4173
 ```
+
+The copied files (`public/pdfjs/`, `public/tesseract/`, `public/ort/`) are git-ignored and come from `node_modules` (`scripts/copy-pdfjs.mjs`, which stops with an error when a source is missing). `public/ort/` holds ONNX Runtime for the on-device AI model, about 37 MB: the app loads no program code from a CDN, so this ships with every build.
 
 ## Desktop (Windows, macOS, Linux, Raspberry Pi OS)
 
@@ -43,7 +46,7 @@ npm run desktop:dist   # build installers for this OS into release/
 ```
 
 `desktop:dist` builds what the current OS can make:
-- Windows: the NSIS installers (x64, arm64) and the portable `.exe`.
+- Windows: one NSIS installer per architecture (x64, arm64) and the portable `.exe`.
 - macOS: a universal `.dmg` and `.zip`.
 - Linux: an AppImage and a `.deb` for x64, arm64 and armv7l (Raspberry Pi OS 32-bit).
 
@@ -56,10 +59,12 @@ npx electron-builder --config electron-builder.config.cjs --linux deb --arm64
 
 Before packaging, CI checks the staged app in `build/desktop-app/` with `node --check` on the Electron scripts.
 
+The desktop app uses Electron 43, which runs on macOS 12 or later, Windows 10 or later, and Linux on x64, arm64 and 32-bit ARM (armv7l). Electron 44 no longer supports macOS 12 and publishes no 32-bit ARM (armv7l) builds, so moving to it means dropping the Raspberry Pi OS 32-bit package; Electron 43 itself is supported until January 2027. The packaged app has Electron's "run as Node" switches turned off (`electronFuses` in `electron-builder.config.cjs`).
+
 ## Android on a computer
 
 ```bash
-npm run android:build    # build, cap sync, gradlew assembleRelease
+npm run android:build    # build, cap sync, gradlew assembleRelease (also from the Windows command prompt)
 ```
 
 The APK is in `android/app/build/outputs/apk/release/`. Without a release keystore it is signed with the debug key; [ANDROID.md](ANDROID.md) covers signing for Google Play.
@@ -71,7 +76,7 @@ You can build the APK on a 64-bit ARM phone or tablet with 4 GB of RAM or more, 
 ```bash
 pkg install -y curl
 termux-setup-storage        # optional: lets the script copy the APK to Downloads
-curl -fsSLO https://raw.githubusercontent.com/socrtwo/QuillFolio/main/scripts/termux-build.sh
+curl -fsSLO https://raw.githubusercontent.com/socrtwo/annes-folio/main/scripts/termux-build.sh
 bash termux-build.sh
 ```
 
@@ -90,7 +95,7 @@ The manual steps the script performs, if you prefer to run them yourself:
 
 ```bash
 pkg update -y && pkg install -y git nodejs-lts openjdk-21 aapt aapt2 unzip wget zip
-git clone --depth 1 https://github.com/socrtwo/QuillFolio && cd Anne's Folio
+git clone --depth 1 https://github.com/socrtwo/annes-folio ~/QuillFolio && cd ~/QuillFolio
 ELECTRON_SKIP_BINARY_DOWNLOAD=1 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 npm ci
 npm run build
 mkdir -p ~/android-sdk/cmdline-tools && cd ~/android-sdk/cmdline-tools

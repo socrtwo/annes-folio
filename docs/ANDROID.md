@@ -9,7 +9,7 @@ The Android app is the Anne's Folio web app (TypeScript/Vite, built into `dist/`
 | Application ID | `io.github.socrtwo.quillfolio` |
 | minSdk / targetSdk / compileSdk | 24 (Android 7.0) / 36 / 36 (`android/variables.gradle`) |
 | versionName | `version` from the root `package.json` |
-| versionCode | `VERSION_CODE` environment variable, default `1` (CI uses the workflow run number) |
+| versionCode | `VERSION_CODE` environment variable, default `1` (CI uses the minutes since 2024-01-01, so it grows whichever workflow builds) |
 | Java / Gradle | JDK 21, Gradle wrapper 8.14.3, Android Gradle Plugin 8.13 |
 
 ## Build locally
@@ -35,7 +35,7 @@ Then either:
   ./gradlew installDebug                     # install on a connected device / emulator
   ```
 
-`npm run android:build` runs build + sync + `assembleRelease` in one go.
+`npm run android:build` runs build + sync + `assembleRelease` in one go (through `scripts/gradlew.mjs`, so it also works in the Windows command prompt).
 
 Run `npx cap sync android` again after every web build; the web assets in
 `android/app/src/main/assets/public/` and `android/capacitor-cordova-android-plugins/` are generated
@@ -44,13 +44,18 @@ and git-ignored.
 ## Continuous integration and releases
 
 `.github/workflows/android.yml` runs on every push to a branch, on pull requests and manually
-(`workflow_dispatch`). Documentation-only changes do not trigger it. The Release workflow
-(`release.yml`) also calls it for tagged and `[release]` builds. Steps:
+(`workflow_dispatch`). Documentation-only changes do not trigger it, and a commit marked `[release]`
+is left to the Release workflow. The build itself is `.github/workflows/android-build.yml`, which
+`android.yml` and the Release workflow (`release.yml`) both call. It can only read the repository;
+publishing happens in a separate job. Steps:
 
-1. `npm ci`, `npm run typecheck`, `npm test`, `npm run build` (all required to pass).
-2. JDK 21 (Temurin), Gradle cache, Android SDK (`android-actions/setup-android@v3`).
-3. `npx cap sync android`.
-4. Decode the release keystore from secrets, if configured.
+1. Decode the release keystore from secrets, if configured. A caller that passes
+   `require_release_key: true` stops here when the secret is missing (see Signing).
+2. `npm ci`, `npm run typecheck`, `npm test`, `npm run build`, then the browser smoke test
+   (`npm run e2e`); all required to pass. (When called by the Release workflow these checks have
+   already run in its first job and are not repeated.)
+3. JDK 21 (Temurin), Gradle cache, Android SDK. Third-party actions are pinned to a commit.
+4. `npx cap sync android`.
 5. `./gradlew assembleRelease bundleRelease`.
 6. Upload `QuillFolio-<version>.apk` and `QuillFolio-<version>.aab` as workflow artifacts
    (Actions run page -> *Artifacts*).
@@ -61,8 +66,10 @@ Publishing:
   `git tag v0.1.0 && git push origin v0.1.0`. The Release workflow builds every platform and publishes
   one GitHub Release named after the tag, with the APK, AAB and `SHA256SUMS.txt` among its files (tags
   containing `-`, e.g. `v0.2.0-beta.1`, are marked prerelease). A commit whose message contains
-  `[release]` does the same without a tag, as a prerelease. The Android build warns if the tag does not
-  match `package.json`.
+  `[release]` does the same without a tag, as a prerelease. The workflow warns if a pushed tag does not
+  match `package.json`. A tag typed into a manual run of the Release workflow must be
+  `v<version in package.json>` (optionally with a `-suffix`) and must not exist yet; otherwise the run
+  stops before building.
 - **Prerelease from any branch, without tagging:** Actions -> *Android* -> *Run workflow*, choose the
   branch, tick **prerelease**. This publishes a GitHub prerelease called
   `Anne's Folio <version> (build <run number>)` under the tag `v<version>-build.<run number>` pointing at
@@ -80,7 +87,12 @@ Publishing:
 | `ANDROID_KEY_PASSWORD` | Key password (defaults to the store password if empty) |
 
 If `ANDROID_KEYSTORE_PATH` is not set (or the file does not exist) the **release build is signed with
-the Android debug key**. That APK installs fine for sideloading and testing, but:
+the Android debug key**. In CI that is allowed everywhere by default, and the release notes then say
+the build is debug-signed. Once the keystore secrets are configured, set `require_release_key: true`
+in the `android` job of `.github/workflows/release.yml`: a release then **fails** in its Android job
+if the `ANDROID_KEYSTORE_BASE64` secret ever goes missing, instead of publishing a debug-signed build
+(the other platforms are still published and the notes list Android as not included). A debug-signed
+APK installs fine for sideloading and testing, but:
 
 - Google Play rejects debug-signed bundles - you need a real upload key for the store.
 - Debug keys differ between machines/runners, so a debug-signed build cannot be installed *over* a build
@@ -115,7 +127,8 @@ Repository -> *Settings* -> *Secrets and variables* -> *Actions* -> *New reposit
 | `ANDROID_KEY_PASSWORD` | the key password |
 
 The workflow decodes the keystore to `$RUNNER_TEMP` and exports `ANDROID_KEYSTORE_PATH`; release
-outputs are then properly signed. For Google Play, enroll in Play App Signing and use this key as the
+outputs are then properly signed. (`android.yml` and `release.yml` pass these four secrets to
+`android-build.yml` by name; a called workflow does not see secrets that are not passed.) For Google Play, enroll in Play App Signing and use this key as the
 upload key.
 
 Signing locally works the same way:
@@ -144,12 +157,19 @@ The `.aab` is for Google Play only; it cannot be installed directly.
 - **Open / Save As** use the system file picker (Storage Access Framework), so files in Drive,
   Dropbox, SD cards, etc. work and no storage permission is needed. Ctrl+S writes back to the same
   PDF via a persisted URI permission (an incremental update by default).
-- **Open with Anne's Folio** (`ACTION_VIEW`) for `.pdf`, `.fdf`, `.xfdf`, `.qfr`, pictures (`.png`, `.jpg`, `.gif`, `.webp`, `.bmp`,
+- **Open with / Edit with Anne's Folio** (`ACTION_VIEW`, `ACTION_EDIT`) for `.pdf`, `.fdf`, `.xfdf`, `.qfr`, pictures (`.png`, `.jpg`, `.gif`, `.webp`, `.bmp`,
   `.tif`), `.txt`, `.md`, `.html`, `.json` and `.zip`. Files are matched by MIME type (`application/pdf`, `application/vnd.fdf`,
   `application/vnd.adobe.xfdf`, `application/x-quillfolio-review`, `image/*`, `text/markdown`, `text/plain`, `text/html`) and, for
   providers that report a generic type, by extension.
-- **Share to Anne's Folio** (`ACTION_SEND`, `ACTION_SEND_MULTIPLE`) for the same types. Text shared without a file arrives
-  as a `.txt` file and becomes a PDF page.
+- **Share to Anne's Folio** (`ACTION_SEND`, `ACTION_SEND_MULTIPLE`) for the same types. Several files shared at
+  once open one after another. Text shared without a file arrives as a `.txt` file and becomes a PDF page.
+- Only `content:` addresses from other apps are read or written. A `file:` address, or one that points
+  into the app's own storage, is ignored, so another app cannot make Anne's Folio open or overwrite its
+  private files.
+- **Audio comments** use the microphone (`RECORD_AUDIO`); Android asks the first time you record.
+- **Backups:** the saved API keys and the WebView's document storage (drafts, recent-file copies,
+  signature pictures) are left out of Android cloud backups; settings are included
+  (`res/xml/data_extraction_rules.xml`, `res/xml/backup_rules.xml`).
 - **Print** goes through Android's print service, which also offers *Save as PDF*.
 - **Share** sends the exported file to any app via the share sheet.
 - The activity is `singleTask`, so opening another file while Anne's Folio runs delivers it to the running
@@ -169,9 +189,12 @@ base64 strings (no line breaks); `data:` URL prefixes are tolerated on input.
 | `readUri` | `{ uri }` | `{ uri, name, mime, data }` |
 | `print` | `{ jobName }` | nothing (print dialog shown) |
 | `share` | `{ name, mime, data, title? }` | nothing (share sheet shown) |
-| `getLaunchFile` | - | `{ uri, name, mime, data }`, or `{}` if the app was not opened with a file. Consumed once. Text shared without a file arrives as `{ name: "….txt", mime: "text/plain", data }` with no `uri`. |
+| `getLaunchFile` | - | `{ uri, name, mime, data }`, or `{}` if the app was not opened with a file. Consumed once. Text shared without a file arrives as `{ name: "….txt", mime: "text/plain", data }` with no `uri`. When several files were shared at once, the others follow as `fileOpened` events. |
 | `keepAwake` | `{ on: boolean }` | nothing |
 | event `fileOpened` | - | same payload as `getLaunchFile`, for files opened/shared while the app is running (kept until a listener subscribes) |
+| `secureSet` / `secureGet` / `secureRemove` | `{ key, value }` / `{ key }` / `{ key }` | nothing / `{ value }` / nothing. API keys, AES-256-GCM with a key in the Android Keystore |
+| `readClipboard` / `writeClipboard` | - / `{ text, sensitive? }` | `{ text }` / nothing |
+| `startLoopback` / `stopLoopback` | `{ timeoutMs, successHtml?, path? }` / - | `{ port }` / nothing; event `oauthCallback` `{ url }` for the sign-in redirect |
 
 Notes:
 
@@ -179,8 +202,10 @@ Notes:
   the returned `uri` keeps working for `writeUri` / `readUri` after restarts. URIs from "Open with" may
   be read-only or temporary; if `writeUri` rejects, fall back to `saveAs`.
 - Writes use mode `"wt"` (truncate), falling back to `"w"` for providers that do not support it.
-- File I/O runs on a background thread; very large documents are limited by memory (files over the plugin's size limit are refused) because they are
-  passed to the WebView as one base64 string.
+- File I/O runs on a background thread; very large documents are limited by memory because they are
+  passed to the WebView as one base64 string: files over 64 MB are refused, and a smaller file that
+  still does not fit in the device's memory is reported as too large instead of closing the app.
+  (The desktop app passes bytes instead and has no such limit.)
 
 ## App icon
 

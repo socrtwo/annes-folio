@@ -5,6 +5,10 @@
  * HTTP goes through fetch (streaming). In the Android, iOS and desktop apps, when a provider blocks browser
  * CORS (or fetch fails at the network layer), the request is retried through Capacitor's
  * native HTTP without streaming.
+ *
+ * Every request has a time limit, and a busy or rate-limited service (429, 5xx) is asked again up to
+ * twice after a short wait. A stream that breaks after some text arrived keeps that text and is
+ * marked incomplete.
  */
 import { Capacitor, CapacitorHttp } from '@capacitor/core';
 import { desktopHttp } from '../platform/native';
@@ -51,7 +55,51 @@ const isNativeApp = () => Capacitor.isNativePlatform() || !!desktopHttp;
 // HTTP
 
 interface HttpReq { url: string; method?: 'GET' | 'POST'; headers: Record<string, string>; body?: unknown; signal?: AbortSignal }
-interface HttpRes { status: number; text: string }
+/** `retryAfter`: the server's Retry-After, in seconds. */
+interface HttpRes { status: number; text: string; retryAfter?: number }
+
+/** No answer (or, when streaming, no first byte) within this time: give up. Matches the native read timeout. */
+const RESPONSE_TIMEOUT_MS = 180000;
+/** A stream that goes silent for this long is taken as broken. */
+const STREAM_IDLE_MS = 120000;
+const RETRY_STATUS = new Set([429, 500, 502, 503, 504, 529]);
+const MAX_RETRIES = 2;
+
+/**
+ * How long to wait before asking again after `status` (attempt 0 is the first failure), or null to stop:
+ * the server's Retry-After when it is short, otherwise 1 s and then 3 s. A long Retry-After (an exhausted
+ * daily quota) is not waited for.
+ */
+export function retryDelayMs(status: number, attempt: number, retryAfter?: number): number | null {
+  if (!RETRY_STATUS.has(status) || attempt >= MAX_RETRIES) return null;
+  if (retryAfter != null && Number.isFinite(retryAfter)) return retryAfter > 15 ? null : Math.max(0, retryAfter * 1000);
+  return attempt === 0 ? 1000 : 3000;
+}
+
+const retryAfterOf = (v: unknown): number | undefined => { const n = Number(v); return v != null && v !== '' && Number.isFinite(n) ? n : undefined; };
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) { reject(new AiError('Stopped', 'aborted')); return; }
+    const stop = () => { clearTimeout(t); reject(new AiError('Stopped', 'aborted')); };
+    const t = setTimeout(() => { signal?.removeEventListener('abort', stop); resolve(); }, ms);
+    signal?.addEventListener('abort', stop, { once: true });
+  });
+}
+
+/** An abort signal that follows the caller's Stop and also fires after `ms`; `arm` restarts the clock. */
+function deadline(signal: AbortSignal | undefined, ms: number) {
+  const ctl = new AbortController();
+  let timedOut = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const arm = (t: number) => { clearTimeout(timer); timer = setTimeout(() => { timedOut = true; ctl.abort(); }, t); };
+  const onAbort = () => ctl.abort();
+  if (signal?.aborted) ctl.abort(); else signal?.addEventListener('abort', onAbort, { once: true });
+  arm(ms);
+  return { signal: ctl.signal, arm, timedOut: () => timedOut, end: () => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); } };
+}
+
+const timeoutError = (def: ProviderDef, ms: number) => new AiError(`${def.name} did not answer within ${Math.round(ms / 1000)} seconds.`, 'network');
 
 /** Native requests cannot be canceled: Stop stops waiting for them, and the late answer is dropped. */
 function abortable<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
@@ -67,9 +115,9 @@ function abortable<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
 async function viaNative(def: ProviderDef, r: HttpReq): Promise<HttpRes> {
   if (r.signal?.aborted) throw new AiError('Stopped', 'aborted');
   const req = desktopHttp
-    ? desktopHttp({ url: r.url, method: r.method || 'GET', headers: r.headers, data: r.body })
-    : CapacitorHttp.request({ url: r.url, method: r.method || 'GET', headers: r.headers, data: r.body, responseType: 'text', connectTimeout: 30000, readTimeout: 180000 })
-      .then((res) => ({ status: res.status, text: typeof res.data === 'string' ? res.data : JSON.stringify(res.data) }));
+    ? desktopHttp({ url: r.url, method: r.method || 'GET', headers: r.headers, data: r.body }).then((res) => ({ status: res.status, text: res.text, retryAfter: retryAfterOf(res.retryAfter) }))
+    : CapacitorHttp.request({ url: r.url, method: r.method || 'GET', headers: r.headers, data: r.body, responseType: 'text', connectTimeout: 30000, readTimeout: RESPONSE_TIMEOUT_MS })
+      .then((res) => ({ status: res.status, text: typeof res.data === 'string' ? res.data : JSON.stringify(res.data), retryAfter: retryAfterOf(res.headers?.['Retry-After'] ?? res.headers?.['retry-after']) }));
   try {
     return await abortable(req, r.signal);
   } catch (e) {
@@ -78,19 +126,44 @@ async function viaNative(def: ProviderDef, r: HttpReq): Promise<HttpRes> {
   }
 }
 
-/** Plain request. Falls back to native HTTP in the app when the browser layer refuses. */
+/** Plain request, asked again after a short wait when the service is busy or rate-limited. */
 async function http(def: ProviderDef, r: HttpReq): Promise<HttpRes> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await httpOnce(def, r);
+    const wait = retryDelayMs(res.status, attempt, res.retryAfter);
+    if (wait == null) return res;
+    await sleep(wait, r.signal);
+  }
+}
+
+/** One request. Falls back to native HTTP in the app when the browser layer refuses. */
+async function httpOnce(def: ProviderDef, r: HttpReq): Promise<HttpRes> {
   if (isNativeApp() && def.cors === 'no') return viaNative(def, r);
+  const d = deadline(r.signal, RESPONSE_TIMEOUT_MS);
   try {
-    const res = await fetch(r.url, { method: r.method || 'GET', headers: r.headers, body: r.body == null ? undefined : JSON.stringify(r.body), signal: r.signal });
-    return { status: res.status, text: await res.text() };
+    const res = await fetch(r.url, { method: r.method || 'GET', headers: r.headers, body: r.body == null ? undefined : JSON.stringify(r.body), signal: d.signal });
+    return { status: res.status, text: await res.text(), retryAfter: retryAfterOf(res.headers?.get?.('retry-after')) };
   } catch (e: any) {
+    if (r.signal?.aborted) throw new AiError('Stopped', 'aborted');
+    if (d.timedOut()) throw timeoutError(def, RESPONSE_TIMEOUT_MS);
     if (e?.name === 'AbortError') throw new AiError('Stopped', 'aborted');
     // The desktop bridge only makes https requests: for a local http server keep the real error.
     if (isNativeApp() && !(desktopHttp && /^http:\/\//i.test(r.url))) return viaNative(def, r);
     throw networkError(def, e, r.url);
+  } finally {
+    d.end();
   }
 }
+
+/** A provider's answer as JSON; a web page or an empty body (wrong address, a proxy's error page) is reported as such. */
+function parseBody(def: ProviderDef, text: string): any {
+  try { return JSON.parse(text); } catch {
+    throw new AiError(`${def.name} answered with something that is not JSON (${text.trim().slice(0, 80) || 'an empty reply'}). Check the server address.`, 'other');
+  }
+}
+
+/** A stream that broke (network, timeout) after text arrived: the text is kept and the answer marked incomplete. */
+const keepPartial = (e: unknown, full: string, signal?: AbortSignal) => !!full && !signal?.aborted && e instanceof AiError && e.code === 'network';
 
 function networkError(def: ProviderDef, e: unknown, url = def.baseUrl, native = false): AiError {
   const why = String((e as Error)?.message || e);
@@ -118,18 +191,38 @@ export function takeSseBlocks(buf: string): [string[], string] {
   return [blocks, buf];
 }
 
-/** Streaming SSE request; returns null if streaming is unavailable here (caller retries without). */
-async function sse(def: ProviderDef, r: HttpReq, onEvent: (data: string, event: string) => void): Promise<{ status: number; text: string } | null> {
+/** Streaming SSE request; returns null if streaming is unavailable here (caller retries without). A busy service is asked again before any text has streamed. */
+async function sse(def: ProviderDef, r: HttpReq, onEvent: (data: string, event: string) => void): Promise<HttpRes | null> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await sseOnce(def, r, onEvent);
+    const wait = res ? retryDelayMs(res.status, attempt, res.retryAfter) : null;
+    if (!res || wait == null) return res;
+    await sleep(wait, r.signal);
+  }
+}
+
+async function sseOnce(def: ProviderDef, r: HttpReq, onEvent: (data: string, event: string) => void): Promise<HttpRes | null> {
   if (isNativeApp() && def.cors === 'no') return null;
+  const d = deadline(r.signal, RESPONSE_TIMEOUT_MS);
+  try {
+    return await sseRead(def, r, onEvent, d);
+  } finally {
+    d.end();
+  }
+}
+
+async function sseRead(def: ProviderDef, r: HttpReq, onEvent: (data: string, event: string) => void, d: ReturnType<typeof deadline>): Promise<HttpRes | null> {
   let res: Response;
   try {
-    res = await fetch(r.url, { method: 'POST', headers: r.headers, body: JSON.stringify(r.body), signal: r.signal });
+    res = await fetch(r.url, { method: 'POST', headers: r.headers, body: JSON.stringify(r.body), signal: d.signal });
   } catch (e: any) {
+    if (r.signal?.aborted) throw new AiError('Stopped', 'aborted');
+    if (d.timedOut()) throw timeoutError(def, RESPONSE_TIMEOUT_MS);
     if (e?.name === 'AbortError') throw new AiError('Stopped', 'aborted');
     if (isNativeApp()) return null;
     throw networkError(def, e, r.url);
   }
-  if (!res.ok || !res.body) return { status: res.status, text: await res.text() };
+  if (!res.ok || !res.body) return { status: res.status, text: await res.text(), retryAfter: retryAfterOf(res.headers?.get?.('retry-after')) };
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   let buf = '';
@@ -144,6 +237,7 @@ async function sse(def: ProviderDef, r: HttpReq, onEvent: (data: string, event: 
   };
   try {
     for (;;) {
+      d.arm(STREAM_IDLE_MS);
       const { done, value } = await reader.read();
       if (done) break;
       buf += dec.decode(value, { stream: true });
@@ -154,9 +248,13 @@ async function sse(def: ProviderDef, r: HttpReq, onEvent: (data: string, event: 
     buf += dec.decode();
     if (buf.trim()) dispatch(buf);
   } catch (e: any) {
-    if (e?.name === 'AbortError') throw new AiError('Stopped', 'aborted');
     void reader.cancel().catch(() => undefined);
-    throw e;
+    if (r.signal?.aborted) throw new AiError('Stopped', 'aborted');
+    if (d.timedOut()) throw timeoutError(def, STREAM_IDLE_MS);
+    if (e instanceof AiError) throw e;
+    if (e?.name === 'AbortError') throw new AiError('Stopped', 'aborted');
+    // The connection dropped mid-answer.
+    throw networkError(def, e, r.url);
   }
   return { status: 200, text: '' };
 }
@@ -180,6 +278,25 @@ function httpError(def: ProviderDef, status: number, body: string, model: string
 const textOf = (c: ChatMessage['content']) => (typeof c === 'string' ? c : c.filter((p) => p.type === 'text').map((p) => (p as { text: string }).text).join('\n'));
 const splitDataUrl = (u: string) => { const m = /^data:([^;,]+);base64,(.*)$/.exec(u); return m ? { mime: m[1], data: m[2] } : null; };
 
+/**
+ * Models that think before answering count that thinking against the output limit, so a small limit
+ * (a 10-token key test, a 120-token caption) can be used up before any answer is written. For those
+ * APIs the limit sent is never below this.
+ */
+export const MIN_REASONING_LIMIT = 1024;
+const outputLimit = (def: ProviderDef, n: number) => (def.kind === 'anthropic' || def.completionTokens ? Math.max(n, MIN_REASONING_LIMIT) : n);
+
+/** What a service refused for a model earlier in this session, so later requests leave it out instead of failing first. */
+const refused = new Map<string, Set<string>>();
+const refusedFor = (key: string) => refused.get(key) || new Set<string>();
+function remember(key: string, names: Iterable<string>): void {
+  const set = refused.get(key) || new Set<string>();
+  for (const n of names) set.add(n);
+  if (set.size) refused.set(key, set);
+}
+/** For tests. */
+export function forgetRefusedParams(): void { refused.clear(); }
+
 async function openaiChat(rp: ResolvedProvider, model: string, req: ChatRequest): Promise<ChatResult> {
   const { def, key, baseUrl } = rp;
   const headers: Record<string, string> = { 'Content-Type': 'application/json', ...(def.extraHeaders || {}) };
@@ -189,56 +306,79 @@ async function openaiChat(rp: ResolvedProvider, model: string, req: ChatRequest)
     role: m.role,
     content: typeof m.content === 'string' ? m.content : m.content.map((p) => (p.type === 'text' ? { type: 'text', text: p.text } : { type: 'image_url', image_url: { url: p.dataUrl } })),
   }));
+  const memo = `${def.id}|${baseUrl}|${model}`;
+  const known = refusedFor(memo);
   const params: Record<string, unknown> = { model, messages };
-  if (req.temperature != null) params.temperature = req.temperature;
-  if (req.maxTokens) params[def.completionTokens ? 'max_completion_tokens' : 'max_tokens'] = req.maxTokens;
+  if (req.temperature != null && !known.has('temperature')) params.temperature = req.temperature;
+  // `known` has 'tokens' when this model wanted the other name for the limit.
+  if (req.maxTokens) params[!!def.completionTokens !== known.has('tokens') ? 'max_completion_tokens' : 'max_tokens'] = outputLimit(def, req.maxTokens);
+  // Asks for token counts at the end of a stream (they are otherwise sent only without streaming).
+  if (req.onToken && !known.has('stream_options')) params.stream_options = { include_usage: true };
   const url = `${baseUrl}/chat/completions`;
+  const done = new Set<string>();
+  const ok = (r: ChatResult): ChatResult => { remember(memo, done); return r; };
 
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (;;) {
     let full = '';
     let finish: unknown = null;
     let usage: { in: number; out: number } | undefined;
     if (req.onToken) {
-      const r = await sse(def, { url, headers, body: { ...params, stream: true }, signal: req.signal }, (data) => {
-        if (data === '[DONE]') return;
-        let j: any;
-        try { j = JSON.parse(data); } catch { return; /* keep-alive or partial */ }
-        // Gateways (OpenRouter...) report failures inside a 200 stream.
-        if (j?.error) throw new AiError(`${def.name}: ${j.error.message || j.error.code || 'the answer failed'}`);
-        const c = j?.choices?.[0];
-        const d = c?.delta?.content;
-        if (typeof d === 'string' && d) { full += d; req.onToken!(d, full); }
-        if (c?.finish_reason) finish = c.finish_reason;
-        if (j?.usage) usage = { in: j.usage.prompt_tokens || 0, out: j.usage.completion_tokens || 0 };
-      });
-      if (r && r.status === 200) return { text: full, model, provider: def.id, providerName: def.name, usage, truncated: cutShort(finish) };
+      let r: HttpRes | null;
+      try {
+        r = await sse(def, { url, headers, body: { ...params, stream: true }, signal: req.signal }, (data) => {
+          if (data === '[DONE]') return;
+          let j: any;
+          try { j = JSON.parse(data); } catch { return; /* keep-alive or partial */ }
+          // Gateways (OpenRouter...) report failures inside a 200 stream.
+          if (j?.error) throw new AiError(`${def.name}: ${j.error.message || j.error.code || 'the answer failed'}`);
+          const c = j?.choices?.[0];
+          const d = c?.delta?.content;
+          if (typeof d === 'string' && d) { full += d; req.onToken!(d, full); }
+          if (c?.finish_reason) finish = c.finish_reason;
+          if (j?.usage) usage = { in: j.usage.prompt_tokens || 0, out: j.usage.completion_tokens || 0 };
+        });
+      } catch (e) {
+        if (keepPartial(e, full, req.signal)) return { text: full, model, provider: def.id, providerName: def.name, usage, truncated: true };
+        throw e;
+      }
+      if (r && r.status === 200) return ok({ text: full, model, provider: def.id, providerName: def.name, usage, truncated: cutShort(finish) });
       if (r) {
-        const retry = adjustParams(params, r.text);
-        if (retry) continue;
+        if (adjustParams(params, r.status, r.text, done)) continue;
         throw httpError(def, r.status, r.text, model);
       }
     }
-    const r = await http(def, { url, method: 'POST', headers, body: { ...params, stream: false }, signal: req.signal });
+    const { stream_options: _streamOnly, ...plain } = params;
+    const r = await http(def, { url, method: 'POST', headers, body: { ...plain, stream: false }, signal: req.signal });
     if (r.status >= 200 && r.status < 300) {
-      const j = JSON.parse(r.text);
+      const j = parseBody(def, r.text);
       if (j.error && !j.choices) throw new AiError(`${def.name}: ${j.error.message || j.error.code || 'the answer failed'}`);
       const msg = j.choices?.[0]?.message;
       const text = typeof msg?.content === 'string' ? msg.content : Array.isArray(msg?.content) ? msg.content.map((p: any) => p.text || '').join('') : '';
       if (j.usage) usage = { in: j.usage.prompt_tokens || 0, out: j.usage.completion_tokens || 0 };
       req.onToken?.(text, text);
-      return { text, model, provider: def.id, providerName: def.name, usage, truncated: cutShort(j.choices?.[0]?.finish_reason) };
+      return ok({ text, model, provider: def.id, providerName: def.name, usage, truncated: cutShort(j.choices?.[0]?.finish_reason) });
     }
-    if (adjustParams(params, r.text)) continue;
+    if (adjustParams(params, r.status, r.text, done)) continue;
     throw httpError(def, r.status, r.text, model);
   }
-  throw new AiError(`${def.name} rejected the request parameters.`, 'other');
 }
 
-/** Retry once without parameters a model refuses (temperature, max_tokens naming). */
-function adjustParams(params: Record<string, unknown>, body: string): boolean {
-  if (/temperature/i.test(body) && 'temperature' in params) { delete params.temperature; return true; }
-  if (/max_tokens/i.test(body) && 'max_tokens' in params) { params.max_completion_tokens = params.max_tokens; delete params.max_tokens; return true; }
-  if (/max_completion_tokens/i.test(body) && 'max_completion_tokens' in params) { params.max_tokens = params.max_completion_tokens; delete params.max_completion_tokens; return true; }
+/**
+ * Changes the request once for a parameter the model refuses, and says whether to send it again:
+ * temperature (dropped), the name of the output limit (max_tokens / max_completion_tokens, swapped),
+ * and the streaming usage option (dropped). Only for "bad request" answers (400, 422), and each change
+ * at most once per request (`done`), so the caller ends with the service's own message, not a loop.
+ */
+export function adjustParams(params: Record<string, unknown>, status: number, body: string, done: Set<string>): boolean {
+  if (status !== 400 && status !== 422) return false;
+  const take = (name: string) => { done.add(name); return true; };
+  if (!done.has('temperature') && /temperature/i.test(body) && 'temperature' in params) { delete params.temperature; return take('temperature'); }
+  if (!done.has('tokens')) {
+    if (/max_tokens/i.test(body) && 'max_tokens' in params) { params.max_completion_tokens = params.max_tokens; delete params.max_tokens; return take('tokens'); }
+    if (/max_completion_tokens/i.test(body) && 'max_completion_tokens' in params) { params.max_tokens = params.max_completion_tokens; delete params.max_completion_tokens; return take('tokens'); }
+  }
+  // Strict servers reject fields they do not know, some without naming them.
+  if (!done.has('stream_options') && 'stream_options' in params) { delete params.stream_options; return take('stream_options'); }
   return false;
 }
 
@@ -256,33 +396,51 @@ async function anthropicChat(rp: ResolvedProvider, model: string, req: ChatReque
       return d ? { type: 'image', source: { type: 'base64', media_type: d.mime, data: d.data } } : { type: 'text', text: '[image]' };
     }),
   }));
-  const body: Record<string, unknown> = { model, max_tokens: req.maxTokens || 4096, messages };
+  const memo = `${def.id}|${baseUrl}|${model}`;
+  const body: Record<string, unknown> = { model, max_tokens: outputLimit(def, req.maxTokens || 4096), messages };
   if (system) body.system = system;
-  if (req.temperature != null) body.temperature = req.temperature;
+  if (req.temperature != null && !refusedFor(memo).has('temperature')) body.temperature = req.temperature;
   const url = `${baseUrl}/messages`;
-  let full = '';
-  let stop: unknown = null;
-  let usage = { in: 0, out: 0 };
-  if (req.onToken) {
-    const r = await sse(def, { url, headers, body: { ...body, stream: true }, signal: req.signal }, (data) => {
+  // Some models refuse a temperature: the request is sent again without it, and the model is remembered.
+  const noTemperature = (r: HttpRes) => {
+    if (r.status !== 400 || !('temperature' in body) || !/temperature/i.test(r.text)) return false;
+    delete body.temperature;
+    remember(memo, ['temperature']);
+    return true;
+  };
+  for (;;) {
+    let full = '';
+    let stop: unknown = null;
+    const usage = { in: 0, out: 0 };
+    if (req.onToken) {
+      let r: HttpRes | null;
       try {
-        const j = JSON.parse(data);
-        if (j.type === 'content_block_delta' && j.delta?.type === 'text_delta') { full += j.delta.text; req.onToken!(j.delta.text, full); }
-        if (j.type === 'message_start' && j.message?.usage) usage.in = j.message.usage.input_tokens || 0;
-        if (j.type === 'message_delta' && j.usage) usage.out = j.usage.output_tokens || 0;
-        if (j.type === 'message_delta' && j.delta?.stop_reason) stop = j.delta.stop_reason;
-        if (j.type === 'error') throw new AiError(`${def.name}: ${j.error?.message || 'stream error'}`);
-      } catch (e) { if (e instanceof AiError) throw e; }
-    });
-    if (r && r.status === 200) return { text: full, model, provider: def.id, providerName: def.name, usage, truncated: cutShort(stop) };
-    if (r) throw httpError(def, r.status, r.text, model);
+        r = await sse(def, { url, headers, body: { ...body, stream: true }, signal: req.signal }, (data) => {
+          try {
+            const j = JSON.parse(data);
+            if (j.type === 'content_block_delta' && j.delta?.type === 'text_delta') { full += j.delta.text; req.onToken!(j.delta.text, full); }
+            if (j.type === 'message_start' && j.message?.usage) usage.in = j.message.usage.input_tokens || 0;
+            if (j.type === 'message_delta' && j.usage) usage.out = j.usage.output_tokens || 0;
+            if (j.type === 'message_delta' && j.delta?.stop_reason) stop = j.delta.stop_reason;
+            if (j.type === 'error') throw new AiError(`${def.name}: ${j.error?.message || 'stream error'}`);
+          } catch (e) { if (e instanceof AiError) throw e; }
+        });
+      } catch (e) {
+        if (keepPartial(e, full, req.signal)) return { text: full, model, provider: def.id, providerName: def.name, usage, truncated: true };
+        throw e;
+      }
+      if (r && r.status === 200) return { text: full, model, provider: def.id, providerName: def.name, usage, truncated: cutShort(stop) };
+      if (r && noTemperature(r)) continue;
+      if (r) throw httpError(def, r.status, r.text, model);
+    }
+    const r = await http(def, { url, method: 'POST', headers, body, signal: req.signal });
+    if (noTemperature(r)) continue;
+    if (r.status < 200 || r.status >= 300) throw httpError(def, r.status, r.text, model);
+    const j = parseBody(def, r.text);
+    const text = (j.content || []).filter((c: any) => c.type === 'text').map((c: any) => c.text).join('');
+    req.onToken?.(text, text);
+    return { text, model, provider: def.id, providerName: def.name, usage: { in: j.usage?.input_tokens || 0, out: j.usage?.output_tokens || 0 }, truncated: cutShort(j.stop_reason) };
   }
-  const r = await http(def, { url, method: 'POST', headers, body, signal: req.signal });
-  if (r.status < 200 || r.status >= 300) throw httpError(def, r.status, r.text, model);
-  const j = JSON.parse(r.text);
-  const text = (j.content || []).filter((c: any) => c.type === 'text').map((c: any) => c.text).join('');
-  req.onToken?.(text, text);
-  return { text, model, provider: def.id, providerName: def.name, usage: { in: j.usage?.input_tokens || 0, out: j.usage?.output_tokens || 0 }, truncated: cutShort(j.stop_reason) };
 }
 
 async function geminiChat(rp: ResolvedProvider, model: string, req: ChatRequest): Promise<ChatResult> {
@@ -318,18 +476,24 @@ async function geminiChat(rp: ResolvedProvider, model: string, req: ChatRequest)
     return t;
   };
   if (req.onToken) {
-    const r = await sse(def, { url: `${baseUrl}/models/${m}:streamGenerateContent?alt=sse`, headers, body, signal: req.signal }, (data) => {
-      let j: any;
-      try { j = JSON.parse(data); } catch { return; /* partial */ }
-      const t = take(j);
-      if (t) { full += t; req.onToken!(t, full); }
-    });
+    let r: HttpRes | null;
+    try {
+      r = await sse(def, { url: `${baseUrl}/models/${m}:streamGenerateContent?alt=sse`, headers, body, signal: req.signal }, (data) => {
+        let j: any;
+        try { j = JSON.parse(data); } catch { return; /* partial */ }
+        const t = take(j);
+        if (t) { full += t; req.onToken!(t, full); }
+      });
+    } catch (e) {
+      if (keepPartial(e, full, req.signal)) return { text: full, model, provider: def.id, providerName: def.name, usage, truncated: true };
+      throw e;
+    }
     if (r && r.status === 200) return { text: full, model, provider: def.id, providerName: def.name, usage, truncated: cutShort(finish) };
     if (r) throw httpError(def, r.status, r.text, model);
   }
   const r = await http(def, { url: `${baseUrl}/models/${m}:generateContent`, method: 'POST', headers, body, signal: req.signal });
   if (r.status < 200 || r.status >= 300) throw httpError(def, r.status, r.text, model);
-  const text = take(JSON.parse(r.text));
+  const text = take(parseBody(def, r.text));
   req.onToken?.(text, text);
   return { text, model, provider: def.id, providerName: def.name, usage, truncated: cutShort(finish) };
 }
@@ -413,6 +577,19 @@ async function chatOne(req: ChatRequest): Promise<ChatResult> {
   return res;
 }
 
+/**
+ * How much document text (characters) a whole-document command should send. Cloud models take the
+ * full 24,000; a model running on this device (a 0.3–1 B model on the CPU, or the browser's) gets a
+ * third of that, so an answer arrives in a reasonable time. With several AIs, the smallest counts.
+ */
+export function inputBudgetChars(providerId?: string | null): number {
+  const s = aiSettings();
+  const plan = providerId ? null : activeEnsemble();
+  const ids = providerId ? [providerId] : plan ? [...plan.members.map((m) => m.provider), plan.master.provider] : s.active ? [s.active] : [];
+  const onDevice = ids.some((id) => { const k = providerById(id)?.kind; return k === 'local' || k === 'builtin'; });
+  return onDevice ? 8000 : 24000;
+}
+
 /** List models (validates the key at the same time). */
 export async function listModels(rp: ResolvedProvider, signal?: AbortSignal): Promise<string[]> {
   const { def, key, baseUrl } = rp;
@@ -439,8 +616,7 @@ export async function listModels(rp: ResolvedProvider, signal?: AbortSignal): Pr
   }
   const r = await http(def, { url, method: 'GET', headers, signal });
   if (r.status < 200 || r.status >= 300) throw httpError(def, r.status, r.text, '');
-  let j: any;
-  try { j = JSON.parse(r.text); } catch { throw new AiError(`${def.name} returned an unexpected response.`); }
+  const j = parseBody(def, r.text);
   if (def.kind === 'gemini') {
     return (j.models || []).filter((m: any) => !m.supportedGenerationMethods || m.supportedGenerationMethods.includes('generateContent')).map((m: any) => String(m.name).replace(/^models\//, ''));
   }

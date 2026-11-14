@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 12 and later (android:dataExtractionRules). Cloud backups leave out the encrypted API keys (their
+     Keystore key never leaves the device) and the WebView's IndexedDB (drafts, recent-file copies, signature
+     pictures: document contents). A direct device-to-device transfer keeps the documents and leaves out the keys. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <exclude domain="sharedpref" path="quillfolio.secure.xml" />
+        <exclude domain="root" path="app_webview/Default/IndexedDB" />
+    </cloud-backup>
+    <device-transfer>
+        <exclude domain="sharedpref" path="quillfolio.secure.xml" />
+    </device-transfer>
+</data-extraction-rules>

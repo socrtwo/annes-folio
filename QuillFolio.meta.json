@@ -1,7 +1,7 @@
 {
   "name": "Anne's Folio",
   "description": "An original, open-source PDF app focused on viewing, editing, forms, signing, OCR and repair. Clean-room alternative with a familiar workflow and innovative features. Part of the Anne's Office suite.",
-  "homepage": "https://github.com/socrtwo/QuillFolio/releases/latest",
+  "homepage": "https://github.com/socrtwo/annes-folio/releases/latest",
   "topics": [
     "pdf",
     "pdf-viewer",
