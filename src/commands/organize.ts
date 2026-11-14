@@ -7,11 +7,12 @@ import { PdfDocument } from '../pdf/document';
 import { openDialog, toast, confirmDialog } from '../ui/dialog';
 import { pickFile } from '../ui/dom';
 import { PAPER, addBlankPage, addTextPages, imageXObject, ensureXObject, ensureExtGState } from '../pdf/build';
-import { deletePages, movePages, rotatePages, duplicatePages, insertBlankPages, setPageBox, cropPages, scalePages, importPages, extractPages, splitDocument, addOverlayText, addBates, addWatermark, appendContent, setBackgroundColor, nUp, booklet, reversePages, setPageOrder, parseRanges } from '../pdf/ops/pages';
+import { deletePages, movePages, rotatePages, duplicatePages, insertBlankPages, setPageBox, cropPages, scalePages, importPages, extractPages, splitGroups, splitParts, addOverlayText, addBates, addWatermark, appendContent, setBackgroundColor, nUp, booklet, reversePages, setPageOrder, parseRanges } from '../pdf/ops/pages';
 import { readPageLabels, writePageLabels, readOutlines, type LabelRange } from '../pdf/structure';
 import { openAsPdf, imageSpecFromBytes, eachImageSpec, addImagePageOriented, type ImageSpecEx } from '../io';
-import { readClipboardText } from '../platform/native';
-import { targetPages, askPages, pagesFromRange, normalizeRange, rangeField, compressRange, viewer, viewerOf, pageOf, saveBytes, baseName, zipOf, hexToRgb, FONT_OPTIONS, esc, editTab, guarded, openAsNewTab, clipboardImage, uprightMatrix, type Ctx } from './util';
+import { readClipboardText, saveAs } from '../platform/native';
+import { ZipWriter } from './zipstream';
+import { targetPages, askPages, pagesFromRange, normalizeRange, rangeField, compressRange, viewer, viewerOf, pageOf, saveBytes, baseName, zipOf, uniqueNames, safeName, hexToRgb, FONT_OPTIONS, esc, editTab, guarded, openAsNewTab, clipboardImage, uprightMatrix, type Ctx } from './util';
 
 const sel = (c: Ctx) => targetPages(c);
 const after = (c: Ctx) => Math.max(...sel(c)) + 1;
@@ -194,17 +195,16 @@ def([
       ], ok: 'Split' });
       if (!r) return;
       const mode = r.mode === 'every' ? { kind: 'every' as const, n: +r.n || 1 } : r.mode === 'ranges' ? { kind: 'ranges' as const, ranges: r.ranges } : r.mode === 'bookmarks' ? { kind: 'bookmarks' as const, items: readOutlines(tab.doc).filter((o) => o.dest).map((o) => ({ title: o.title, page: o.dest!.page })) } : { kind: 'size' as const, maxBytes: (+r.mb || 5) * 1024 * 1024 };
-      const parts = splitDocument(tab.doc, mode);
-      if (!parts.length) { toast('Nothing to split.'); return; }
+      const groups = splitGroups(tab.doc, mode);
+      if (!groups.length) { toast('Nothing to split.'); return; }
       if (r.out === 'tabs') {
-        if (parts.length > 12 && !(await confirmDialog('Split Document', `This opens ${parts.length} documents at once, each in its own tab. Saving them as one ZIP is lighter.`, `Open ${parts.length} Tabs`))) return;
-        for (const p of parts) openAsNewTab(app, p.doc.save({ incremental: false }), `${baseName(tab)} ${p.name}`);
+        const rev = tab.bytes;
+        if (groups.length > 12 && !(await confirmDialog('Split Document', `This opens ${groups.length} documents at once, each in its own tab. Saving them as one ZIP is lighter.`, `Open ${groups.length} Tabs`))) return;
+        if (!app.stillOpen(tab, rev)) return;
+        for (const p of splitParts(tab.doc, mode, groups)) openAsNewTab(app, p.doc.save({ incremental: false }), `${baseName(tab)} ${p.name}`);
         return;
       }
-      // Each part is written and released in turn; zipOf keeps parts with the same name apart ("… (2).pdf").
-      const files: { name: string; data: Uint8Array }[] = [];
-      while (parts.length) { const p = parts.shift()!; files.push({ name: `${baseName(tab)} ${p.name}.pdf`, data: p.doc.save({ incremental: false }) }); }
-      await saveBytes(await zipOf(files), `${baseName(tab)} split.zip`, 'application/zip');
+      await saveSplitZip(tab.doc, mode, groups, baseName(tab));
     },
   },
   { id: 'organize.merge', label: 'Merge Files…', icon: 'merge', tab: 'Organize Pages', group: 'Split and Merge', tip: 'Append other PDFs (or images) at the end of this document', run: async (app) => { const tab = app.tab; const files = await pickFile('.pdf,image/*', true); await insertFiles(app, files, Infinity, tab); } },
@@ -398,3 +398,18 @@ def([
 ]);
 
 export { addBlankPage };
+
+/**
+ * Writes the parts of a split into one ZIP, building each part only when its turn comes and letting its
+ * document go once its bytes are in the archive: at any time one part's document is held, plus the archive.
+ * Parts with the same name are kept apart ("… (2).pdf").
+ */
+export async function saveSplitZip(src: PdfDocument, mode: Parameters<typeof splitGroups>[1], groups: { name: string; pages: number[] }[], base: string): Promise<boolean> {
+  const names = uniqueNames(groups.map((g) => `${base} ${g.name}.pdf`));
+  const zip = new ZipWriter();
+  let k = 0;
+  for (const p of splitParts(src, mode, groups)) zip.add(names[k++], p.doc.save({ incremental: false }));
+  const r = await saveAs(new Blob(zip.finish() as BlobPart[], { type: 'application/zip' }), safeName(`${base} split.zip`));
+  if (r) toast(`Saved ${r.name}`);
+  return !!r;
+}

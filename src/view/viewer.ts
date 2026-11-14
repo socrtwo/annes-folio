@@ -10,6 +10,7 @@ import { toast, confirmDialog } from '../ui/dialog';
 import { openPdfjs, pageTextItems, pageTextString, PdfjsTextLayer, AnnotationMode, type PDFDocumentProxy, type PDFPageProxy, type TextItem } from './pdfjs';
 import { totalRotation, pageToCss, cssToPage, outputScale, wheelZoomFactor, drawingOnDown, searchRegex, searchItems, coalesce, jobQueue, type Drawing } from './viewutil';
 import { isSafeExternalUrl } from '../util/sanitize';
+import { PageChangeTracker } from './pagechange';
 import type { Rect } from '../pdf/ops/annots';
 import type { Dest } from '../pdf/structure';
 
@@ -19,7 +20,7 @@ const MAX_CANVAS_PIXELS = typeof matchMedia === 'function' && matchMedia('(point
 const MULTI_CLICK = ['polygon', 'polyline', 'cloud'];
 
 interface LinkArea { rect: Rect; url?: string; dest?: Dest }
-interface PageSlot { i: number; el: HTMLElement; canvas: HTMLCanvasElement; text: HTMLElement; overlay: SVGSVGElement; rendered: string; proxy: PDFPageProxy | null; task: any; gen: number; width: number; height: number; sig: string; textLayer: any; items: TextItem[] | null; links: LinkArea[] | null; selEls: HTMLElement[] | null }
+interface PageSlot { i: number; el: HTMLElement; canvas: HTMLCanvasElement; text: HTMLElement; overlay: SVGSVGElement; rendered: string; painted: string; token: string; proxy: PDFPageProxy | null; task: any; gen: number; width: number; height: number; sig: string; textLayer: any; items: TextItem[] | null; links: LinkArea[] | null; selEls: HTMLElement[] | null }
 
 /** `rect` is the first rectangle of the match; `rects` has one per text item the match covers (a match can span lines). */
 export interface SearchHit { page: number; item: number; rect: Rect; rects?: Rect[] }
@@ -55,8 +56,15 @@ export class Viewer implements TabView {
   private searchSeq = 0;
   private dragFrom: number | null = null;
   private destroyed = false;
-  /** Counts document loads: renders and thumbnails of an earlier load are never shown or cached. */
-  private epoch = 0;
+  /**
+   * One token per page that changes when the page may look different (pagechange.ts): renders and thumbnails
+   * are keyed by it, so after an edit only the pages it touched are drawn again.
+   */
+  private tokens: string[] = [];
+  private tracker = new PageChangeTracker();
+  private uniq = 0;
+  /** The bytes of the last load, so a reload of the same bytes draws everything again. */
+  private loadedBytes: Uint8Array | null = null;
   private textCache = new Map<number, Promise<string>>();
   private drawing: Drawing | null = null;
   onSelect: (() => void) | null = null;
@@ -134,24 +142,44 @@ export class Viewer implements TabView {
 
   private async load(): Promise<void> {
     const old = this.pdf;
+    // Taken together, in the same turn: the bytes and the record of which objects changed to make them.
+    const bytes = this.tab.bytes;
+    const changes = this.tab.takeChanges();
+    let tokens: string[];
+    try { tokens = this.tracker.tokens(this.tab.doc, changes.touched !== 'all' && !changes.touched.size && bytes === this.loadedBytes ? 'all' : changes.touched, changes.numbering); }
+    catch (e) { console.warn('page changes', e); this.tracker.reset(); tokens = []; }
     let pdf: PDFDocumentProxy;
-    try { pdf = await openPdfjs(this.tab.bytes, this.tab.password || undefined); }
-    catch (e: any) { console.error(e); toast(`The renderer could not read the document: ${e?.message || e}`); return; }
+    try { pdf = await openPdfjs(bytes, this.tab.password || undefined); }
+    catch (e: any) { this.tracker.reset(); console.error(e); toast(`The renderer could not read the document: ${e?.message || e}`); return; }
     if (this.destroyed) { void (pdf as any).destroy?.(); return; }
     this.pdf = pdf;
-    this.epoch++;
+    this.loadedBytes = bytes;
+    // The engine and pdf.js disagree about the pages: every page counts as changed.
+    if (tokens.length !== pdf.numPages) { this.tracker.reset(); tokens = Array.from({ length: pdf.numPages }, () => `u${++this.uniq}`); }
+    this.tokens = tokens;
     const sameCount = !!old && old.numPages === pdf.numPages;
     void (old as any)?.destroy?.();
-    this.textCache.clear();
-    this.thumbCache.clear();
-    this.thumbJobs.clear();
+    const live = new Set(tokens);
+    for (const k of [...this.thumbCache.keys()]) if (!live.has(k.slice(0, k.lastIndexOf(':')))) this.thumbCache.delete(k);
     this.hits = []; this.hitIndex = -1; this.searchSeq++;
-    if (this.slots.length === pdf.numPages && this.slots.every((s) => s.sig === this.pageSig(s.i))) {
-      // Same pages, same sizes: keep the elements and their bitmaps, and repaint the visible ones in place.
-      for (const s of this.slots) { s.gen++; try { s.task?.cancel(); } catch { /* */ } s.task = null; s.proxy = null; s.items = null; s.links = null; s.rendered = ''; }
+    if (this.slots.length === pdf.numPages) {
+      // Same number of pages: keep the elements. A page whose token is unchanged keeps its bitmap and text
+      // layer and is not drawn again; the others are repainted in place (a new size first, if it has one).
+      let resized = false;
+      for (const s of this.slots) {
+        const sig = this.pageSig(s.i), same = s.token === tokens[s.i] && s.sig === sig;
+        s.gen++; try { s.task?.cancel(); } catch { /* */ } s.task = null; s.proxy = null; s.links = null;
+        s.token = tokens[s.i];
+        if (same) { s.rendered = s.painted; continue; }
+        s.items = null; s.rendered = ''; s.painted = '';
+        this.textCache.delete(s.i);
+        if (s.sig !== sig) { const b = this.pageBox(s.i); s.width = b.w; s.height = b.h; s.sig = sig; resized = true; }
+      }
+      if (resized) { if (this.fit) this.applyFit(); else this.resizeSlots(); }
       this.renderVisible();
       this.refreshAnnotations();
     } else {
+      this.textCache.clear();
       const keepScroll = this.scroll.scrollTop;
       this.buildSlots();
       if (sameCount) this.scroll.scrollTop = keepScroll; else this.goToPage(Math.min(this._page, pdf.numPages - 1));
@@ -191,7 +219,7 @@ export class Viewer implements TabView {
       const el = h('div', { class: 'qf-page', 'data-i': String(i), 'aria-label': `Page ${i + 1}` }, canvas, text, overlay as unknown as HTMLElement);
       el.style.width = `${b.w * CSS_PER_PT * this._zoom}px`;
       el.style.height = `${b.h * CSS_PER_PT * this._zoom}px`;
-      const slot: PageSlot = { i, el, canvas, text, overlay, rendered: '', proxy: null, task: null, gen: 0, width: b.w, height: b.h, sig: this.pageSig(i), textLayer: null, items: null, links: null, selEls: null };
+      const slot: PageSlot = { i, el, canvas, text, overlay, rendered: '', painted: '', token: this.tokens[i] ?? `u${++this.uniq}`, proxy: null, task: null, gen: 0, width: b.w, height: b.h, sig: this.pageSig(i), textLayer: null, items: null, links: null, selEls: null };
       this.applyToolTo(slot);
       this.bindPointer(slot);
       this.slots.push(slot);
@@ -216,7 +244,7 @@ export class Viewer implements TabView {
     clear(s.text);
     while (s.overlay.firstChild) s.overlay.removeChild(s.overlay.firstChild);
     if (s.selEls) s.selEls[0].style.display = 'none';
-    s.rendered = '';
+    s.rendered = ''; s.painted = '';
     try { s.proxy?.cleanup(); } catch { /* still rendering elsewhere (a thumbnail) */ }
   }
 
@@ -270,7 +298,7 @@ export class Viewer implements TabView {
     if (!s || !pdf || this.destroyed) return;
     const scale = CSS_PER_PT * this._zoom;
     const dpr = Math.min(this.app.prefs.renderDpiCap || 3, window.devicePixelRatio || 1);
-    const key = `${this.epoch}|${scale.toFixed(5)}|${dpr}|${this.viewRotation}`;
+    const key = `${s.token}|${scale.toFixed(5)}|${dpr}|${this.viewRotation}`;
     if (s.rendered === key) return;
     s.rendered = key;
     // Every render of a slot gets a number; after each await a render that is no longer the latest stops
@@ -307,6 +335,7 @@ export class Viewer implements TabView {
       await layer.render();
       if (stale()) return;
       this.drawOverlay(s);
+      s.painted = key;
     } catch (e: any) {
       if (stale()) return;
       if (e?.name !== 'RenderingCancelledException' && e?.name !== 'AbortException') console.warn('render', s.i, e);
@@ -747,25 +776,32 @@ export class Viewer implements TabView {
   // ------------------------------------------------------------------------------------------
   // Thumbnails, rail and grid
 
+  /** Thumbnail of page i, cached by the page's token: pages an edit did not touch keep theirs. */
   async thumb(i: number, width = 120): Promise<string> {
-    const key = `${i}:${width}`;
-    const hit = this.thumbCache.get(key);
-    if (hit) return hit;
-    const pdf = this.pdf, epoch = this.epoch, rot = this.viewRotation;
-    if (!pdf) return '';
-    try {
-      const page = await pdf.getPage(i + 1);
-      const rotation = totalRotation(page.rotate, rot);
-      const vp0 = page.getViewport({ scale: 1, rotation });
-      const vp = page.getViewport({ scale: (width * 2) / vp0.width, rotation });
-      const c = document.createElement('canvas'); c.width = Math.floor(vp.width); c.height = Math.floor(vp.height);
-      await page.render({ canvasContext: c.getContext('2d')!, viewport: vp, annotationMode: AnnotationMode.ENABLE } as any).promise;
-      const url = c.toDataURL('image/jpeg', 0.7);
-      c.width = c.height = 0;
-      // A thumbnail of an earlier load or view rotation is returned to its caller but not kept.
-      if (epoch === this.epoch && rot === this.viewRotation) this.thumbCache.set(key, url);
-      return url;
-    } catch { return ''; }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const token = this.tokens[i], key = `${token}:${width}`;
+      const hit = this.thumbCache.get(key);
+      if (hit) return hit;
+      const pdf = this.pdf, rot = this.viewRotation;
+      if (!pdf || token === undefined) return '';
+      try {
+        const page = await pdf.getPage(i + 1);
+        const rotation = totalRotation(page.rotate, rot);
+        const vp0 = page.getViewport({ scale: 1, rotation });
+        const vp = page.getViewport({ scale: (width * 2) / vp0.width, rotation });
+        const c = document.createElement('canvas'); c.width = Math.floor(vp.width); c.height = Math.floor(vp.height);
+        await page.render({ canvasContext: c.getContext('2d')!, viewport: vp, annotationMode: AnnotationMode.ENABLE } as any).promise;
+        const url = c.toDataURL('image/jpeg', 0.7);
+        c.width = c.height = 0;
+        // A thumbnail of a page that changed meanwhile, or of another view rotation, is returned to its caller but not kept.
+        if (this.tokens[i] === token && rot === this.viewRotation) this.thumbCache.set(key, url);
+        return url;
+      } catch {
+        // A reload replaced the document while this was drawing: once more, from the new one.
+        if (this.pdf === pdf || this.destroyed) return '';
+      }
+    }
+    return '';
   }
 
   async renderPagePng(i: number, dpi: number): Promise<Blob> {
@@ -803,14 +839,15 @@ export class Viewer implements TabView {
   }
   private loadThumb(t: HTMLElement, width: number): void {
     const img = t.querySelector('img');
-    const want = `${this.epoch}:${this.viewRotation}`;
+    const now = () => `${this.tokens[+t.dataset.i!]}:${this.viewRotation}`;
+    const want = now();
     if (!img || img.dataset.epoch === want || img.dataset.pending === want) return;
     img.dataset.pending = want;
     this.thumbJobs.add(async () => {
-      if (t.dataset.vis !== '1' || !t.isConnected || want !== `${this.epoch}:${this.viewRotation}`) { if (img.dataset.pending === want) delete img.dataset.pending; return; }
+      if (t.dataset.vis !== '1' || !t.isConnected || want !== now()) { if (img.dataset.pending === want) delete img.dataset.pending; return; }
       const u = await this.thumb(+t.dataset.i!, width);
       if (img.dataset.pending === want) delete img.dataset.pending;
-      if (u && want === `${this.epoch}:${this.viewRotation}`) { img.src = u; img.dataset.epoch = want; }
+      if (u && want === now()) { img.src = u; img.dataset.epoch = want; }
     });
   }
   /** After a reload the old pictures stay until the visible thumbnails have been drawn again. */

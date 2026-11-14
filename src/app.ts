@@ -15,6 +15,7 @@ import { canonicalKey } from './util/keys';
 import type { Shell } from './ui/shell';
 import type { Viewer } from './view/viewer';
 import type { RepairReport } from './pdf/repair';
+import { overlayDiff, sameTrailerForPages } from './view/pagechange';
 
 let tabCounter = 0;
 /** This window's session: part of every tab id, so another window can tell this window's drafts from abandoned ones. */
@@ -33,6 +34,10 @@ export const NO_CHANGE: unique symbol = Symbol('no change');
 
 /** Undo steps kept per tab, and the stream bytes they may hold beyond what the document itself needs. */
 const HISTORY_STEPS = 60;
+/** Objects an edit touched for the first time are compared with the file's version up to this many (more count as changed). */
+const FILE_COMPARE_MAX = 5000;
+/** Autosave waits for this long a pause in editing (see App.scheduleAutosave). */
+const AUTOSAVE_QUIET_MS = 1500;
 export const historyLimits = { bytes: 192 * 1024 * 1024 };
 
 /** Snapshot copy of an overlay object: dictionaries and arrays are copied, stream bytes are shared (the engine replaces them, never writes into them). */
@@ -89,6 +94,10 @@ export class DocTab {
   bytes: Uint8Array;
   private undoStack: Snapshot[] = [];
   private redoStack: Snapshot[] = [];
+  /** Object numbers changed since the viewer last took them ('all' when unknown), so it re-renders only the pages they touch. */
+  private pendingChanges: Set<number> | 'all' = 'all';
+  /** Changes when `doc` is replaced by a document that may number its objects differently. */
+  numbering = 0;
   /** Form-fill mode: clicking a field opens its editor. */
   fillMode = true;
   /** Page content selected with the Edit tool: a text run or an image (content-stream operator index). */
@@ -102,6 +111,38 @@ export class DocTab {
   get canRedo(): boolean { return this.redoStack.length > 0; }
   get undoLabel(): string { return this.undoStack[this.undoStack.length - 1]?.label || ''; }
   get redoLabel(): string { return this.redoStack[this.redoStack.length - 1]?.label || ''; }
+
+  /** What changed since the last call: object numbers of `doc` ('all' when not known), and the numbering they belong to. */
+  takeChanges(): { touched: ReadonlySet<number> | 'all'; numbering: number } {
+    const touched = this.pendingChanges;
+    this.pendingChanges = new Set();
+    return { touched, numbering: this.numbering };
+  }
+  private noteChanges(t: ReadonlySet<number> | 'all'): void {
+    if (this.pendingChanges === 'all') return;
+    if (t === 'all') { this.pendingChanges = 'all'; return; }
+    for (const n of t) this.pendingChanges.add(n);
+  }
+  /** Objects that differ between the document now and a snapshot (of before an edit, or the state undo or redo goes to). */
+  private differenceFrom(s: Snapshot): ReadonlySet<number> | 'all' {
+    if (!sameTrailerForPages(s.trailer, this.doc.trailer)) return 'all';
+    return overlayDiff(s.changed, this.doc.changed, (nums) => this.fileVersions(nums));
+  }
+  /** The objects as the file has them (null: not in the file), read past the overlay and the parsed-object caches. */
+  private fileVersions(nums: number[]): Map<number, PdfObj | null> {
+    const out = new Map<number, PdfObj | null>();
+    if (nums.length > FILE_COMPARE_MAX) return out; // not compared: they count as changed
+    const d = this.doc as any;
+    const live = d.changed, cache = d.cache, objStm = d.objStmCache;
+    d.changed = new Map(); d.cache = new Map(); d.objStmCache = new Map();
+    try {
+      for (const n of nums) {
+        if (!this.doc.xref.has(n)) { out.set(n, null); continue; }
+        try { out.set(n, this.doc.fetch(new Ref(n, this.doc.genOf(n)))); } catch { /* unreadable: counts as changed */ }
+      }
+    } finally { d.changed = live; d.cache = cache; d.objStmCache = objStm; }
+    return out;
+  }
 
   private snapshot(label: string): Snapshot {
     const changed = new Map<number, PdfObj | null>();
@@ -151,33 +192,40 @@ export class DocTab {
     try { r = fn(); }
     catch (e) { this.restore(before); throw e; }
     if (r === NO_CHANGE) return undefined;
+    let touched: ReadonlySet<number> | 'all' = 'all';
+    try { touched = this.differenceFrom(before); } catch { /* not known: every page */ }
     this.undoStack.push(before);
     this.redoStack = [];
     this.trimHistory();
-    this.afterChange();
+    this.afterChange(touched);
     return r;
   }
   undo(): boolean {
     const s = this.undoStack.pop();
     if (!s) return false;
     this.redoStack.push(this.snapshot(s.label));
+    let touched: ReadonlySet<number> | 'all' = 'all';
+    try { touched = this.differenceFrom(s); } catch { /* not known: every page */ }
     this.restore(s);
     this.dropStaleSelection();
-    this.afterChange();
+    this.afterChange(touched);
     return true;
   }
   redo(): boolean {
     const s = this.redoStack.pop();
     if (!s) return false;
     this.undoStack.push(this.snapshot(s.label));
+    let touched: ReadonlySet<number> | 'all' = 'all';
+    try { touched = this.differenceFrom(s); } catch { /* not known: every page */ }
     this.restore(s);
     this.dropStaleSelection();
-    this.afterChange();
+    this.afterChange(touched);
     return true;
   }
   clearHistory(): void { this.undoStack = []; this.redoStack = []; }
-  /** Rebuilds the viewer bytes from the engine and marks the tab dirty. */
-  afterChange(): void {
+  /** Rebuilds the viewer bytes from the engine and marks the tab dirty. `touched`: the objects that changed, when known. */
+  afterChange(touched: ReadonlySet<number> | 'all' = 'all'): void {
+    this.noteChanges(touched);
     try { this.bytes = this.doc.save({ incremental: !this.mustRewrite && (this.app.prefs.saveMode !== 'rewrite' || !!this.doc.security) }); }
     catch (e) { console.error(e); toast(`Could not apply the change: ${(e as any)?.message || e}`); }
     this.app.docChanged(this);
@@ -190,6 +238,8 @@ export class DocTab {
     const had = this.undoStack.length + this.redoStack.length > 0;
     const kept = had && this.rebaseHistory(doc);
     this.doc = doc; this.bytes = bytes;
+    // A document carried over with its history is the old file plus this tab's changes, numbered the same.
+    if (!kept) this.numbering++;
     if (!kept) {
       this.clearHistory();
       if (had && !this.app.toldHistoryReset) { this.app.toldHistoryReset = true; toast('The document was reloaded from newly written bytes, so Undo starts again from here.', { ms: 6000 }); }
@@ -244,7 +294,10 @@ export class App {
   toldHistoryReset = false;
   private refreshQueued = false;
   private autosaveTimer: any = null;
+  private lastChangeAt = 0;
   private draftFailureTold = false;
+  /** What the stored draft of each tab holds, so an unchanged tab is not written again. */
+  private drafted = new WeakMap<DocTab, { bytes: Uint8Array; meta: string }>();
   private reloads = new Map<DocTab, { again: boolean }>();
   private listeners = new Set<(app: App) => void>();
   lastCommand: { id: string; arg?: any } | null = null;
@@ -442,9 +495,21 @@ export class App {
   // ------------------------------------------------------------------------------------------
   // Autosave and drafts
 
+  /**
+   * Stores drafts the autosave interval after a change. While edits keep coming the write waits for a pause
+   * (AUTOSAVE_QUIET_MS), but never longer than a second interval, so a large document is not copied mid-burst.
+   */
   scheduleAutosave(): void {
+    this.lastChangeAt = Date.now();
     if (!this.prefs.autosave || this.autosaveTimer) return;
-    this.autosaveTimer = setTimeout(() => { this.autosaveTimer = null; void this.saveDrafts(); }, Math.max(3, this.prefs.autosaveSeconds) * 1000);
+    const every = Math.max(3, this.prefs.autosaveSeconds) * 1000, first = Date.now();
+    const fire = (): void => {
+      const quiet = Date.now() - this.lastChangeAt;
+      if (quiet < AUTOSAVE_QUIET_MS && Date.now() - first < 2 * every) { this.autosaveTimer = setTimeout(fire, AUTOSAVE_QUIET_MS - quiet); return; }
+      this.autosaveTimer = null;
+      void this.saveDrafts();
+    };
+    this.autosaveTimer = setTimeout(fire, every);
   }
 
   /** Stores a draft of every changed tab. The password of an encrypted document is never stored: recovery asks for it. */
@@ -452,10 +517,17 @@ export class App {
     let saved = 0, failed = 0;
     for (const tab of [...this.docs]) {
       if (!tab.dirty) continue;
+      const bytes = tab.bytes, encrypted = !!tab.doc.security;
+      const meta = JSON.stringify([tab.title, tab.fileName, tab.uri, tab.key, encrypted, tab.saved]);
+      const had = this.drafted.get(tab);
+      if (had && had.bytes === bytes && had.meta === meta) continue; // the stored draft already holds this
       try {
-        await kvSet('draft:' + tab.id, { id: tab.id, bytes: tab.bytes.buffer.slice(tab.bytes.byteOffset, tab.bytes.byteOffset + tab.bytes.byteLength), title: tab.title, fileName: tab.fileName, uri: tab.uri, key: tab.key, time: Date.now(), encrypted: !!tab.doc.security });
+        // The bytes are never written into or transferred, so a view that covers its whole buffer is stored without a copy.
+        const buf = bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength ? bytes.buffer : bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        this.drafted.delete(tab);
+        await kvSet('draft:' + tab.id, { id: tab.id, bytes: buf, title: tab.title, fileName: tab.fileName, uri: tab.uri, key: tab.key, time: Date.now(), encrypted });
         // The tab may have been saved or closed while the draft was being written.
-        if (!tab.dirty || !this.docs.includes(tab)) await kvDel('draft:' + tab.id).catch(() => undefined); else saved++;
+        if (!tab.dirty || !this.docs.includes(tab)) await kvDel('draft:' + tab.id).catch(() => undefined); else { saved++; this.drafted.set(tab, { bytes, meta }); }
       } catch (e) { failed++; console.warn('draft', e); }
     }
     if (failed && !this.draftFailureTold) { this.draftFailureTold = true; toast('Drafts could not be stored on this device (storage is full or unavailable). Save your documents to keep your changes.', { ms: 9000 }); }

@@ -412,7 +412,8 @@ export function parseRanges(spec: string, count: number): number[] {
 
 export type SplitMode = { kind: 'every'; n: number } | { kind: 'ranges'; ranges: string } | { kind: 'bookmarks'; items: { title: string; page: number }[] } | { kind: 'size'; maxBytes: number };
 
-export function splitDocument(src: PdfDocument, mode: SplitMode): { name: string; doc: PdfDocument }[] {
+/** The parts a split makes: a file-safe name and the page indexes of each. */
+export function splitGroups(src: PdfDocument, mode: SplitMode): { name: string; pages: number[] }[] {
   const n = src.pageCount;
   const groups: { name: string; pages: number[] }[] = [];
   if (mode.kind === 'every') { const step = Math.max(1, Math.floor(mode.n) || 1); for (let i = 0; i < n; i += step) groups.push({ name: `pages ${i + 1}-${Math.min(n, i + step)}`, pages: [...Array(Math.min(step, n - i)).keys()].map((k) => i + k) }); }
@@ -431,7 +432,20 @@ export function splitDocument(src: PdfDocument, mode: SplitMode): { name: string
     }
     if (cur.length) groups.push({ name: `part ${groups.length + 1}`, pages: cur });
   }
-  return groups.map((g) => ({ name: g.name.replace(/[\\/:*?"<>|]/g, '_'), doc: extractPages(src, g.pages) }));
+  return groups.map((g) => ({ name: g.name.replace(/[\\/:*?"<>|]/g, '_'), pages: g.pages }));
+}
+
+/**
+ * The parts of a split, built one at a time as they are asked for: a caller that writes each part and lets
+ * it go holds one part's document at a time, not all of them. `src` must not change while this runs.
+ */
+export function* splitParts(src: PdfDocument, mode: SplitMode, groups = splitGroups(src, mode)): Generator<{ name: string; doc: PdfDocument }> {
+  for (const g of groups) yield { name: g.name, doc: extractPages(src, g.pages) };
+}
+
+/** Every part of a split at once (splitParts holds less in memory). */
+export function splitDocument(src: PdfDocument, mode: SplitMode): { name: string; doc: PdfDocument }[] {
+  return [...splitParts(src, mode)];
 }
 
 export function estimatePageBytes(doc: PdfDocument, p: PageInfo): number {

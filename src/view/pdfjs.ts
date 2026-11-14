@@ -24,9 +24,24 @@ function sharedWorker(): InstanceType<typeof pdfjs.PDFWorker> | undefined {
 /** Images above this many pixels are not decoded (a 16,000 × 16,000 scan fits; a decompression bomb does not). */
 const MAX_IMAGE_PIXELS = 256e6;
 
+/** Documents above this size are read by the worker in ranges instead of being copied to it whole on every load. */
+export const RANGE_LOAD_ABOVE = 8 * 1024 * 1024;
+
+/**
+ * Serves a document to the worker in the ranges it asks for. pdf.js copies each range it is handed (a
+ * subarray is not a whole buffer), so `bytes` is never transferred away and stays usable by the app.
+ */
+export function rangeSource(bytes: Uint8Array): InstanceType<typeof pdfjs.PDFDataRangeTransport> {
+  const t = new pdfjs.PDFDataRangeTransport(bytes.length, null);
+  t.requestDataRange = (begin: number, end: number) => t.onDataRange(begin, bytes.subarray(begin, Math.min(end, bytes.length)));
+  return t;
+}
+
 export async function openPdfjs(bytes: Uint8Array, password?: string): Promise<PDFDocumentProxy> {
-  const data = bytes.slice(); // pdf.js transfers the buffer to its worker
-  const task = pdfjs.getDocument({ data, password, worker: sharedWorker(), cMapUrl: base + 'cmaps/', cMapPacked: true, standardFontDataUrl: base + 'standard_fonts/', wasmUrl: base + 'wasm/', iccUrl: base + 'iccs/', stopAtErrors: false, enableXfa: false, maxImageSize: MAX_IMAGE_PIXELS } as any);
+  // pdf.js transfers a buffer it is given to its worker: a small document goes as a copy, a large one in ranges,
+  // so that an edit to a 50 MB file does not copy and send all 50 MB again (only what the visible pages need).
+  const source = bytes.length > RANGE_LOAD_ABOVE ? { range: rangeSource(bytes), length: bytes.length, disableAutoFetch: true, disableStream: true } : { data: bytes.slice() };
+  const task = pdfjs.getDocument({ ...source, password, worker: sharedWorker(), cMapUrl: base + 'cmaps/', cMapPacked: true, standardFontDataUrl: base + 'standard_fonts/', wasmUrl: base + 'wasm/', iccUrl: base + 'iccs/', stopAtErrors: false, enableXfa: false, maxImageSize: MAX_IMAGE_PIXELS } as any);
   const pdf = await task.promise;
   // pdf.js keeps destroy() on the loading task; the viewer calls it through the proxy. The shared worker stays.
   (pdf as any).destroy = () => task.destroy();
