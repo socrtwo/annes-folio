@@ -5,10 +5,10 @@
  * conformance. Unused-object removal and stream recompression are the writer's full rewrite
  * (src/pdf/writer.ts); image downsampling is in src/commands/tools.ts.
  */
-import { Dict, Name, PdfObj, PdfStream, PdfString, Ref, isName, nameObj, nameText } from '../objects';
+import { Dict, Name, PdfObj, PdfStream, PdfString, Ref, bytesOf, isName, latin1, nameObj, nameText } from '../objects';
 import { PdfDocument } from '../document';
 import { readAttachments, readLayers, readMetadata, pageAnnotations, readFields, readOutlines, removeAnnotation } from '../structure';
-import { IMAGE_FILTERS } from '../filters';
+import { IMAGE_FILTERS, flateStream } from '../filters';
 import { removeHiddenContent, membershipHidden, pruneUndrawn } from './redact';
 
 export interface ImageInfo { ref: Ref | null; page: number; name: string; width: number; height: number; bpc: number; colorSpace: string; filter: string; bytes: number; /** The image has a mask or is itself a stencil mask: it cannot be re-encoded as an opaque picture. */ hasMask: boolean; /** A 1-bit stencil painted in the current fill colour (/ImageMask true). */ imageMask: boolean; stream: PdfStream }
@@ -64,7 +64,7 @@ export function listFonts(doc: PdfDocument): FontUse[] {
       const enc = doc.get(f, 'Encoding');
       const cur = map.get(key);
       if (cur) { if (!cur.pages.includes(page)) cur.pages.push(page); continue; }
-      map.set(key, { name: nameText(base), subtype: sub, embedded: !!fd && (fd.has('FontFile') || fd.has('FontFile2') || fd.has('FontFile3')), encoding: isName(enc) ? enc.name : enc instanceof Dict ? 'Custom' : enc instanceof PdfStream ? 'CMap' : '', pages: [page], ref: ref instanceof Ref ? ref : null, type3: sub === 'Type3' });
+      map.set(key, { name: nameText(base), subtype: sub, embedded: !!fd && (fd.has('FontFile') || fd.has('FontFile2') || fd.has('FontFile3')), encoding: isName(enc) ? nameText(enc.name) : enc instanceof Dict ? 'Custom' : enc instanceof PdfStream ? 'CMap' : '', pages: [page], ref: ref instanceof Ref ? ref : null, type3: sub === 'Type3' });
     }
     const xo = doc.getDict(res, 'XObject');
     if (xo) for (const k of xo.keys()) { const s = doc.resolve<PdfStream | null>(xo.get(k)); if (s instanceof PdfStream && doc.getName(s, 'Subtype') === 'Form') walk(doc.getDict(s, 'Resources'), page, depth + 1); }
@@ -176,6 +176,112 @@ function countJavaScript(doc: PdfDocument): number {
   return n;
 }
 
+// ------------------------------------------------------------------------------------------
+// XFA scripts
+
+/** The packets of the XFA form (/AcroForm /XFA): one stream holding the whole XDP document (name ''), or [name stream …] pairs. */
+function xfaPackets(doc: PdfDocument): { name: string; ref: Ref | null; stream: PdfStream }[] {
+  const af = doc.getDict(doc.catalog, 'AcroForm');
+  const x = af ? af.get('XFA') : undefined;
+  const v = doc.resolve<PdfObj>(x);
+  if (v instanceof PdfStream) return [{ name: '', ref: x instanceof Ref ? x : null, stream: v }];
+  if (!Array.isArray(v)) return [];
+  const out: { name: string; ref: Ref | null; stream: PdfStream }[] = [];
+  for (let i = 0; i + 1 < v.length; i += 2) {
+    const n = doc.resolve<PdfObj>(v[i]), s = doc.resolve<PdfObj>(v[i + 1]);
+    if (s instanceof PdfStream) out.push({ name: n instanceof PdfString ? n.toText() : isName(n) ? n.name : '', ref: v[i + 1] instanceof Ref ? (v[i + 1] as Ref) : null, stream: s });
+  }
+  return out;
+}
+
+/** Where markup at `i` (a '<') ends: comments, CDATA sections and processing instructions are skipped whole; a tag ends at its '>' outside quotes. */
+function markupEnd(xml: string, i: number): number {
+  const skip = (open: string, close: string) => (xml.startsWith(open, i) ? (xml.indexOf(close, i + open.length) < 0 ? xml.length : xml.indexOf(close, i + open.length) + close.length) : -1);
+  for (const [o, c] of [['<!--', '-->'], ['<![CDATA[', ']]>'], ['<?', '?>']]) { const e = skip(o, c); if (e >= 0) return e; }
+  let q = '';
+  for (let k = i + 1; k < xml.length; k++) {
+    const ch = xml[k];
+    if (q) { if (ch === q) q = ''; } else if (ch === '"' || ch === "'") q = ch; else if (ch === '>') return k + 1;
+  }
+  return xml.length;
+}
+
+/**
+ * The elements (outermost only) whose local name (any namespace prefix) is in `names`, as [start, end)
+ * ranges: an empty element, or the element up to its matching end tag. An element left open runs to the end.
+ */
+function xmlElements(xml: string, names: Set<string>): [number, number][] {
+  const out: [number, number][] = [];
+  const tag = /^<(\/?)([\w.:-]+)/;
+  for (let i = xml.indexOf('<'); i >= 0 && i < xml.length; ) {
+    const end = markupEnd(xml, i);
+    const m = tag.exec(xml.slice(i, i + 200));
+    const local = m ? m[2].slice(m[2].lastIndexOf(':') + 1) : '';
+    if (m && !m[1] && names.has(local)) {
+      if (xml[end - 2] === '/') { out.push([i, end]); i = xml.indexOf('<', end); continue; }
+      // Find the matching end tag of the same qualified name, counting nested ones.
+      let depth = 1, k = xml.indexOf('<', end), stop = xml.length;
+      while (k >= 0) {
+        const e = markupEnd(xml, k);
+        const t = tag.exec(xml.slice(k, k + 200));
+        if (t && t[2] === m[2] && xml[e - 2] !== '/') { depth += t[1] ? -1 : 1; if (!depth) { stop = e; break; } }
+        k = xml.indexOf('<', e);
+      }
+      out.push([i, stop]);
+      i = xml.indexOf('<', stop);
+      continue;
+    }
+    i = xml.indexOf('<', end);
+  }
+  return out;
+}
+
+const XFA_ACTIVE = new Set(['script', 'execute', 'submit']);
+const XFA_SECTIONS = new Set(['template', 'config']);
+
+/** Takes scripts and event-driven execute/submit elements out of XFA XML (as bytes, one char per byte); `sections` limits it to template/config. */
+function stripXfa(xml: string, sections: boolean): { xml: string; removed: number } {
+  let removed = 0;
+  const strip = (part: string): string => {
+    const r = xmlElements(part, XFA_ACTIVE);
+    removed += r.length;
+    let s = '', at = 0;
+    for (const [a, b] of r) { s += part.slice(at, a); at = b; }
+    return s + part.slice(at);
+  };
+  if (!sections) return { xml: strip(xml), removed };
+  let s = '', at = 0;
+  for (const [a, b] of xmlElements(xml, XFA_SECTIONS)) { s += xml.slice(at, a) + strip(xml.slice(a, b)); at = b; }
+  return { xml: s + xml.slice(at), removed };
+}
+
+/** The XFA packets that can hold scripts (template and config; a single-stream XDP is searched in those sections). */
+function scriptPackets(doc: PdfDocument) { return xfaPackets(doc).filter((p) => p.name === '' || p.name === 'template' || p.name === 'config'); }
+
+/** How many script, execute and submit elements the XFA form holds. */
+function countXfaScripts(doc: PdfDocument): number {
+  let n = 0;
+  for (const p of scriptPackets(doc)) { try { n += stripXfa(latin1(doc.decoded(p.stream)), p.name === '').removed; } catch { /* unreadable packet */ } }
+  return n;
+}
+
+/** Removes the XFA form's scripts (rewriting each changed packet); returns how many elements went. */
+function removeXfaScripts(doc: PdfDocument): number {
+  let n = 0;
+  // A stream is always an indirect object, so every packet has a reference to replace it under.
+  for (const p of scriptPackets(doc)) {
+    if (!p.ref) continue;
+    let r: { xml: string; removed: number };
+    try { r = stripXfa(latin1(doc.decoded(p.stream)), p.name === ''); } catch { continue; }
+    if (!r.removed) continue;
+    const entries: Record<string, PdfObj> = {};
+    for (const [k, v] of p.stream.dict.map) if (!['Filter', 'DecodeParms', 'Length', 'DL'].includes(k)) entries[k] = v;
+    doc.update(p.ref, flateStream(bytesOf(r.xml), entries));
+    n += r.removed;
+  }
+  return n;
+}
+
 /** Object numbers of the layers (optional content groups) that the default configuration hides. */
 export function hiddenLayers(doc: PdfDocument): { ref: Ref; name: string }[] {
   const oc = doc.getDict(doc.catalog, 'OCProperties');
@@ -206,6 +312,7 @@ export function hiddenInformation(doc: PdfDocument): HiddenInfoReport {
   if (m.xmp) items.push({ kind: 'XMP metadata', count: 1, detail: `${m.xmp.length} characters` });
   const att = readAttachments(doc); if (att.length) items.push({ kind: 'Attachments', count: att.length, detail: att.map((a) => a.name).join(', ') });
   const js = countJavaScript(doc); if (js) items.push({ kind: 'JavaScript / actions', count: js, detail: 'scripts or actions that run on events' });
+  const xfa = countXfaScripts(doc); if (xfa) items.push({ kind: 'XFA scripts', count: xfa, detail: 'scripts, execute and submit elements in the XFA form' });
   const annots = doc.pages.flatMap((p) => pageAnnotations(doc, p));
   const comments = annots.filter((a) => !['Widget', 'Popup', 'Link'].includes(a.subtype)); if (comments.length) items.push({ kind: 'Comments and markup', count: comments.length, detail: [...new Set(comments.map((a) => a.author).filter(Boolean))].join(', ') });
   const hidden = annots.filter((a) => a.hidden); if (hidden.length) items.push({ kind: 'Hidden annotations', count: hidden.length, detail: '' });
@@ -262,6 +369,7 @@ export function sanitize(doc: PdfDocument, o: SanitizeOptions): string[] {
     // Bookmarks, and every node of the field tree (not only the fields that hold values).
     for (const [ref, d] of actionHolders(doc)) if (strip(d)) doc.touch(ref);
     if (n) done.push('JavaScript and actions');
+    if (removeXfaScripts(doc)) done.push('XFA scripts');
   }
   if (o.links) { for (const p of doc.pages) { const keep = (doc.getArray(p.dict, 'Annots') || []).filter((a) => { const d = doc.resolve<Dict | null>(a); return !(d instanceof Dict && doc.getName(d, 'Subtype') === 'Link'); }); p.dict.set('Annots', keep); if (p.ref) doc.touch(p.ref); } done.push('links'); }
   if (o.comments) { for (const p of doc.pages) { const keep = (doc.getArray(p.dict, 'Annots') || []).filter((a) => { const d = doc.resolve<Dict | null>(a); const st = d instanceof Dict ? doc.getName(d, 'Subtype') : ''; return st === 'Widget' || st === 'Link'; }); p.dict.set('Annots', keep); if (p.ref) doc.touch(p.ref); } done.push('comments'); }
@@ -322,7 +430,7 @@ export function archivalCheck(doc: PdfDocument): CheckItem[] {
   if (!m.title) out.push({ level: 'warning', text: 'The document has no title.', fix: 'File ▸ Properties' });
   if (countJavaScript(doc)) out.push({ level: 'error', text: 'JavaScript or actions are present.', fix: 'Protect ▸ Sanitize' });
   if (readAttachments(doc).some((a) => !/pdf/i.test(a.mime))) out.push({ level: 'warning', text: 'Non-PDF attachments are present (allowed only in some archival levels).' });
-  for (const im of listImages(doc)) if (/JPX/.test(im.filter)) out.push({ level: 'warning', text: `Image ${im.name} on page ${im.page + 1} uses JPEG 2000 (allowed only in PDF/A-2 and later).`, page: im.page });
+  for (const im of listImages(doc)) if (/JPX/.test(im.filter)) out.push({ level: 'warning', text: `Image ${nameText(im.name)} on page ${im.page + 1} uses JPEG 2000 (allowed only in PDF/A-2 and later).`, page: im.page });
   if (readLayers(doc).length) out.push({ level: 'warning', text: 'Optional content (layers) is present (forbidden in PDF/A-1).' });
   const transp = doc.pages.some((p) => { const res = p.resources; const eg = res ? doc.getDict(res, 'ExtGState') : null; return !!eg && eg.keys().some((k) => { const g = doc.getDict(eg, k); return !!g && ((doc.getNum(g, 'CA', 1) < 1) || doc.getNum(g, 'ca', 1) < 1 || (g.has('SMask') && !isName(g.get('SMask'), 'None'))); }); });
   if (transp) out.push({ level: 'warning', text: 'Transparency is used (forbidden in PDF/A-1, allowed from PDF/A-2).' });

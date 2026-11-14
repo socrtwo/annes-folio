@@ -50,6 +50,8 @@ export class PdfDocument {
   private loading = new Set<number>();
   /** Where each "n g obj" really is, built on the first object the cross-reference table misplaces. */
   private huntIndex: Map<number, ObjectHeader> | null = null;
+  /** Objects the file's newest revision lists as free, with their generation numbers: an incremental update keeps them in its free list. */
+  prevFree = new Map<number, number>();
   /** Set when the document was modified in memory. save() leaves it alone; whoever stores the bytes resets it. */
   dirty = false;
   password = '';
@@ -74,7 +76,7 @@ export class PdfDocument {
       catch (e: any) { warn(`Cross-reference table unusable: ${e?.message || e}`); }
     }
     const password = opts.password || '';
-    if (xr) { doc.xref = xr.entries; doc.trailer = xr.trailer; doc.usesXrefStream = xr.usesXrefStream; doc.startxref = xr.startxref; }
+    if (xr) { doc.xref = xr.entries; doc.trailer = xr.trailer; doc.usesXrefStream = xr.usesXrefStream; doc.startxref = xr.startxref; doc.prevFree = xr.free; }
     if (!xr || !doc.validate()) doc.reconstruct(warn, password);
     else doc.setupSecurity(password);
     // Make sure the catalog and page tree resolve; otherwise rebuild.
@@ -89,8 +91,56 @@ export class PdfDocument {
     try { doc.catalog; } catch { throw new Error('This file has no readable document catalog, even after scanning it for objects, so there is nothing to open.'); }
     doc.pageCache = null;
     doc.nextNum = Math.max(doc.nextNum, doc.sizeFromXref(), 1);
+    if (doc.reconstructed) { try { doc.tidyRebuilt(warn); } catch { /* best effort: the document opens as it is */ } }
+    // A direct catalog becomes an object of its own now, so that catalogRef is the same from the start and
+    // a saved file's trailer names it by reference. That is no edit of the user's, so the document stays clean.
+    if (doc.trailer.get('Root') instanceof Dict) { void doc.catalogRef; doc.dirty = false; }
     doc.password = password;
     return doc;
+  }
+
+  /**
+   * After a rebuild, lists that name other objects can point at objects the damage destroyed (they read as
+   * null) or at salvaged fragments that are not what the list needs. Readers warn about such entries and
+   * some refuse the file, so the page /Annots arrays and the form's /Fields tree (with /Kids) keep only
+   * entries that resolve to an annotation or a field. Recorded as a load warning; not counted as an edit.
+   */
+  private tidyRebuilt(warn: (w: string) => void): void {
+    const wasDirty = this.dirty;
+    let dropped = 0;
+    const put = (owner: Dict, ownerRef: Ref | null, key: string, kept: PdfObj[]): void => {
+      const v = owner.get(key);
+      if (v instanceof Ref) this.update(v, kept);
+      else { owner.set(key, kept); if (ownerRef) this.update(ownerRef, owner); }
+    };
+    const pages = this.pages;
+    for (const p of pages) {
+      const list = this.getArray(p.dict, 'Annots');
+      if (!list) continue;
+      const kept = list.filter((x) => { const d = dictOf(this.resolve(x)); return !!d && d.has('Subtype'); });
+      if (kept.length !== list.length) { dropped += list.length - kept.length; put(p.dict, p.ref, 'Annots', kept); }
+    }
+    const isField = (d: Dict) => d.has('FT') || d.has('T') || d.has('Kids') || isName(d.get('Subtype'), 'Widget');
+    const seen = new Set<number>();
+    const prune = (owner: Dict, ownerRef: Ref | null, key: string, depth: number): void => {
+      const list = this.getArray(owner, key);
+      if (!list || depth > 32) return;
+      const kept: PdfObj[] = [];
+      for (const x of list) {
+        if (x instanceof Ref) { if (seen.has(x.num)) continue; seen.add(x.num); }
+        const d = dictOf(this.resolve(x));
+        if (!d || !isField(d)) { dropped++; continue; }
+        kept.push(x);
+        if (d.has('Kids')) prune(d, x instanceof Ref ? x : null, 'Kids', depth + 1);
+      }
+      if (kept.length !== list.length) put(owner, ownerRef, key, kept);
+    };
+    const afv = this.catalog.get('AcroForm');
+    const af = dictOf(this.resolve(afv));
+    if (af) prune(af, afv instanceof Ref ? afv : this.catalogRef, 'Fields', 0);
+    this.pageCache = null;
+    this.dirty = wasDirty;
+    if (dropped) warn(`${dropped} reference(s) to annotations or form fields that the damage destroyed were removed.`);
   }
 
   /** One more than the highest object number in the trailer's /Size and the cross-reference table. */
@@ -116,7 +166,8 @@ export class PdfDocument {
   /** Checks that a sample of xref offsets point at the objects they claim (cheap sanity check). */
   private validate(): boolean {
     const root = this.trailer.get('Root');
-    if (!(root instanceof Ref)) return false;
+    // A catalog written directly in the trailer is not allowed, but nothing about it needs a rebuild.
+    if (!(root instanceof Ref) && !(root instanceof Dict)) return false;
     const probe = (n: number): boolean => {
       const e = this.xref.get(n);
       if (!e) return false;
@@ -126,7 +177,7 @@ export class PdfDocument {
       const a = lex.next(), b = lex.next(), c = lex.next();
       return a.t === 'num' && a.v === n && b.t === 'num' && c.t === 'kw' && c.v === 'obj';
     };
-    if (!probe(root.num)) return false;
+    if (root instanceof Ref && !probe(root.num)) return false;
     const nums = [...this.xref.keys()];
     const step = Math.max(1, Math.floor(nums.length / 12));
     for (let i = 0; i < nums.length; i += step) if (!probe(nums[i])) return false;
@@ -145,6 +196,7 @@ export class PdfDocument {
     this.cache.clear(); this.objStmCache.clear(); this.pageCache = null; this.huntIndex = null;
     this.xref = scan.entries;
     this.startxref = -1;
+    this.prevFree = new Map();
     const oldTrailer = this.trailer;
     this.trailer = scan.trailer;
     // Keep ID/Info/Encrypt from the original trailer if the scan did not find them.

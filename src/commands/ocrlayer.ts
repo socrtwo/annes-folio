@@ -5,11 +5,15 @@
  * The layer is invisible text (render mode 3) inside a /QuillFolioOCR marked-content block. Words that
  * fit WinAnsi are written in Helvetica; everything else (Cyrillic, Greek, CJK, Arabic, …) in a glyphless
  * Type0 font whose character codes are UTF-16 code units, with a ToUnicode CMap that maps them back.
+ * A character beyond the Basic Multilingual Plane (emoji, CJK Extension B, historic scripts) gets one of
+ * the codes D800–DFFF (no character of its own has one), given out per document, and the CMap maps that code
+ * to the character's surrogate pair (ISO 32000-1 §9.10.3 allows a UTF-16BE destination of any length);
+ * poppler, pdf.js and pypdf all read such a mapping back as the one character.
  */
 import type { PdfDocument, PageInfo } from '../pdf/document';
 import { Dict, Name, PdfStream, PdfString, Ref, bytesOf, concat, isName, type PdfObj } from '../pdf/objects';
 import { ensureFont } from '../pdf/build';
-import { parseContent, serializeContent, type Op } from '../pdf/content';
+import { parseContent, parseToUnicode, serializeContent, type Op } from '../pdf/content';
 import { textWidth, winAnsiBytes } from '../pdf/stdfonts';
 import { deflateZlib } from '../pdf/filters';
 import { pageRuns, type EditableRun } from '../pdf/ops/textedit';
@@ -44,11 +48,10 @@ const RTL = /[\u0590-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]/u;
 /**
  * Text as the layer stores it, and back (the function is its own inverse). PDF readers expect a
  * right-to-left word in visual order (first letter at the right) and turn it around when extracting, so
- * a Hebrew or Arabic word is stored mirrored (digits and Latin letters in it keep their order). Characters outside the Basic Multilingual Plane
- * cannot be mapped back by a two-byte ToUnicode CMap in pdf.js or poppler and become U+FFFD.
+ * a Hebrew or Arabic word is stored mirrored (digits and Latin letters in it keep their order).
  */
 export function ocrLayerText(s: string): string {
-  const cps = [...s].map((ch) => (ch.length > 1 ? '\uFFFD' : ch));
+  const cps = [...s];
   if (!cps.some((ch) => RTL.test(ch))) return cps.join('');
   // Runs of digits and left-to-right letters keep their order inside; everything else is mirrored.
   const ltr = (ch: string) => /\p{Nd}/u.test(ch) || (/\p{L}/u.test(ch) && !RTL.test(ch));
@@ -57,11 +60,60 @@ export function ocrLayerText(s: string): string {
   return runs.reverse().map((r) => (r.ltr ? r.chars : r.chars.reverse()).join('')).join('');
 }
 
-const utf16Units = (s: string): number => s.length;
-function utf16Hex(s: string): Uint8Array {
-  const b = new Uint8Array(s.length * 2);
-  for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); b[i * 2] = c >> 8; b[i * 2 + 1] = c & 255; }
+/** Glyphs (codes) a word takes in the Unicode font: one per character. */
+const utf16Units = (s: string): number => [...s].length;
+/**
+ * The word's codes in the Unicode font, two bytes per character: a character of the Basic Multilingual Plane
+ * is its own code; one beyond it gets a code from D800–DFFF (see supplementaryCodes), or U+FFFD's when the
+ * 2,048 codes are all taken or the font's mapping cannot be changed; a lone surrogate also becomes U+FFFD.
+ */
+function utf16Hex(doc: PdfDocument, font: PdfObj | undefined, s: string): Uint8Array {
+  const cps = [...s];
+  const b = new Uint8Array(cps.length * 2);
+  cps.forEach((ch, i) => {
+    let c = ch.codePointAt(0)!;
+    if (c > 0xffff) c = supplementaryCode(doc, font, ch);
+    else if (c >= 0xd800 && c <= 0xdfff) c = 0xfffd;
+    b[i * 2] = c >> 8; b[i * 2 + 1] = c & 255;
+  });
   return b;
+}
+
+/** The first code given to characters beyond the Basic Multilingual Plane, and how many there are. */
+const SUPP_FIRST = 0xd800, SUPP_COUNT = 0x800;
+/** Per document, per ToUnicode stream (object number): the codes given out so far. */
+const suppCache = new WeakMap<PdfDocument, Map<number, Map<string, number>>>();
+
+/**
+ * The code of a character beyond the Basic Multilingual Plane in a Unicode font of the layer (`font`). The codes
+ * given out so far are read from the font's ToUnicode CMap; a new one is added to it (the CMap is rewritten).
+ */
+function supplementaryCode(doc: PdfDocument, font: PdfObj | undefined, ch: string): number {
+  const fd = doc.resolve<PdfObj>(font);
+  const ref = fd instanceof Dict ? fd.get('ToUnicode') : undefined;
+  if (!(ref instanceof Ref)) return 0xfffd;
+  let perDoc = suppCache.get(doc);
+  if (!perDoc) { perDoc = new Map(); suppCache.set(doc, perDoc); }
+  let codes = perDoc.get(ref.num);
+  if (!codes) {
+    codes = new Map<string, number>();
+    const s = doc.resolve<PdfObj>(ref);
+    if (s instanceof PdfStream) {
+      try { for (const [code, text] of parseToUnicode(doc.decoded(s))) if (code >= SUPP_FIRST && code < SUPP_FIRST + SUPP_COUNT && text.length === 2 && text.codePointAt(0)! > 0xffff) codes.set(text, code); }
+      catch { /* unreadable CMap: it is written anew */ }
+    }
+    perDoc.set(ref.num, codes);
+  }
+  const have = codes.get(ch);
+  if (have !== undefined) return have;
+  if (codes.size >= SUPP_COUNT) return 0xfffd;
+  const used = new Set(codes.values());
+  let code = SUPP_FIRST;
+  while (used.has(code)) code++;
+  codes.set(ch, code);
+  const raw = deflateZlib(bytesOf(identityToUnicode(codes)));
+  doc.update(ref, new PdfStream(new Dict({ Filter: Name.get('FlateDecode'), Length: raw.length }), raw));
+  return code;
 }
 const hexOf = (b: Uint8Array): string => { let s = '<'; for (const c of b) s += c.toString(16).padStart(2, '0'); return s + '>'; };
 function lit(bytes: Uint8Array): string {
@@ -70,15 +122,30 @@ function lit(bytes: Uint8Array): string {
   return out + ')';
 }
 
-/** ToUnicode CMap for codes that are UTF-16 code units: 256 ranges, one per high byte, as the CMap rules require. */
-export function identityToUnicode(): string {
+/**
+ * ToUnicode CMap for codes that are UTF-16 code units: ranges of one high byte each, as the CMap rules require.
+ * With `supplementary` (character → code from D800–DFFF), the ranges of high bytes D8–DF are left out and each
+ * of those codes maps to its character's surrogate pair instead.
+ */
+export function identityToUnicode(supplementary: Map<string, number> = new Map()): string {
   const head = '/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n';
+  const hex4 = (n: number) => n.toString(16).toUpperCase().padStart(4, '0');
+  const highs: number[] = [];
+  for (let k = 0; k < 256; k++) if (!supplementary.size || k < 0xd8 || k > 0xdf) highs.push(k);
   let body = '';
-  for (let hi = 0; hi < 256; hi += 100) {
-    const n = Math.min(100, 256 - hi);
-    body += `${n} beginbfrange\n`;
-    for (let k = hi; k < hi + n; k++) { const h = k.toString(16).toUpperCase().padStart(2, '0'); body += `<${h}00> <${h}FF> <${h}00>\n`; }
+  // At most 100 entries per block (the CMap rules).
+  for (let i = 0; i < highs.length; i += 100) {
+    const part = highs.slice(i, i + 100);
+    body += `${part.length} beginbfrange\n`;
+    for (const k of part) { const h = k.toString(16).toUpperCase().padStart(2, '0'); body += `<${h}00> <${h}FF> <${h}00>\n`; }
     body += 'endbfrange\n';
+  }
+  const chars = [...supplementary].sort((a, b) => a[1] - b[1]);
+  for (let i = 0; i < chars.length; i += 100) {
+    const part = chars.slice(i, i + 100);
+    body += `${part.length} beginbfchar\n`;
+    for (const [ch, code] of part) body += `<${hex4(code)}> <${hex4(ch.charCodeAt(0))}${hex4(ch.charCodeAt(1))}>\n`;
+    body += 'endbfchar\n';
   }
   return head + body + 'endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n';
 }
@@ -103,6 +170,9 @@ export function ocrFontRef(doc: PdfDocument): Ref {
   fontCache.set(doc, ref);
   return ref;
 }
+
+/** The font a page's resources name `name`. */
+const fontRes = (doc: PdfDocument, p: PageInfo, name: string): PdfObj | undefined => (p.resources ? doc.getDict(p.resources, 'Font')?.get(name) : undefined);
 
 function ensureOcrFont(doc: PdfDocument, p: PageInfo): string {
   const res = doc.pageResources(p);
@@ -163,7 +233,7 @@ export function writeTextLayer(doc: PdfDocument, p: PageInfo, words: OcrWord[], 
     const tz = clampTz((wd / naturalWidth(text, size)) * 100);
     // The baseline sits a little above the bottom edge of the word box, measured across the reading direction.
     const bx = (w.ox ?? w.x0) - dy * size * 0.22, by = (w.oy ?? w.y0) + dx * size * 0.22;
-    ops.push(`/${font} ${num(size)} Tf ${num(tz)} Tz ${num(dx)} ${num(dy)} ${num(-dy)} ${num(dx)} ${num(bx)} ${num(by)} Tm ${latin ? lit(winAnsiBytes(text)) : hexOf(utf16Hex(text))} Tj`);
+    ops.push(`/${font} ${num(size)} Tf ${num(tz)} Tz ${num(dx)} ${num(dy)} ${num(-dy)} ${num(dx)} ${num(bx)} ${num(by)} Tm ${latin ? lit(winAnsiBytes(text)) : hexOf(utf16Hex(doc, fontRes(doc, p, font), text))} Tj`);
   }
   ops.push('ET Q', 'EMC');
   doc.setPageContent(p, concat([isolatedContent(doc.pageContent(p)), bytesOf('\n' + ops.join('\n') + '\n')]));
@@ -241,7 +311,8 @@ export function applyOcrCorrections(doc: PdfDocument, p: PageInfo, changes: { ru
     const width = ((oldNatural || 1) * tz) / 100;
     const toUni = wasUni || !fitsWinAnsi(ch.text);
     const text = toUni ? ocrLayerText(ch.text) : ch.text;
-    const str = toUni ? new PdfString(utf16Hex(text), true) : new PdfString(winAnsiBytes(text));
+    if (toUni && !wasUni) uni ||= ensureOcrFont(doc, p);
+    const str = toUni ? new PdfString(utf16Hex(doc, wasUni ? fonts?.get(ch.run.font) : fontRes(doc, p, uni), text), true) : new PdfString(winAnsiBytes(text));
     const newNatural = (toUni ? (utf16Units(text) * OCR_DW * size) / 1000 : textWidth(text, 'Helvetica', size)) || 1;
     const newTz = text ? clampTz((width / newNatural) * 100) : tz;
     const show: Op = op.op === 'TJ' ? { op: 'TJ', args: [[str]] } : op.op === '"' ? { op: '"', args: [op.args[0], op.args[1], str] } : { op: op.op, args: [str] };

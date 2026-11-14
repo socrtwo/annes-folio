@@ -96,6 +96,18 @@ export function serialize(o: PdfObj): Uint8Array {
   return concat(parts);
 }
 
+/**
+ * serialize() as a list of pieces, for writers that join everything once at the end: a stream's data is
+ * handed over as it is instead of being copied into an intermediate buffer first. Saves one copy of every
+ * changed stream on every incremental save (the app writes one after each edit).
+ */
+export function serializeParts(o: PdfObj): Uint8Array[] {
+  if (!(o instanceof PdfStream)) return [serialize(o)];
+  const d = o.dict.clone();
+  d.set('Length', o.raw.length);
+  return [serialize(d), bytesOf('\nstream\n'), o.raw, bytesOf('\nendstream')];
+}
+
 function reachable(doc: PdfDocument, roots: PdfObj[]): Set<number> {
   const seen = new Set<number>();
   const stack: PdfObj[] = [...roots];
@@ -286,7 +298,7 @@ export function writeIncremental(doc: PdfDocument, _opts: SaveOptions = {}): Uin
     let o: PdfObj = obj;
     if (doc.security) o = doc.security.encryptObject(o, new Ref(n, gen));
     offsets.set(n, pos);
-    push(bytesOf(`${n} ${gen} obj\n`)); push(serialize(o)); push(bytesOf('\nendobj\n'));
+    push(bytesOf(`${n} ${gen} obj\n`)); for (const part of serializeParts(o)) push(part); push(bytesOf('\nendobj\n'));
   }
   const t = new Dict();
   for (const k of ['Root', 'Info', 'Encrypt']) if (doc.trailer.has(k)) t.set(k, doc.trailer.get(k)!);
@@ -300,14 +312,20 @@ export function writeIncremental(doc: PdfDocument, _opts: SaveOptions = {}): Uin
   }
   t.set('Size', size);
   if (doc.startxref >= 0) t.set('Prev', doc.startxref);
-  // The free list: object 0 heads it, each deleted object names the next one, and the last names 0.
+  // The free list (§7.5.4): object 0 heads it, each free object names the next one, and the last names 0.
+  // It holds the objects deleted now and those the previous revision already listed as free, so that
+  // this section's entry for object 0 (which replaces the old one) does not cut the earlier ones off.
+  const gens = new Map<number, number>();
+  for (const n of deleted) gens.set(n, Math.min(65535, doc.genOf(n) + 1));
+  for (const [n, g] of doc.prevFree) if (n > 0 && n < size && !offsets.has(n) && !gens.has(n)) gens.set(n, g);
+  const freeList = [...gens.keys()].sort((a, b) => a - b);
   const nextFree = new Map<number, number>();
-  deleted.forEach((n, i) => nextFree.set(n, deleted[i + 1] ?? 0));
-  const freeGen = (n: number): number => Math.min(65535, doc.genOf(n) + 1);
+  freeList.forEach((n, i) => nextFree.set(n, freeList[i + 1] ?? 0));
+  const freeGen = (n: number): number => gens.get(n) ?? 0;
   const xrefPos = pos;
   if (doc.usesXrefStream) {
     const xnum = size;
-    const nums = [...(deleted.length ? [0] : []), ...offsets.keys(), ...deleted, xnum].sort((a, b) => a - b);
+    const nums = [...(freeList.length ? [0] : []), ...offsets.keys(), ...freeList, xnum].sort((a, b) => a - b);
     const rows: Uint8Array[] = [];
     const index: number[] = [];
     // Index: runs of consecutive numbers.
@@ -317,7 +335,7 @@ export function writeIncremental(doc: PdfDocument, _opts: SaveOptions = {}): Uin
       if (n !== prev + 1) { flush(); runStart = n; runLen = 0; }
       runLen++; prev = n;
       const o = n === xnum ? xrefPos : offsets.get(n);
-      const e: [number, number, number] = o != null ? [1, o, n === xnum ? 0 : doc.genOf(n)] : n === 0 ? [0, deleted[0], 65535] : [0, nextFree.get(n) ?? 0, freeGen(n)];
+      const e: [number, number, number] = o != null ? [1, o, n === xnum ? 0 : doc.genOf(n)] : n === 0 ? [0, freeList[0] ?? 0, 65535] : [0, nextFree.get(n) ?? 0, freeGen(n)];
       rows.push(Uint8Array.from([e[0], (e[1] >>> 24) & 255, (e[1] >>> 16) & 255, (e[1] >>> 8) & 255, e[1] & 255, (e[2] >> 8) & 255, e[2] & 255]));
     }
     flush();
@@ -328,7 +346,7 @@ export function writeIncremental(doc: PdfDocument, _opts: SaveOptions = {}): Uin
     push(bytesOf(`${xnum} 0 obj\n`)); push(serialize(new PdfStream(xd, raw))); push(bytesOf('\nendobj\n'));
   } else {
     // Every section starts with object 0 (the head of the free list), as readers expect of a table.
-    const nums = [0, ...[...offsets.keys(), ...deleted].filter((n) => n > 0)].sort((a, b) => a - b);
+    const nums = [0, ...[...offsets.keys(), ...freeList].filter((n) => n > 0)].sort((a, b) => a - b);
     const pad = (v: number, w: number) => String(v).padStart(w, '0');
     let x = 'xref\n';
     let i = 0;
@@ -338,7 +356,7 @@ export function writeIncremental(doc: PdfDocument, _opts: SaveOptions = {}): Uin
       x += `${nums[i]} ${j - i + 1}\n`;
       for (let k = i; k <= j; k++) {
         const n = nums[k]; const o = offsets.get(n);
-        x += o != null && n > 0 ? `${pad(o, 10)} ${pad(doc.genOf(n), 5)} n \n` : n === 0 ? `${pad(deleted[0] ?? 0, 10)} 65535 f \n` : `${pad(nextFree.get(n) ?? 0, 10)} ${pad(freeGen(n), 5)} f \n`;
+        x += o != null && n > 0 ? `${pad(o, 10)} ${pad(doc.genOf(n), 5)} n \n` : n === 0 ? `${pad(freeList[0] ?? 0, 10)} 65535 f \n` : `${pad(nextFree.get(n) ?? 0, 10)} ${pad(freeGen(n), 5)} f \n`;
       }
       i = j + 1;
     }

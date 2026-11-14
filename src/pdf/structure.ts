@@ -380,7 +380,7 @@ export function readMetadata(doc: PdfDocument): Metadata {
   if (info) for (const k of info.keys()) if (!std.has(k)) custom[k] = doc.getText(info, k);
   const m = doc.get(doc.catalog, 'Metadata');
   let xmp = '';
-  if (m instanceof PdfStream) { try { xmp = new TextDecoder().decode(doc.decoded(m)); } catch { xmp = ''; } }
+  if (m instanceof PdfStream) { try { xmp = decodeXmp(doc.decoded(m)); } catch { xmp = ''; } }
   const x = (tag: string): string => { const r = new RegExp(`<${tag}[^>]*>(?:\\s*<rdf:(?:Alt|Seq|Bag)>\\s*<rdf:li[^>]*>)?([^<]*)`, 'i').exec(xmp); return r ? r[1].trim() : ''; };
   const mi = doc.getDict(doc.catalog, 'MarkInfo');
   // An XMP date that does not parse is no date (an Invalid Date object would throw later, in toISOString).
@@ -394,6 +394,50 @@ export function readMetadata(doc: PdfDocument): Metadata {
 }
 
 const xmlEsc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
+const reEsc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/** An XMP packet's text: UTF-8 (with or without a byte-order mark), or UTF-16 big- or little-endian, with or without one. */
+export function decodeXmp(b: Uint8Array): string {
+  const utf16 = (from: number, be: boolean): string => {
+    let out = '';
+    for (let i = from; i + 1 < b.length; i += 0x4000) {
+      const end = Math.min(b.length - 1, i + 0x4000), codes: number[] = [];
+      for (let k = i; k + 1 <= end; k += 2) codes.push(be ? (b[k] << 8) | b[k + 1] : b[k] | (b[k + 1] << 8));
+      out += String.fromCharCode.apply(null, codes);
+    }
+    return out;
+  };
+  if (b.length >= 2 && b[0] === 0xfe && b[1] === 0xff) return utf16(2, true);
+  if (b.length >= 2 && b[0] === 0xff && b[1] === 0xfe) return utf16(2, false);
+  // No byte-order mark: a packet starts with "<" (or white space), so a zero byte next to it gives UTF-16 away.
+  if (b.length >= 2 && b[0] === 0 && b[1] !== 0) return utf16(0, true);
+  if (b.length >= 2 && b[0] !== 0 && b[1] === 0) return utf16(0, false);
+  return new TextDecoder().decode(b);
+}
+
+const XMP_NS: Record<string, string> = { dc: 'http://purl.org/dc/elements/1.1/', xmp: 'http://ns.adobe.com/xap/1.0/', pdf: 'http://ns.adobe.com/pdf/1.3/' };
+
+/**
+ * Takes the given properties (as "prefix:name" with the usual prefixes) out of an XMP packet, as elements
+ * or as attributes of rdf:Description, under whatever prefix the packet binds their namespace to (older
+ * files write xap: for xmp:). Everything else stays byte for byte.
+ */
+function dropXmpProps(xml: string, props: string[]): string {
+  const bound = new Map<string, Set<string>>();
+  for (const m of xml.matchAll(/\bxmlns:([\w.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g)) { const uri = m[2] ?? m[3]; if (!bound.has(uri)) bound.set(uri, new Set()); bound.get(uri)!.add(m[1]); }
+  for (const prop of props) {
+    const [pre, local] = prop.split(':');
+    const uri = XMP_NS[pre];
+    const prefixes = uri && bound.get(uri)?.size ? [...bound.get(uri)!] : [pre];
+    for (const px of prefixes) {
+      const t = reEsc(`${px}:${local}`);
+      // An empty element first, so that "<dc:title />" is not read as a start tag that runs on to a later end tag.
+      xml = xml.replace(new RegExp(`<${t}(?:\\s(?:[^>"']|"[^"]*"|'[^']*')*?)?\\/>|<${t}(?:\\s(?:[^>"']|"[^"]*"|'[^']*')*)?>[\\s\\S]*?<\\/${t}\\s*>`, 'g'), '');
+      xml = xml.replace(new RegExp(`(<rdf:Description\\b(?:[^>"']|"[^"]*"|'[^']*')*?)\\s+${t}\\s*=\\s*("[^"]*"|'[^']*')`, 'g'), '$1');
+    }
+  }
+  return xml;
+}
 
 export function writeMetadata(doc: PdfDocument, m: Partial<Metadata>): void {
   const info = doc.ensureInfo();
@@ -407,29 +451,34 @@ export function writeMetadata(doc: PdfDocument, m: Partial<Metadata>): void {
   const val = (k: 'title' | 'author' | 'subject' | 'keywords' | 'producer' | 'creator'): string => xmlEsc(m[k] ?? cur[k]);
   // The properties this function keeps in step with the Info dictionary: [tag, content, whether to write it].
   // An empty value is left out, and a creation date is written only when one is known (never today's
-  // date in its place; an existing date that could not be read stays as it is).
+  // date in its place; an existing date that could not be read stays as it is). dc:language is only
+  // touched when the language is being set.
   const alt = (v: string) => `<rdf:Alt><rdf:li xml:lang="x-default">${v}</rdf:li></rdf:Alt>`;
+  const now = new Date().toISOString();
+  const lang = m.language !== undefined ? xmlEsc(m.language) : null;
   const all: [string, string, boolean][] = [
     ['dc:title', alt(val('title')), !!val('title')],
     ['dc:creator', `<rdf:Seq><rdf:li>${val('author')}</rdf:li></rdf:Seq>`, !!val('author')],
     ['dc:description', alt(val('subject')), !!val('subject')],
+    ...(lang !== null ? [['dc:language', `<rdf:Bag><rdf:li>${lang}</rdf:li></rdf:Bag>`, !!lang] as [string, string, boolean]] : []),
     ['pdf:Keywords', val('keywords'), !!val('keywords')], ['pdf:Producer', val('producer'), !!val('producer')], ['xmp:CreatorTool', val('creator'), !!val('creator')],
     ...(cur.created ? [['xmp:CreateDate', cur.created.toISOString(), true] as [string, string, boolean]] : []),
-    ['xmp:ModifyDate', new Date().toISOString(), true],
+    ['xmp:ModifyDate', now, true], ['xmp:MetadataDate', now, true],
   ];
-  const props = all.map(([t]) => [t] as [string]);
-  const block = `<rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:xmp="http://ns.adobe.com/xap/1.0/" xmlns:pdf="http://ns.adobe.com/pdf/1.3/">\n${all.filter((p) => p[2]).map(([t, v]) => `<${t}>${v}</${t}>`).join('\n')}\n</rdf:Description>`;
+  const hasPacket = /<rdf:RDF[\s>][\s\S]*<\/rdf:RDF>/.test(cur.xmp);
+  // Every description in a packet must be about the same resource: the new one takes the existing value.
+  const about = hasPacket ? /<rdf:Description\b(?:[^>"']|"[^"]*"|'[^']*')*?\brdf:about\s*=\s*(?:"([^"]*)"|'([^']*)')/.exec(cur.xmp) : null;
+  const aboutVal = about ? xmlEsc(about[1] ?? about[2] ?? '') : '';
+  const block = `<rdf:Description rdf:about="${aboutVal}" xmlns:dc="${XMP_NS.dc}" xmlns:xmp="${XMP_NS.xmp}" xmlns:pdf="${XMP_NS.pdf}">\n${all.filter((p) => p[2]).map(([t, v]) => `<${t}>${v}</${t}>`).join('\n')}\n</rdf:Description>`;
   let xmp: string;
-  if (/<rdf:RDF[\s>][\s\S]*<\/rdf:RDF>/.test(cur.xmp)) {
+  if (hasPacket) {
     // An existing packet is kept (PDF/A identification, rights, custom schemas…): only these properties are
-    // taken out, as elements or as attributes, and the new values are added as one more description.
-    let old = cur.xmp;
-    for (const [t] of props) {
-      old = old.replace(new RegExp(`<${t}(\\s[^>]*)?>[\\s\\S]*?</${t}>|<${t}(\\s[^>]*)?/>`, 'g'), '');
-      old = old.replace(new RegExp(`(<rdf:Description\\b[^>]*?)\\s+${t}=("[^"]*"|'[^']*')`, 'g'), '$1');
-    }
+    // taken out, and the new values are added as one more description. It is written back as UTF-8, so a
+    // declaration that names another encoding is corrected.
+    let old = dropXmpProps(cur.xmp, all.map(([t]) => t));
     // Descriptions left with nothing in them (ours from the last time, usually) go too.
     old = old.replace(/<rdf:Description\b([^>]*)>\s*<\/rdf:Description>/g, (m, attrs: string) => (attrs.replace(/\s+(rdf:about|xmlns:[\w.-]+)=("[^"]*"|'[^']*')/g, '').trim() ? m : ''));
+    old = old.replace(/(<\?(?:xml|xpacket)\b[^?]*?\bencoding\s*=\s*)(["'])[^"']*\2/g, '$1$2UTF-8$2');
     const at = old.lastIndexOf('</rdf:RDF>');
     xmp = old.slice(0, at) + block + '\n' + old.slice(at);
   } else {

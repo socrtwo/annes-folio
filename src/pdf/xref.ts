@@ -18,9 +18,11 @@ export interface XrefResult {
   warnings: string[];
   /** Offsets of every xref section seen (newest first). */
   sections: number[];
+  /** Objects the newest revision lists as free, with the generation number its entry gives (for an update's free list). */
+  free: Map<number, number>;
 }
 
-interface Section { entries: Map<number, XrefEntry>; /** Object numbers this section marks free (deleted). */ free: number[]; trailer: Dict; stream: boolean; offset: number }
+interface Section { entries: Map<number, XrefEntry>; /** Object numbers this section marks free (deleted). */ free: number[]; /** The generation each free entry gives. */ freeGen: Map<number, number>; trailer: Dict; stream: boolean; offset: number }
 
 const num = (o: PdfObj | undefined, d = 0): number => (typeof o === 'number' ? o : d);
 
@@ -31,14 +33,15 @@ export function parseXref(buf: Uint8Array, resolveLength: (o: PdfObj) => PdfObj 
   const lex = new Lexer(buf, tail + 9);
   const t = lex.next();
   if (t.t !== 'num') throw new Error('startxref has no offset');
-  const result: XrefResult = { entries: new Map(), trailer: new Dict(), usesXrefStream: false, startxref: t.v, warnings: [], sections: [] };
+  const result: XrefResult = { entries: new Map(), trailer: new Dict(), usesXrefStream: false, startxref: t.v, warnings: [], sections: [], free: new Map() };
   const seen = new Set<number>();
   // Objects a newer section deleted: an older section's entry for them must not bring them back.
   const freed = new Set<number>();
+  const addFree = (s: Section, n: number) => { if (!freed.has(n)) { freed.add(n); result.free.set(n, s.freeGen.get(n) ?? 0); } };
   const merge = (s: Section, withFree: boolean) => {
     for (const [n, e] of s.entries) if (!result.entries.has(n) && !freed.has(n)) result.entries.set(n, e);
     for (const [k, v] of s.trailer.map) if (!result.trailer.has(k)) result.trailer.set(k, v);
-    if (withFree) for (const n of s.free) if (!result.entries.has(n)) freed.add(n);
+    if (withFree) for (const n of s.free) if (!result.entries.has(n)) addFree(s, n);
   };
   const read = (off: number): Section | null => {
     if (seen.has(off)) return null;
@@ -63,7 +66,7 @@ export function parseXref(buf: Uint8Array, resolveLength: (o: PdfObj) => PdfObj 
     // by XRefStm supplies them. So the stream is read before the table's free entries take effect.
     const xs = section.trailer.get('XRefStm');
     if (typeof xs === 'number') { const hybrid = read(xs); if (hybrid) merge(hybrid, true); }
-    for (const n of section.free) if (!result.entries.has(n)) freed.add(n);
+    for (const n of section.free) if (!result.entries.has(n)) addFree(section, n);
     const prev = section.trailer.get('Prev');
     if (typeof prev === 'number') next = prev;
   }
@@ -92,17 +95,18 @@ function parseSection(buf: Uint8Array, off: number, resolveLength: (o: PdfObj) =
 function parseTable(buf: Uint8Array, pos: number, offset: number): Section {
   const entries = new Map<number, XrefEntry>();
   const free: number[] = [];
+  const freeGen = new Map<number, number>();
   const lex = new Lexer(buf, pos);
   for (;;) {
     lex.skipWs();
     if (Lexer.find(buf, 'trailer', lex.pos, lex.pos + 7) === lex.pos) {
       const p = new Parser(buf, lex.pos + 7);
       const t = p.parse();
-      return { entries, free, trailer: t instanceof Dict ? t : new Dict(), stream: false, offset };
+      return { entries, free, freeGen, trailer: t instanceof Dict ? t : new Dict(), stream: false, offset };
     }
     const a = lex.next();
     const b = lex.next();
-    if (a.t !== 'num' || b.t !== 'num') return { entries, free, trailer: new Dict(), stream: false, offset };
+    if (a.t !== 'num' || b.t !== 'num') return { entries, free, freeGen, trailer: new Dict(), stream: false, offset };
     const start = a.v, count = b.v;
     lex.skipWs();
     // Entries are 20 bytes each in a valid file, but tolerate sloppy spacing by tokenizing.
@@ -114,7 +118,7 @@ function parseTable(buf: Uint8Array, pos: number, offset: number): Section {
       if (o.t !== 'num' || g.t !== 'num' || k.t !== 'kw') { lex.pos = save; break; }
       const n = start + i;
       if (k.v === 'n') { if (!entries.has(n)) entries.set(n, { offset: o.v, gen: g.v, type: 1 }); }
-      else if (k.v === 'f' && n > 0) free.push(n);
+      else if (k.v === 'f' && n > 0 && !freeGen.has(n)) { free.push(n); freeGen.set(n, g.v); }
     }
   }
 }
@@ -127,6 +131,7 @@ function parseXrefStream(s: PdfStream, resolveLength: (o: PdfObj) => PdfObj, off
   const index = (d.get('Index') as PdfObj[] | undefined)?.map((x) => num(x)) || [0, size];
   const entries = new Map<number, XrefEntry>();
   const free: number[] = [];
+  const freeGen = new Map<number, number>();
   const rowLen = W.reduce((a, b) => a + b, 0);
   let pos = 0;
   const read = (w: number): number => { let v = 0; for (let i = 0; i < w; i++) v = v * 256 + (data[pos++] ?? 0); return v; };
@@ -140,12 +145,12 @@ function parseXrefStream(s: PdfStream, resolveLength: (o: PdfObj) => PdfObj, off
       if (entries.has(n)) continue;
       if (type === 1) entries.set(n, { offset: f2, gen: f3, type: 1 });
       else if (type === 2) entries.set(n, { offset: f2, gen: 0, type: 2, idx: f3 });
-      else if (type === 0 && n > 0) free.push(n);
+      else if (type === 0 && n > 0) { free.push(n); freeGen.set(n, f3); }
     }
   }
   const trailer = new Dict();
   for (const k of ['Root', 'Info', 'ID', 'Encrypt', 'Prev', 'Size', 'XRefStm']) if (d.has(k)) trailer.set(k, d.get(k)!);
-  return { entries, free, trailer, stream: true, offset };
+  return { entries, free, freeGen, trailer, stream: true, offset };
 }
 
 // ------------------------------------------------------------------------------------------
@@ -287,7 +292,7 @@ export function finishScan(scan: Scan, usable: (n: number, what: 'catalog' | 'pa
   for (const n of scan.entries.keys()) if (n > maxNum) maxNum = n;
   trailer.set('Size', maxNum + 1);
   const streams = scan.trailers.filter((t) => t.stream).length;
-  return { entries: scan.entries, trailer, usesXrefStream: streams > 0 && streams === scan.trailers.length, startxref: -1, warnings, sections: [], objectsFound: scan.objectsFound, trailersFound: scan.trailers.length - streams, catalogSynthesized, pagesRoot };
+  return { entries: scan.entries, trailer, usesXrefStream: streams > 0 && streams === scan.trailers.length, startxref: -1, warnings, sections: [], free: new Map(), objectsFound: scan.objectsFound, trailersFound: scan.trailers.length - streams, catalogSynthesized, pagesRoot };
 }
 
 /**

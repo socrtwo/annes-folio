@@ -313,14 +313,18 @@ export function encodeString(font: FontInfo, text: string): PdfString | null {
   return new PdfString(Uint8Array.from(out));
 }
 
-export interface PageText { runs: TextRun[]; images: ImageUse[]; ops: Op[] }
+export interface PageText {
+  runs: TextRun[]; images: ImageUse[]; ops: Op[];
+  /** Some forms were not looked into (the work budget ran out, or they are nested deeper than 8): runs and images may be missing. */
+  incomplete: boolean;
+}
 
 /**
  * Shared by one analysis and the forms it descends into: parsed form content, and how much work in forms
  * is still allowed (in operators; the default is about 20,000 small forms, or twenty million operators).
  * Forms drawn after that are skipped, so nested forms that multiply cannot stall the app.
  */
-export interface FormWork { parsed: Map<PdfStream, Op[]>; opsLeft: number }
+export interface FormWork { parsed: Map<PdfStream, Op[]>; opsLeft: number; /** Set when a form was skipped for the budget or the nesting limit. */ cutShort?: boolean }
 
 /** Walks a page's content and reports where text strings and images are drawn (user space). */
 export function analyzeContent(doc: PdfDocument, ops: Op[], resources: Dict | null, depth = 0, ctm0: Matrix = IDENTITY, shared: FormWork = { parsed: new Map(), opsLeft: 2e7 }): PageText {
@@ -398,7 +402,8 @@ export function analyzeContent(doc: PdfDocument, ops: Op[], resources: Dict | nu
           if (sub === 'Image') {
             const pts = [apply(ctm, 0, 0), apply(ctm, 1, 0), apply(ctm, 0, 1), apply(ctm, 1, 1)];
             images.push({ opIndex: i, name: a[0].name, box: [Math.min(...pts.map((p) => p[0])), Math.min(...pts.map((p) => p[1])), Math.max(...pts.map((p) => p[0])), Math.max(...pts.map((p) => p[1]))] });
-          } else if (sub === 'Form' && depth < 8) {
+          } else if (sub === 'Form' && depth >= 8) shared.cutShort = true;
+          else if (sub === 'Form') {
             const mtx = doc.getArray(x, 'Matrix');
             const fm: Matrix = mtx && mtx.length >= 6 ? (mtx.map((v) => n(doc.resolve(v))) as Matrix) : IDENTITY;
             try {
@@ -408,7 +413,7 @@ export function analyzeContent(doc: PdfDocument, ops: Op[], resources: Dict | nu
               if (!formOps) { formOps = parseContent(doc.decoded(x)); shared.parsed.set(x, formOps); }
               // Setting a form up costs about as much as walking a thousand of its operators.
               shared.opsLeft -= formOps.length + 1000;
-              if (shared.opsLeft < 0) break;
+              if (shared.opsLeft < 0) { shared.cutShort = true; break; }
               const inner = analyzeContent(doc, formOps, doc.getDict(x, 'Resources') || resources, depth + 1, mul(fm, ctm), shared);
               for (const r of inner.runs) runs.push({ ...r, opIndex: i });
               for (const im of inner.images) images.push({ ...im, opIndex: i });
@@ -424,7 +429,7 @@ export function analyzeContent(doc: PdfDocument, ops: Op[], resources: Dict | nu
       }
     }
   });
-  return { runs, images, ops };
+  return { runs, images, ops, incomplete: !!shared.cutShort };
 }
 
 export const rectsOverlap = (a: [number, number, number, number], b: [number, number, number, number]): boolean => a[0] < b[2] && a[2] > b[0] && a[1] < b[3] && a[3] > b[1];

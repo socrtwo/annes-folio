@@ -14,7 +14,15 @@ type Rect = [number, number, number, number];
 
 export interface RedactStats { text: number; images: number; paths: number; forms: number }
 
-interface Ctx { doc: PdfDocument; rects: Rect[]; stats: RedactStats; /** Object numbers of XObjects a rewritten container stopped drawing. */ dropped: Set<number>; /** Text-showing operators to blank whatever their position, each replaced by exactly one operator. */ force?: Set<Op>; /** Object numbers of optional content groups (layers) that are hidden: what they hold is removed. */ hidden?: Set<number> }
+/**
+ * How much work in Form XObjects one page may still take (in operators, as in content.ts: about twenty
+ * million), and whether some form was left unchecked because it ran out: forms that draw each other many
+ * times over would otherwise be rewritten without end.
+ */
+export interface RedactWork { opsLeft: number; cutShort: boolean }
+export const redactWork = (): RedactWork => ({ opsLeft: 2e7, cutShort: false });
+
+interface Ctx { doc: PdfDocument; rects: Rect[]; stats: RedactStats; /** Object numbers of XObjects a rewritten container stopped drawing. */ dropped: Set<number>; /** Text-showing operators to blank whatever their position, each replaced by exactly one operator. */ force?: Set<Op>; /** Object numbers of optional content groups (layers) that are hidden: what they hold is removed. */ hidden?: Set<number>; work?: RedactWork }
 
 /** Hands out a container's private copy of a resource sub-dictionary, made on first use. */
 type Own = (kind: 'XObject' | 'Properties') => Dict;
@@ -212,6 +220,7 @@ function redactOps(c: Ctx, ops: Op[], resources: Dict | null, ctm0: Matrix, dept
           const bb = doc.rect(x.dict.get('BBox'));
           const underMark = rects.length > 0 && (!bb || hit(boxOf([apply(inner, bb[0], bb[1]), apply(inner, bb[2], bb[1]), apply(inner, bb[0], bb[3]), apply(inner, bb[2], bb[3])])));
           if (underMark && depth >= MAX_FORM_DEPTH) { c.stats.forms++; changed = true; droppedNames.add(name); continue; } // too deep to rewrite safely: the form goes
+          if (c.hidden && !underMark && depth >= MAX_FORM_DEPTH && c.work) c.work.cutShort = true; // too deep to look into for hidden layers
           if ((underMark || c.hidden) && depth < MAX_FORM_DEPTH) {
             // Rewrite a private copy of the form; the original stays for whoever else draws it.
             const priv: { res: Dict | null; subs: Map<string, Dict> } = { res: null, subs: new Map() };
@@ -221,9 +230,15 @@ function redactOps(c: Ctx, ops: Op[], resources: Dict | null, ctm0: Matrix, dept
               if (!sub2) { if (!priv.res) priv.res = innerRes ? innerRes.clone() : new Dict(); const cur = doc.getDict(priv.res, kind); sub2 = cur ? cur.clone() : new Dict(); priv.res.set(kind, sub2); priv.subs.set(kind, sub2); }
               return sub2;
             };
-            let r: { ops: Op[]; changed: boolean };
-            try { r = redactOps(c, parseContent(doc.decoded(x)), innerRes, inner, depth + 1, innerOwn); }
-            catch { if (!underMark) { out.push(o); continue; } c.stats.forms++; changed = true; droppedNames.add(name); continue; } // unreadable form under a mark: remove it rather than keep it
+            let r: { ops: Op[]; changed: boolean } | null;
+            try {
+              const formOps = parseContent(doc.decoded(x));
+              // Rewriting a form costs about as much as walking a thousand of its operators. Out of budget, the
+              // form stays as it is and the page is reported as not fully checked.
+              if (c.work && (c.work.opsLeft -= formOps.length + 1000) < 0) { c.work.cutShort = true; r = null; }
+              else r = redactOps(c, formOps, innerRes, inner, depth + 1, innerOwn);
+            } catch { if (!underMark) { out.push(o); continue; } c.stats.forms++; changed = true; droppedNames.add(name); continue; } // unreadable form under a mark: remove it rather than keep it
+            if (!r) { out.push(o); continue; }
             if (r.changed) {
               const entries: Record<string, PdfObj> = {};
               for (const [k, v] of x.dict.map) if (!['Filter', 'DecodeParms', 'Length', 'DL', 'F', 'FFilter', 'FDecodeParms'].includes(k)) entries[k] = v;
@@ -366,7 +381,7 @@ function pageOwn(doc: PdfDocument, p: PageInfo): Own {
  * whether the page changed; `dropped` collects XObjects for pruneUndrawn.
  */
 export function removeHiddenContent(doc: PdfDocument, p: PageInfo, hidden: Set<number>, dropped: Set<number>): boolean {
-  const r = redactOps({ doc, rects: [], stats: { text: 0, images: 0, paths: 0, forms: 0 }, dropped, hidden }, parseContent(doc.pageContent(p)), p.resources, IDENTITY, 0, pageOwn(doc, p));
+  const r = redactOps({ doc, rects: [], stats: { text: 0, images: 0, paths: 0, forms: 0 }, dropped, hidden, work: redactWork() }, parseContent(doc.pageContent(p)), p.resources, IDENTITY, 0, pageOwn(doc, p));
   if (r.changed) doc.setPageContent(p, serializeContent(r.ops));
   return r.changed;
 }
@@ -381,8 +396,8 @@ export function membershipHidden(doc: PdfDocument, oc: PdfObj | undefined, hidde
  * operators, isolated in q…Q so the caller can append drawing in clean user space, and the object
  * numbers of XObjects the page stopped drawing (for pruneUndrawn).
  */
-export function redactPageContent(doc: PdfDocument, p: PageInfo, rects: Rect[], stats: RedactStats, dropped: Set<number>): Op[] {
-  const r = redactOps({ doc, rects, stats, dropped }, parseContent(doc.pageContent(p)), p.resources, IDENTITY, 0, pageOwn(doc, p));
+export function redactPageContent(doc: PdfDocument, p: PageInfo, rects: Rect[], stats: RedactStats, dropped: Set<number>, work: RedactWork = redactWork()): Op[] {
+  const r = redactOps({ doc, rects, stats, dropped, work }, parseContent(doc.pageContent(p)), p.resources, IDENTITY, 0, pageOwn(doc, p));
   // The embedded thumbnail still shows the page as it was.
   if (p.dict.has('Thumb')) { p.dict.delete('Thumb'); if (p.ref) doc.touch(p.ref); }
   return [{ op: 'q', args: [] }, ...r.ops, { op: 'Q', args: [] }];

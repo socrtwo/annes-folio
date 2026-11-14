@@ -4,7 +4,7 @@
  * password the person enters as user or owner password. Saving re-encrypts new objects with the same key
  * (incremental updates) or encrypts everything with a new AES-256 dictionary (Protect ▸ Encrypt).
  */
-import { Dict, Name, PdfObj, PdfStream, PdfString, Ref, bytesOf, isName, nameObj } from './objects';
+import { Dict, Name, PdfObj, PdfStream, PdfString, Ref, bytesOf, isName, nameObj, nameText } from './objects';
 import { aesCbcDecrypt, aesCbcDecryptNoPad, aesCbcEncrypt, aesCbcEncryptNoPad, md5, randomBytes, rc4, sha256, sha384, sha512 } from './hash';
 
 const PAD = Uint8Array.from([0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41, 0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08, 0x2e, 0x2e, 0x00, 0xb6, 0xd0, 0x68, 0x3e, 0x80, 0x2f, 0x0c, 0xa9, 0xfe, 0x64, 0x53, 0x69, 0x7a]);
@@ -103,7 +103,7 @@ export class SecurityHandler {
   constructor(public dict: Dict, private id0: Uint8Array, resolve: (o: PdfObj | undefined) => PdfObj) {
     const num = (k: string, d: number) => { const v = resolve(dict.get(k)); return typeof v === 'number' ? v : d; };
     const filter = resolve(dict.get('Filter'));
-    if (!isName(filter, 'Standard')) throw new Error(`Unsupported security handler ${isName(filter) ? filter.name : '?'}`);
+    if (!isName(filter, 'Standard')) throw new Error(`Unsupported security handler ${isName(filter) ? nameText(filter.name) : '?'}`);
     this.V = num('V', 1); this.R = num('R', 2); this.length = num('Length', 40); this.P = num('P', -1) | 0;
     const em = resolve(dict.get('EncryptMetadata'));
     this.encryptMetadata = em !== false;

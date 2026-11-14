@@ -337,7 +337,8 @@ def([
       if (!res) return;
       audit(tab, `Redactions applied: ${res.textRemoved} text run(s), ${res.imagesRemoved} image(s), ${res.pathsRemoved} drawing(s), ${res.areas} area(s)`);
       tab.ui.selectedAnnot = null;
-      toast(`Redacted: ${res.textRemoved} text run(s), ${res.imagesRemoved} image(s) and ${res.pathsRemoved} drawing(s) removed in ${res.areas} area(s). Save now: the file is rewritten whole, without the removed content.`, { ms: 9000, action: 'Save', onAction: () => { if (app.docs.includes(tab)) { app.activate(tab); app.exec('file.save'); } } });
+      const unchecked = res.incompletePages.length ? ` Page(s) ${res.incompletePages.map((i) => i + 1).join(', ')} could not be fully checked: their content nests drawings so deeply that the work limit ran out, so something under a mark there may remain in the file (it is covered by the black box). Check those pages before you share the file.` : '';
+      toast(`Redacted: ${res.textRemoved} text run(s), ${res.imagesRemoved} image(s) and ${res.pathsRemoved} drawing(s) removed in ${res.areas} area(s).${unchecked} Save now: the file is rewritten whole, without the removed content.`, { ms: unchecked ? 20000 : 9000, action: 'Save', onAction: () => { if (app.docs.includes(tab)) { app.activate(tab); app.exec('file.save'); } } });
     },
   },
   {

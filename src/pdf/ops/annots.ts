@@ -4,7 +4,7 @@
  * is rebuilt from the dictionary, so what is stored and what is drawn agree); replies and review
  * states; XFDF import/export; flattening; applying redactions to page content.
  */
-import { Dict, Name, PdfObj, PdfStream, PdfString, Ref, cloneObj, pdfDate } from '../objects';
+import { Dict, Name, PdfObj, PdfStream, PdfString, Ref, cloneObj, nameText, pdfDate } from '../objects';
 import { flateStream } from '../filters';
 import { PdfDocument, PageInfo } from '../document';
 import { fmtNum } from '../writer';
@@ -15,7 +15,7 @@ import { serializeContent, rectsOverlap, Op } from '../content';
 import { bytesOf, concat } from '../objects';
 import { parseXml, esc } from '../../io/xml';
 import { detachWidget, mapAnnotGeometry, ownResources } from './shared';
-import { redactPageContent, pruneUndrawn, type RedactStats } from './redact';
+import { redactPageContent, pruneUndrawn, redactWork, type RedactStats } from './redact';
 
 export type RGB = [number, number, number];
 export type Rect = [number, number, number, number];
@@ -668,7 +668,13 @@ export function flattenAnnotations(doc: PdfDocument, p: PageInfo, filter: (a: An
 // ------------------------------------------------------------------------------------------
 // Redaction
 
-export interface RedactResult { textRemoved: number; imagesRemoved: number; areas: number; /** Vector paths that lay wholly inside an area. */ pathsRemoved: number; /** Form XObjects rewritten (or removed) because content inside them was under an area. */ formsRewritten: number }
+export interface RedactResult { textRemoved: number; imagesRemoved: number; areas: number; /** Vector paths that lay wholly inside an area. */ pathsRemoved: number; /** Form XObjects rewritten (or removed) because content inside them was under an area. */ formsRewritten: number;
+  /**
+   * Pages (0-based) whose content could not be checked completely: their Form XObjects draw each other so many
+   * times over that the work limit ran out. What was found there is removed and covered, but forms left
+   * unchecked may still hold content under the areas.
+   */
+  incompletePages: number[] }
 
 /**
  * Applies every Redact annotation on the pages (and the given rects). Text glyphs, images and vector
@@ -681,6 +687,7 @@ export function applyRedactions(doc: PdfDocument, indexes: number[], extra: Map<
   const stats: RedactStats = { text: 0, images: 0, paths: 0, forms: 0 };
   const dropped = new Set<number>();
   let areas = 0;
+  const incompletePages: number[] = [];
   const pages = doc.pages;
   for (const i of new Set(indexes)) {
     const p = pages[i];
@@ -697,7 +704,9 @@ export function applyRedactions(doc: PdfDocument, indexes: number[], extra: Map<
     }
     if (!rects.length) continue;
     areas += rects.length;
-    const ops: Op[] = redactPageContent(doc, p, rects, stats, dropped);
+    const work = redactWork();
+    const ops: Op[] = redactPageContent(doc, p, rects, stats, dropped, work);
+    if (work.cutShort) incompletePages.push(i);
     // Black boxes on top, in clean user space (the old content is closed off in q…Q).
     ops.push({ op: 'q', args: [] }, { op: 'rg', args: [0, 0, 0] });
     for (const r of rects) ops.push({ op: 're', args: [r[0], r[1], r[2] - r[0], r[3] - r[1]] }, { op: 'f', args: [] });
@@ -719,7 +728,7 @@ export function applyRedactions(doc: PdfDocument, indexes: number[], extra: Map<
     for (const a of pageAnnotations(doc, p)) if (a.ref && (a.subtype === 'Redact' || rects.some((r) => rectsOverlap(r, a.rect)))) deleteAnnotation(doc, p, a.ref);
   }
   pruneUndrawn(doc, dropped);
-  return { textRemoved: stats.text, imagesRemoved: stats.images, areas, pathsRemoved: stats.paths, formsRewritten: stats.forms };
+  return { textRemoved: stats.text, imagesRemoved: stats.images, areas, pathsRemoved: stats.paths, formsRewritten: stats.forms, incompletePages: incompletePages.sort((a, b) => a - b) };
 }
 
 // ------------------------------------------------------------------------------------------
@@ -742,7 +751,7 @@ export function exportXfdf(doc: PdfDocument, fileName = ''): string {
     if (a.date) attrs.push(`date="${esc(pdfDate(a.date).toText())}"`);
     if (a.opacity < 1) attrs.push(`opacity="${fmtNum(a.opacity)}"`);
     if (a.irt) { const parent = doc.resolve<Dict>(a.irt); attrs.push(`inreplyto="${esc(doc.getText(parent, 'NM'))}"`); }
-    if (a.subtype === 'Text') attrs.push(`icon="${esc(doc.getName(a.dict, 'Name') || 'Comment')}"`);
+    if (a.subtype === 'Text') attrs.push(`icon="${esc(nameText(doc.getName(a.dict, 'Name')) || 'Comment')}"`);
     if (a.subtype === 'Stamp' && a.dict.has('QFText')) attrs.push(`icon="${esc(doc.getText(a.dict, 'QFText'))}"`);
     const q = doc.getArray(a.dict, 'QuadPoints'); if (q) attrs.push(`coords="${list(q)}"`);
     const bs = doc.getDict(a.dict, 'BS'); if (bs) attrs.push(`width="${fmtNum(doc.getNum(bs, 'W', 1))}"`);

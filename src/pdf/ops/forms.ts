@@ -2,7 +2,7 @@
  * Interactive forms (ISO 32000-1 §12.7): filling fields with regenerated appearances, creating and
  * deleting fields, calculation and tab order, reset, flattening, and FDF/XFDF/CSV/JSON data exchange.
  */
-import { Dict, Name, PdfObj, PdfStream, PdfString, Ref, concat } from '../objects';
+import { Dict, Name, PdfObj, PdfStream, PdfString, Ref, concat, nameText } from '../objects';
 import { flateStream } from '../filters';
 import { PdfDocument, PageInfo } from '../document';
 import { Parser } from '../lexer';
@@ -131,7 +131,9 @@ export function setFieldValue(doc: PdfDocument, f: FieldInfo, value: string | st
     const states = f.widgets.map((w) => w.onState || 'Yes');
     if (f.type === 'radio') {
       // value: the export name (on state) to select, or true for the first widget
-      const want = typeof value === 'string' ? (on ? value : '') : on ? states[0] : '';
+      // A state is a name, kept as its bytes; the value may also be its text as shown or exported (UTF-8 decoded).
+      const asked = typeof value === 'string' ? (on ? value : '') : on ? states[0] : '';
+      const want = states.includes(asked) ? asked : states.find((s) => nameText(s) === asked) ?? asked;
       if (want && !states.includes(want)) throw new Error(`${f.name} has no option "${want}".`);
       f.dict.set('V', Name.get(want || 'Off'));
       f.widgets.forEach((w) => { w.dict.set('AS', Name.get(want && w.onState === want ? want : 'Off')); doc.touch(w.ref); });
@@ -381,7 +383,7 @@ export function flattenForm(doc: PdfDocument): number {
 
 export function formData(doc: PdfDocument): Record<string, string | string[] | boolean> {
   const out: Record<string, string | string[] | boolean> = {};
-  for (const f of readFields(doc)) if (f.type !== 'button' && f.type !== 'signature') out[f.name] = f.value;
+  for (const f of readFields(doc)) if (f.type !== 'button' && f.type !== 'signature') out[f.name] = f.type === 'radio' && typeof f.value === 'string' ? nameText(f.value) : f.value;
   return out;
 }
 
@@ -394,7 +396,7 @@ export function applyFormData(doc: PdfDocument, data: Record<string, unknown>): 
     if (!f) { const tail = fields.filter((x) => x.name.endsWith('.' + k)); if (tail.length === 1) f = tail[0]; }
     if (!f || f.readOnly) continue;
     try {
-      if (f.type === 'checkbox') setFieldValue(doc, f, v === true || v === 1 || (typeof v === 'string' && (/^(true|yes|on|1|x|checked)$/i.test(v.trim()) || f.widgets.some((w) => w.onState === v))));
+      if (f.type === 'checkbox') setFieldValue(doc, f, v === true || v === 1 || (typeof v === 'string' && (/^(true|yes|on|1|x|checked)$/i.test(v.trim()) || f.widgets.some((w) => w.onState === v || (!!w.onState && nameText(w.onState) === v)))));
       else if (f.type === 'radio') setFieldValue(doc, f, typeof v === 'string' ? v : !!v);
       else setFieldValue(doc, f, Array.isArray(v) ? v.map(String) : String(v ?? ''));
       n++;
@@ -406,7 +408,7 @@ export function applyFormData(doc: PdfDocument, data: Record<string, unknown>): 
 export function exportFormXfdf(doc: PdfDocument, fileName = ''): string {
   const fields = readFields(doc).filter((f) => f.type !== 'button' && f.type !== 'signature');
   const items = fields.map((f) => {
-    const vals = f.type === 'checkbox' || f.type === 'radio' ? [f.value ? (f.widgets.find((w) => (f.type === 'radio' ? doc.getName(w.dict, 'AS') !== 'Off' : true))?.onState || 'Yes') : 'Off'] : Array.isArray(f.value) ? f.value : [String(f.value)];
+    const vals = f.type === 'checkbox' || f.type === 'radio' ? [f.value ? (f.widgets.find((w) => (f.type === 'radio' ? doc.getName(w.dict, 'AS') !== 'Off' : true))?.onState || 'Yes') : 'Off'].map(nameText) : Array.isArray(f.value) ? f.value : [String(f.value)];
     return `<field name="${xmlEsc(f.name)}">${vals.map((v) => `<value>${xmlEsc(v)}</value>`).join('')}</field>`;
   });
   return `<?xml version="1.0" encoding="UTF-8"?>\n<xfdf xmlns="http://ns.adobe.com/xfdf/" xml:space="preserve">${fileName ? `<f href="${xmlEsc(fileName)}"/>` : ''}<fields>${items.join('')}</fields></xfdf>`;
