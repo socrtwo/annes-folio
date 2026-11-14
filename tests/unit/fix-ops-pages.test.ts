@@ -145,6 +145,26 @@ describe('importing pages', () => {
   });
 });
 
+describe('pages that inherit their resources', () => {
+  it('keep them when an overlay adds a font', () => {
+    const raw = `%PDF-1.4
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
+2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1/MediaBox[0 0 612 792]/Resources<</Font<</F1 4 0 R>>>>>>endobj
+3 0 obj<</Type/Page/Parent 2 0 R/Contents 5 0 R>>endobj
+4 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj
+5 0 obj<</Length 38>>stream
+BT /F1 12 Tf 72 700 Td (body) Tj ET
+endstream
+endobj
+trailer<</Root 1 0 R/Size 6>>
+%%EOF`;
+    const d = PdfDocument.load(bytesOf(raw));
+    addOverlayText(d, [0], { text: 'HEADER', position: 'top-left' });
+    const fonts = reload(d).getDict(reload(d).pages[0].resources, 'Font')!;
+    expect(fonts.keys().sort()).toEqual(['F1', 'QFHelvetica']);
+  });
+});
+
 describe('placement on rotated and cropped pages', () => {
   it('headers and Bates numbers follow /Rotate', () => {
     const d = PdfDocument.load(makeTextPdf(['x']));

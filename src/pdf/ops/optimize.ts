@@ -94,10 +94,16 @@ const isLinearized = (buf: Uint8Array): boolean => /\/Linearized/.test(new TextD
 export function earlierVersions(buf: Uint8Array): number {
   const eof = [0x25, 0x25, 0x45, 0x4f, 0x46], sx = [0x73, 0x74, 0x61, 0x72, 0x74, 0x78, 0x72, 0x65, 0x66];
   const at = (i: number, pat: number[]) => { for (let k = 0; k < pat.length; k++) if (buf[i + k] !== pat[k]) return false; return true; };
+  const space = (c: number) => c === 0x0a || c === 0x0d || c === 0x20 || c === 0x09;
   let n = 0;
   for (let i = buf.indexOf(0x25); i >= 0 && i + 5 <= buf.length; i = buf.indexOf(0x25, i + 1)) {
     if (!at(i, eof)) continue;
-    for (let j = i - 9; j >= Math.max(0, i - 40); j--) if (at(j, sx)) { n++; break; }
+    // Exactly "startxref <offset> %%EOF": the same bytes inside stream data do not count.
+    let j = i - 1, digits = 0;
+    while (j >= 0 && space(buf[j])) j--;
+    while (j >= 0 && buf[j] >= 0x30 && buf[j] <= 0x39) { j--; digits++; }
+    while (j >= 0 && space(buf[j])) j--;
+    if (digits && j >= 8 && at(j - 8, sx)) n++;
   }
   return Math.max(0, n - 1 - (isLinearized(buf) ? 1 : 0));
 }

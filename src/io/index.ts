@@ -289,7 +289,10 @@ export function addImagePageOriented(doc: PdfDocument, spec: ImageSpecEx, opts: 
   const o = spec.orientation && spec.orientation >= 1 && spec.orientation <= 8 ? spec.orientation : 1;
   const dpi = opts.dpi || spec.dpi || 96;
   const turned = o >= 5;
-  const iw = ((turned ? spec.height : spec.width) / dpi) * 72, ih = ((turned ? spec.width : spec.height) / dpi) * 72;
+  let iw = ((turned ? spec.height : spec.width) / dpi) * 72, ih = ((turned ? spec.width : spec.height) / dpi) * 72;
+  // A page side below 3 points is not a usable page (readers and this engine fall back to a default size).
+  const tiny = Math.min(iw, ih);
+  if (tiny > 0 && tiny < 3) { iw *= 3 / tiny; ih *= 3 / tiny; }
   const paper: [number, number] = !opts.paper || opts.paper === 'image' ? [iw, ih] : opts.paper;
   const page = addBlankPage(doc, paper, opts.at);
   const name = ensureXObject(doc, page, 'Im', imageXObject(doc, spec));
