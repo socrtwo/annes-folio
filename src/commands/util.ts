@@ -1,7 +1,7 @@
 /** Helpers shared by the command modules (no commands are defined here). */
 import type { App, DocTab } from '../app';
 import { PdfDocument, type PageInfo } from '../pdf/document';
-import type { Ref } from '../pdf/objects';
+import { PdfStream, type Ref } from '../pdf/objects';
 import { pageAnnotations, type AnnotInfo } from '../pdf/structure';
 import { imageXObject, jpegInfo, type ImageSpec } from '../pdf/build';
 import type { ImageInfo } from '../pdf/ops/optimize';
@@ -202,8 +202,9 @@ export async function pageImage(c: Ctx, i: number, dpi: number, format: 'png' | 
  * undone placement leaves nothing behind in the file.
  */
 export async function imageSpecFromFile(file: Blob): Promise<ImageSpec> {
-  const { imageSpecFromBytes } = await import('../io');
-  return imageSpecFromBytes(new Uint8Array(await file.arrayBuffer()), file.type === 'image/jpeg' ? 'jpeg' : undefined);
+  const { imageSpecFromBytes, uprightImageSpec } = await import('../io');
+  // A stamp or signature is placed by its pixel box, so a photo that is only turned by its EXIF tag is redrawn upright first.
+  return uprightImageSpec(await imageSpecFromBytes(new Uint8Array(await file.arrayBuffer()), file.type === 'image/jpeg' ? 'jpeg' : undefined));
 }
 
 /** The picture on the system clipboard, if the platform lets the page read one. */
@@ -217,10 +218,11 @@ export async function clipboardImage(): Promise<Blob | null> {
 
 /**
  * Re-encodes an image XObject as a JPEG at most maxPx on its longest side. Null when the image cannot be
- * decoded here, is a stencil mask or has a mask (a JPEG cannot carry either), or would not get smaller.
+ * decoded here, is a stencil mask or has a mask (a JPEG cannot carry either), has a /Decode array (the canvas
+ * would bake the undecoded samples in), or would not get smaller.
  */
 export async function recompressedJpeg(doc: PdfDocument, im: ImageInfo, maxPx: number, quality: number, gray = false): Promise<Uint8Array | null> {
-  if (!im.ref || im.hasMask || doc.resolve(im.stream.dict.get('ImageMask')) === true) return null;
+  if (!im.ref || im.hasMask || doc.resolve(im.stream.dict.get('ImageMask')) === true || im.stream.dict.has('Decode')) return null;
   const ex = extractImage(doc, im);
   let bmp: ImageBitmap;
   if (ex.kind === 'jpeg') bmp = await createImageBitmap(new Blob([ex.data as BlobPart], { type: 'image/jpeg' }));
@@ -240,7 +242,10 @@ export async function recompressedJpeg(doc: PdfDocument, im: ImageInfo, maxPx: n
 export function replaceImageWithJpeg(doc: PdfDocument, ref: Ref, jpeg: Uint8Array): void {
   const info = jpegInfo(jpeg)!;
   const nr = imageXObject(doc, { kind: 'jpeg', data: jpeg, width: info.width, height: info.height, gray: info.components === 1 });
-  doc.update(ref, doc.resolve(nr)); doc.remove(nr);
+  const fresh = doc.resolve<PdfStream>(nr), old = doc.resolve<PdfStream | null>(ref);
+  // What says when and how the image is shown stays with it: its layer, alternate text, structure link, smoothing.
+  if (old instanceof PdfStream && fresh instanceof PdfStream) for (const k of ['OC', 'Alt', 'StructParent', 'Interpolate']) { const v = old.dict.get(k); if (v !== undefined && v !== null) fresh.dict.set(k, v); }
+  doc.update(ref, fresh); doc.remove(nr);
 }
 
 /** Fits an image into a box (points), centered. */

@@ -39,7 +39,6 @@ export function formatFromName(name: string): FormatDef | undefined {
 }
 
 const ascii = (u8: Uint8Array, from: number, to: number) => { let s = ''; for (let i = from; i < Math.min(u8.length, to); i++) s += String.fromCharCode(u8[i]); return s; };
-const u16le = (b: Uint8Array, o: number) => b[o] | (b[o + 1] << 8);
 const u32le = (b: Uint8Array, o: number) => (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0;
 const printableShare = (data: Uint8Array, from: number, to: number): number => { let ok = 0; const n = Math.max(1, to - from); for (let i = from; i < to; i++) { const c = data[i]; if (c === 9 || c === 10 || c === 13 || (c >= 32 && c < 127) || c >= 0x80) ok++; } return ok / n; };
 

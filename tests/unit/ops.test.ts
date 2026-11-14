@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { PdfDocument } from '../../src/pdf/document';
-import { addBlankPage, addTextPages, makeTextPdf, PAPER } from '../../src/pdf/build';
+import { addBlankPage, addTextPages, PAPER } from '../../src/pdf/build';
 import { readOutlines, writeOutlines, readPageLabels, writePageLabels, pageLabelList, readAttachments, addAttachment, removeAttachment, readMetadata, writeMetadata, pageAnnotations, readFields, readLayers } from '../../src/pdf/structure';
 import { addTextMarkup, addNote, addFreeText, addShape, addInk, addTextStamp, addLink, addRedactMark, addReply, setAnnotationProps, deleteAnnotation, flattenAnnotations, applyRedactions, exportXfdf, importXfdf } from '../../src/pdf/ops/annots';
 import { addField, setFieldValue, resetForm, deleteField, setFieldProps, flattenForm, formData, applyFormData, exportFormXfdf, importFormXfdf, exportFormFdf, importFormFdf, formDataCsv, detectFieldsFromText } from '../../src/pdf/ops/forms';

@@ -8,12 +8,12 @@ import type { App, DocTab } from '../app';
 import { openDialog, toast, confirmDialog } from '../ui/dialog';
 import { pickFile } from '../ui/dom';
 import { PdfDocument, type PageInfo } from '../pdf/document';
-import { addImagePage, imageXObject, jpegInfo, PAPER, ensureXObject } from '../pdf/build';
+import { imageXObject, jpegInfo, PAPER, ensureXObject } from '../pdf/build';
 import { fmtNum } from '../pdf/writer';
 import { bytesOf, concat, PdfString, type Ref } from '../pdf/objects';
 import { setPageBox, setPageOrder } from '../pdf/ops/pages';
 import { listImages } from '../pdf/ops/optimize';
-import { imageSpecFromBytes } from '../io';
+import { imageSpecFromBytes, eachImageSpec, addImagePageOriented } from '../io';
 import { askPages, pageOf, saveBytes, baseName, viewerOf, esc, targetPages, editTab, stillCurrent, guarded, openAsNewTab, recompressedJpeg, replaceImageWithJpeg } from './util';
 import { writeTextLayer, stripOcrLayer, invisibleRuns, applyOcrCorrections, ocrLayerText, wordFromCanvasBox, canvasPlacement, isolatedContent, estimateSkew, deskewMatrix, median3x3, inkBounds, type OcrWord } from './ocrlayer';
 
@@ -172,7 +172,8 @@ def([
       const r = await openDialog({ title: 'PDF from Images', fields: [{ key: 'paper', label: 'Page size', type: 'select', options: [{ value: 'image', label: 'Fit the page to each picture' }, ...Object.keys(PAPER).map((k) => ({ value: k, label: k.toUpperCase() }))], value: 'image', half: true }, { key: 'dpi', label: 'Picture resolution (dpi)', type: 'number', min: 36, max: 1200, value: 200, half: true }, { key: 'ocr', label: 'Recognize text afterwards', type: 'checkbox', value: false }], ok: 'Create' });
       if (!r) return;
       const doc = PdfDocument.create();
-      for (const f of files) { try { addImagePage(doc, await imageSpecFromBytes(new Uint8Array(await f.arrayBuffer()), f.type === 'image/jpeg' ? 'jpeg' : undefined), { paper: r.paper === 'image' ? 'image' : PAPER[r.paper], dpi: +r.dpi || 200 }); } catch (e: any) { toast(`${f.name}: ${e?.message || e}`); } }
+      // Every page of a multi-page TIFF becomes a page; JPEGs are turned as their EXIF orientation asks.
+      for (const f of files) { try { for (const w of await eachImageSpec(new Uint8Array(await f.arrayBuffer()), f.type === 'image/jpeg' ? 'jpeg' : undefined, (spec) => { addImagePageOriented(doc, spec, { paper: r.paper === 'image' ? 'image' : PAPER[r.paper], dpi: +r.dpi || 200 }); })) toast(`${f.name}: ${w}`); } catch (e: any) { toast(`${f.name}: ${e?.message || e}`); } }
       if (!doc.pageCount) return;
       const name = files.length === 1 ? files[0].name.replace(/\.[^.]+$/, '') : 'Scanned pages';
       const t = openAsNewTab(app, doc.save({ incremental: false }), name);
@@ -189,7 +190,7 @@ def([
       if (!file) return;
       const spec = await imageSpecFromBytes(new Uint8Array(await file.arrayBuffer()), file.type === 'image/jpeg' ? 'jpeg' : undefined);
       const at = Math.max(...targetPages(tab)) + 1;
-      if (editTab(app, tab, 'Scan with Camera', (doc) => { addImagePage(doc, spec, { paper: 'image', dpi: 200, at }); return true; })) tab.ui.goToPage(at);
+      if (editTab(app, tab, 'Scan with Camera', (doc) => { addImagePageOriented(doc, spec, { paper: 'image', dpi: 200, at }); return true; })) tab.ui.goToPage(at);
     },
   },
   {

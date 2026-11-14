@@ -420,7 +420,7 @@ function ensembleSection(app: App, draft: EnsembleSettings, preferMode?: Ensembl
   const update = () => {
     draft.members = ids.filter((id) => boxes.get(id)!.checked).map((id) => (modelSel.get(id)!.value ? { provider: id, model: modelSel.get(id)!.value } : { provider: id }));
     const n = draft.members.length;
-    for (const [id, cb] of boxes) cb.disabled = !cb.checked && n >= MAX_MEMBERS;
+    for (const cb of boxes.values()) cb.disabled = !cb.checked && n >= MAX_MEMBERS;
     for (const [id, sel] of modelSel) sel.disabled = !boxes.get(id)!.checked;
     lastMode = (modeRadios.find((r) => r.checked)?.value as 'master' | 'consensus') || lastMode;
     enable.disabled = n < 2;

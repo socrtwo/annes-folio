@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import JSZip from 'jszip';
 import { PdfDocument } from '../../src/pdf/document';
-import { Dict, Name, PdfStream, PdfString, Ref, bytesOf, latin1 } from '../../src/pdf/objects';
-import { addBlankPage, addTextPage, ensureFont, ensureXObject, imageXObject, makeTextPdf } from '../../src/pdf/build';
+import { Dict, Name, PdfString, bytesOf, latin1 } from '../../src/pdf/objects';
+import { addBlankPage, ensureFont, ensureXObject, imageXObject, makeTextPdf } from '../../src/pdf/build';
 import { flateStream } from '../../src/pdf/filters';
 import { pageAnnotations } from '../../src/pdf/structure';
 import { addNote, exportXfdf } from '../../src/pdf/ops/annots';

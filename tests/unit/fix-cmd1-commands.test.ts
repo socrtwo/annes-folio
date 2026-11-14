@@ -250,8 +250,9 @@ describe('removal commands mark the tab for a rewrite (finding 1, contract C1)',
     ({ app, tab } = marked());
     answers.push((opts: any) => {
       const layers = opts.fields.find((f: any) => f.key === 'hiddenLayers');
+      // The engine now removes hidden layers with their content; the option is pre-ticked only when the file has some.
       expect(layers.value).toBe(false);
-      expect(layers.label).toMatch(/not removed/);
+      expect(layers.label).toMatch(/and their content/);
       return { metadata: true };
     });
     await run('protect.sanitize', app);

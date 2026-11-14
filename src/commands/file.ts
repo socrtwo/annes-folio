@@ -3,7 +3,7 @@ import { def } from './registry';
 import { recoverableDraftKeys, type App, type DocTab } from '../app';
 import { PdfDocument } from '../pdf/document';
 import { PasswordNeeded } from '../pdf/crypt';
-import { FORMATS, formatById, formatFromName, openAsPdf, imageSpecFromBytes } from '../io';
+import { FORMATS, formatById, formatFromName, openAsPdf, imageSpecFromBytes, addImagePageOriented } from '../io';
 import { openDocument, saveAs, writeBack, shareFile, readUri, OPEN_ACCEPT, OPEN_MIMES, isDesktop, readClipboardText } from '../platform/native';
 import { openDialog, toast, confirmDialog, choiceDialog, promptDialog } from '../ui/dialog';
 import { kvGet, kvSet, kvKeys, kvDel } from '../util/store';
@@ -325,9 +325,8 @@ def([
       const image = await clipboardImage();
       if (image) {
         const spec = await imageSpecFromBytes(new Uint8Array(await image.arrayBuffer()), image.type === 'image/jpeg' ? 'jpeg' : undefined);
-        const { addImagePage } = await import('../pdf/build');
         const doc = PdfDocument.create();
-        addImagePage(doc, spec, { paper: 'image' });
+        addImagePageOriented(doc, spec, { paper: 'image' });
         openAsNewTab(app, doc.save({ incremental: false }), 'Clipboard image');
         app.ui.hideBackstage(); return;
       }

@@ -370,10 +370,10 @@ def([
       const tab = app.tab;
       const issues = archivalCheck(tab.doc);
       const m = readMetadata(tab.doc);
-      const r = await openDialog({ title: 'Prepare for Archiving', fields: [{ key: 'i', type: 'info', html: `<p class="ql-help">${issues.length} finding(s) from the archival check. This step cannot embed fonts or add color profiles, so the result is "archival-ready" rather than conforming PDF/A.</p>` }, { key: 'title', label: 'Title', type: 'text', value: m.title || tab.title }, { key: 'lang', label: 'Language', type: 'text', value: m.language || 'en-US' }, { key: 'strip', label: 'Remove scripts and actions, and turn every hidden layer on (layer content is kept, not removed)', type: 'checkbox', value: true }], ok: 'Prepare' });
+      const r = await openDialog({ title: 'Prepare for Archiving', fields: [{ key: 'i', type: 'info', html: `<p class="ql-help">${issues.length} finding(s) from the archival check. This step cannot embed fonts or add color profiles, so the result is "archival-ready" rather than conforming PDF/A.</p>` }, { key: 'title', label: 'Title', type: 'text', value: m.title || tab.title }, { key: 'lang', label: 'Language', type: 'text', value: m.language || 'en-US' }, { key: 'strip', label: 'Remove scripts and actions', type: 'checkbox', value: true }, { key: 'layers', label: 'Remove hidden layers and their content (an archival PDF may not hide content in layers)', type: 'checkbox', value: false }], ok: 'Prepare' });
       if (!r) return;
       if (tab.doc.security) { toast('Remove the security first (Protect ▸ Remove Security).'); return; }
-      editTab(app, tab, 'Prepare for Archiving', (doc) => { writeMetadata(doc, { title: r.title, language: r.lang }); if (r.strip) sanitize(doc, { javascript: true, hiddenLayers: true }); const vp = doc.getDict(doc.catalog, 'ViewerPreferences') || new Dict(); vp.set('DisplayDocTitle', true); doc.catalog.set('ViewerPreferences', vp); doc.update(doc.catalogRef, doc.catalog); });
+      editTab(app, tab, 'Prepare for Archiving', (doc) => { writeMetadata(doc, { title: r.title, language: r.lang }); if (r.strip || r.layers) { tab.mustRewrite = true; sanitize(doc, { javascript: !!r.strip, hiddenLayers: !!r.layers }); } const vp = doc.getDict(doc.catalog, 'ViewerPreferences') || new Dict(); vp.set('DisplayDocTitle', true); doc.catalog.set('ViewerPreferences', vp); doc.update(doc.catalogRef, doc.catalog); });
       app.exec('review.archivalCheck');
     },
   },

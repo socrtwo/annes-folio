@@ -6,10 +6,10 @@ import { fmtNum } from '../pdf/writer';
 import { PdfDocument } from '../pdf/document';
 import { openDialog, toast, confirmDialog } from '../ui/dialog';
 import { pickFile } from '../ui/dom';
-import { PAPER, addBlankPage, addImagePage, addTextPages, imageXObject, ensureXObject, ensureExtGState, type ImageSpec } from '../pdf/build';
+import { PAPER, addBlankPage, addTextPages, imageXObject, ensureXObject, ensureExtGState } from '../pdf/build';
 import { deletePages, movePages, rotatePages, duplicatePages, insertBlankPages, setPageBox, cropPages, scalePages, importPages, extractPages, splitDocument, addOverlayText, addBates, addWatermark, appendContent, setBackgroundColor, nUp, booklet, reversePages, setPageOrder, parseRanges } from '../pdf/ops/pages';
 import { readPageLabels, writePageLabels, readOutlines, type LabelRange } from '../pdf/structure';
-import { openAsPdf, imageSpecFromBytes } from '../io';
+import { openAsPdf, imageSpecFromBytes, eachImageSpec, addImagePageOriented, type ImageSpecEx } from '../io';
 import { readClipboardText } from '../platform/native';
 import { targetPages, askPages, pagesFromRange, normalizeRange, rangeField, compressRange, viewer, viewerOf, pageOf, saveBytes, baseName, zipOf, hexToRgb, FONT_OPTIONS, esc, editTab, guarded, openAsNewTab, clipboardImage, uprightMatrix, type Ctx } from './util';
 
@@ -77,11 +77,12 @@ def([
       if (!files.length) return;
       const r = await openDialog({ title: 'Insert from Images', fields: [{ key: 'paper', label: 'Page size', type: 'select', options: [{ value: 'image', label: 'Fit the page to the picture' }, ...Object.keys(PAPER).map((k) => ({ value: k, label: `${k.toUpperCase()} (picture fitted with margins)` }))], value: 'image', half: true }, { key: 'dpi', label: 'Picture resolution (dpi)', type: 'number', min: 36, max: 1200, value: 150, half: true }], ok: 'Insert' });
       if (!r) return;
-      const specs: ImageSpec[] = [];
-      for (const f of files) { try { specs.push(await imageSpecFromBytes(new Uint8Array(await f.arrayBuffer()), f.type === 'image/jpeg' ? 'jpeg' : undefined)); } catch (e: any) { toast(`${f.name}: ${e?.message || e}`); } }
+      const specs: ImageSpecEx[] = [];
+      // Every page of a multi-page TIFF becomes a page; JPEGs are turned as their EXIF orientation asks.
+      for (const f of files) { try { for (const w of await eachImageSpec(new Uint8Array(await f.arrayBuffer()), f.type === 'image/jpeg' ? 'jpeg' : undefined, (spec) => specs.push(spec))) toast(`${f.name}: ${w}`); } catch (e: any) { toast(`${f.name}: ${e?.message || e}`); } }
       if (!specs.length) return;
       let at = after(tab);
-      editTab(app, tab, 'Insert from Images', (doc) => { for (const s of specs) addImagePage(doc, s, { paper: r.paper === 'image' ? 'image' : PAPER[r.paper], dpi: +r.dpi || 150, at: at++ }); });
+      editTab(app, tab, 'Insert from Images', (doc) => { for (const s of specs) addImagePageOriented(doc, s, { paper: r.paper === 'image' ? 'image' : PAPER[r.paper], dpi: +r.dpi || 150, at: at++ }); });
       tab.ui.goToPage(after(tab));
     },
   },
@@ -92,7 +93,7 @@ def([
       let image = await clipboardImage();
       if (!image && app.clip?.image) image = new Blob([app.clip.image.data as BlobPart], { type: app.clip.image.mime });
       const at = after(tab);
-      if (image) { const spec = await imageSpecFromBytes(new Uint8Array(await image.arrayBuffer()), image.type === 'image/jpeg' ? 'jpeg' : undefined); editTab(app, tab, 'Insert from Clipboard', (doc) => addImagePage(doc, spec, { paper: 'image', at })); tab.ui.goToPage(at); return; }
+      if (image) { const spec = await imageSpecFromBytes(new Uint8Array(await image.arrayBuffer()), image.type === 'image/jpeg' ? 'jpeg' : undefined); editTab(app, tab, 'Insert from Clipboard', (doc) => addImagePageOriented(doc, spec, { paper: 'image', at })); tab.ui.goToPage(at); return; }
       const text = (await readClipboardText()) || app.clip?.text || '';
       if (!text.trim()) { toast('The clipboard has no picture or text.'); return; }
       const p = pageOf(tab, tab.ui.page);

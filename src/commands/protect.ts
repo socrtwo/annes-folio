@@ -328,16 +328,16 @@ def([
         if (r.log) {
           const old = readAttachments(doc).find((a) => a.name === 'redaction-log.txt');
           const prev = old?.stream ? new TextDecoder().decode(doc.decoded(old.stream)) + '\n' : '';
-          const line = `${new Date().toISOString()}\t${author}\t${marks.length} mark(s) applied: ${result.textRemoved} text run(s), ${result.imagesRemoved} image(s), ${result.areas} area(s) on page(s) ${pageList.map((i) => i + 1).join(', ')}`;
+          const line = `${new Date().toISOString()}\t${author}\t${marks.length} mark(s) applied: ${result.textRemoved} text run(s), ${result.imagesRemoved} image(s), ${result.pathsRemoved} drawing(s), ${result.areas} area(s) on page(s) ${pageList.map((i) => i + 1).join(', ')}`;
           if (old) removeAttachment(doc, old);
           addAttachment(doc, 'redaction-log.txt', new TextEncoder().encode(prev + line), { description: 'Anne\'s Folio redaction log', mime: 'text/plain' });
         }
         return result;
       });
       if (!res) return;
-      audit(tab, `Redactions applied: ${res.textRemoved} text run(s), ${res.imagesRemoved} image(s), ${res.areas} area(s)`);
+      audit(tab, `Redactions applied: ${res.textRemoved} text run(s), ${res.imagesRemoved} image(s), ${res.pathsRemoved} drawing(s), ${res.areas} area(s)`);
       tab.ui.selectedAnnot = null;
-      toast(`Redacted: ${res.textRemoved} text run(s) and ${res.imagesRemoved} image(s) removed in ${res.areas} area(s). Save now: the file is rewritten whole, without the removed content.`, { ms: 9000, action: 'Save', onAction: () => { if (app.docs.includes(tab)) { app.activate(tab); app.exec('file.save'); } } });
+      toast(`Redacted: ${res.textRemoved} text run(s), ${res.imagesRemoved} image(s) and ${res.pathsRemoved} drawing(s) removed in ${res.areas} area(s). Save now: the file is rewritten whole, without the removed content.`, { ms: 9000, action: 'Save', onAction: () => { if (app.docs.includes(tab)) { app.activate(tab); app.exec('file.save'); } } });
     },
   },
   {
@@ -370,8 +370,8 @@ def([
         { key: 'metadata', label: 'Document metadata and XMP', on: true }, { key: 'attachments', label: 'Attachments', on: has('attach') }, { key: 'javascript', label: 'JavaScript and script actions', on: true },
         { key: 'comments', label: 'Comments and markup', on: false }, { key: 'forms', label: 'Form fields (flattened into the page)', on: false }, { key: 'links', label: 'Links', on: false },
         { key: 'bookmarks', label: 'Bookmarks', on: false }, { key: 'thumbnails', label: 'Embedded page thumbnails', on: true }, { key: 'privateData', label: 'Private application data', on: true },
-        // Not a removal: it only turns the layers on, so that nothing in them stays unseen.
-        { key: 'hiddenLayers', label: 'Show hidden layers (turns them on; their content is not removed)', on: false },
+        // Removes the layers that are switched off together with what they draw; offered only when the file has some.
+        { key: 'hiddenLayers', label: 'Hidden layers and their content', on: has('hidden layers') },
       ];
       const r = await openDialog({ title: 'Sanitize Document', fields: [...opts.map((o) => ({ key: o.key, label: o.label, type: 'checkbox' as const, value: o.on, half: true })), { key: 'i', type: 'info', html: '<p class="ql-help">After this the document is saved, shared and emailed as a full rewrite, so what was removed is not kept in earlier versions inside the file.</p>' }], ok: 'Remove' });
       if (!r) return;

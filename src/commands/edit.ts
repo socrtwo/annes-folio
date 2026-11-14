@@ -200,7 +200,14 @@ def([
       if (!r || !app.stillOpen(tab, rev)) return;
       const box = { x: +r.x, y: +r.y, w: Math.max(1, +r.w), h: Math.max(1, +r.h) };
       const ok = app.editTab(tab,'Move Image', (doc) => moveImage(doc, pageOf(tab, s.page), s.index, box));
-      if (ok) tab.selection = { ...s, box: [box.x, box.y, box.x + box.w, box.y + box.h] };
+      if (!ok) return;
+      // Moving an image that had no matrix of its own inserts operators, so its place in the content changes: look it up again by where it now is.
+      const nb: Rect = [box.x, box.y, box.x + box.w, box.y + box.h];
+      const pg = pageOf(tab, s.page);
+      const now = analyzeContent(tab.doc, parseContent(tab.doc.pageContent(pg)), pg.resources).images;
+      const near = (i: { box: Rect }) => Math.abs(i.box[0] - nb[0]) + Math.abs(i.box[1] - nb[1]) + Math.abs(i.box[2] - nb[2]) + Math.abs(i.box[3] - nb[3]);
+      const hit = now.sort((a, b2) => near(a) - near(b2))[0];
+      tab.selection = hit && near(hit) < 2 ? { ...s, index: hit.opIndex, box: nb } : null;
     },
   },
   { id: 'edit.deleteImage', label: 'Delete Image', icon: 'hide_image', tab: 'Edit', group: 'Images', isEnabled: imageSel, run: (app) => { const s = app.tab.selection!; const p = pageOf(app, s.page); if (app.edit('Delete Image', (doc) => deleteImage(doc, p, s.index))) app.tab.selection = null; } },
