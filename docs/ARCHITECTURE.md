@@ -5,9 +5,11 @@ src/
   main.ts            entry: fonts, commands, App, Shell, launch files, drafts, service worker
   app.ts             App (prefs, tabs, exec, keys, autosave) and DocTab (engine document + bytes, undo snapshots)
   prefs.ts           preferences (localStorage key quillfolio.prefs.v1), Quick Access Bar choices
+  csp.ts             Content-Security-Policy inserted at startup on the web and Capacitor builds
   commands/          one module per tab; registry.ts is the command registry; util.ts shared helpers
     file.ts edit.ts nav.ts home.ts view.ts comment.ts forms.ts protect.ts sign.ts organize.ts
     scan.ts review.ts tools.ts ai.ts dev.ts help.ts
+    ocrlayer.ts      the recognized-text layer (placement, Unicode font, corrections) and scan image math
   pdf/               the engine (document of record)
     objects.ts       Name, Ref, PdfString (PDFDocEncoding/UTF-16), Dict, PdfStream, dates, helpers
     lexer.ts         tokens, object parser, streams with /Length recovery
@@ -24,6 +26,8 @@ src/
     ops/pages.ts     reorder, delete, move, rotate, duplicate, insert, boxes, crop, scale, import/extract/split,
                      overlays (headers, Bates, watermark, background, image), N-up, booklet
     ops/annots.ts    annotations with generated appearance streams, replies, flatten, redaction, XFDF
+    ops/redact.ts    content redaction (glyphs, images, vector paths, Form XObjects), hidden-layer removal
+    ops/shared.ts    helpers shared by the operations (page-private resources, field and destination clean-up)
     ops/forms.ts     field values and appearances, add/delete/props, orders, flatten, XFDF/FDF/CSV/JSON, detection
     ops/textedit.ts  text runs, replace in place or overlay, erase, insert text and images, move/delete images
     ops/optimize.ts  images, fonts, statistics, hidden information, sanitize, archival and accessibility checks
@@ -32,6 +36,7 @@ src/
   view/
     pdfjs.ts         pdf.js (legacy build, bundled worker, CMaps/fonts/wasm copied to public/pdfjs)
     viewer.ts        the TabView: pages, text layer, overlay, tools and gestures, search, thumbnails, grid
+    viewutil.ts      pure helpers for the viewer: rotation, zoom steps, bitmap budget, page search, reload coalescing
   io/                formats table, sniffing, openAsPdf (PDF, images, text, ZIP, review packages), TIFF decoder
     recover/         file identification, ZIP salvage, ImmortalInflate (shared with the suite)
   ui/                shell, ribbon layout, backstage, panes, dialogs, customize, recovery report, wizards
@@ -42,7 +47,8 @@ src/
   export/print.ts    printing through rendered pages
 electron/            desktop main and preload (app:// origin, file grants, permission and content policy)
 android/, ios/       Capacitor projects (native plugin for files, print, share on Android)
-scripts/             catalog generation, icons, notices, pdf.js and tesseract asset copying, desktop packaging
+scripts/             catalog generation, icons, notices, pdf.js and tesseract asset copying, desktop packaging,
+                     the service worker's precache list (gen-sw-precache.mjs, run after every build)
 tests/unit           engine, operations, repair, registry/catalog tests (vitest)
 tests/e2e/smoke.mjs  Playwright smoke test against the build
 ```
@@ -53,7 +59,21 @@ A tab holds a `PdfDocument` (the engine's object graph) and `bytes`, the PDF the
 
 ## Undo
 
-`DocTab.edit(label, fn)` snapshots the engine overlay (the map of changed objects, the trailer and the next object number), runs `fn`, and pushes the snapshot. Undo and redo swap snapshots, clear caches and re-render. Commands call `app.edit(...)`, which also refuses when the tab is read-only.
+`DocTab.edit(label, fn)` snapshots the engine overlay (the map of changed objects, the trailer and the next object number), runs `fn`, and pushes the snapshot. Undo and redo swap snapshots, clear caches and re-render. Commands call `app.edit(...)`, or `app.editTab(tab, ...)` after an `await` so the change goes to the tab the command started on; both refuse when the tab is read-only.
+
+- Snapshots share stream bytes with the live overlay instead of copying them, and the history is capped by the stream bytes only it still holds.
+- Undo never lowers the next object number, so a reference kept from before an undo can only resolve to nothing, never to a different object.
+- An edit that returns `NO_CHANGE` leaves no undo step and does not mark the tab dirty.
+- The history survives an incremental save: after the save the snapshots are re-expressed against the new file. After a full rewrite, encryption or revert the history starts again and the user is told once.
+- Image XObjects are created inside the edit that places them, so a cancelled or undone placement leaves nothing in the file.
+
+## Read-only documents
+
+`App.exec` refuses every command that is not marked `edits: false` while the tab is read-only; viewing, navigation, export and settings commands carry that mark. `DocTab.edit` and `replaceWithBytes` check again, so a command that reaches them some other way is still refused.
+
+## Viewer
+
+One pdf.js worker is shared by all tabs. Reload requests made while a load is running are folded into one trailing load. Pages far from the viewport release their bitmap and text layer, and a page bitmap is capped (16 megapixels on touch devices, 48 elsewhere) with CSS stretching the rest. Every viewport combines the page's own `/Rotate` with the view rotation. HTML that reaches a dialog through `Field.html` is rebuilt from an allow-list (`util/sanitize.ts`), so text from a document cannot become markup that runs.
 
 ## Commands and gestures
 

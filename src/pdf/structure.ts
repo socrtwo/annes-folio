@@ -335,12 +335,14 @@ export function readLayers(doc: PdfDocument): Layer[] {
   const oc = doc.getDict(doc.catalog, 'OCProperties');
   if (!oc) return [];
   const d = doc.getDict(oc, 'D');
-  const off = new Set((d ? doc.getArray(d, 'OFF') || [] : []).filter((x): x is Ref => x instanceof Ref).map((r) => r.num));
+  const nums = (key: string) => new Set((d ? doc.getArray(d, key) || [] : []).filter((x): x is Ref => x instanceof Ref).map((r) => r.num));
+  // /BaseState /OFF turns every layer off unless /ON lists it; otherwise every layer is on unless /OFF lists it.
+  const off = nums('OFF'), on = nums('ON'), baseOff = !!d && doc.getName(d, 'BaseState') === 'OFF';
   const out: Layer[] = [];
   for (const r of doc.getArray(oc, 'OCGs') || []) {
     if (!(r instanceof Ref)) continue;
     const g = doc.resolve<Dict | null>(r);
-    if (g instanceof Dict) out.push({ name: doc.getText(g, 'Name') || `Layer ${r.num}`, ref: r, on: !off.has(r.num) });
+    if (g instanceof Dict) out.push({ name: doc.getText(g, 'Name') || `Layer ${r.num}`, ref: r, on: baseOff ? on.has(r.num) : !off.has(r.num) });
   }
   return out;
 }
@@ -350,12 +352,16 @@ export function setLayerVisible(doc: PdfDocument, layer: Layer, on: boolean): vo
   if (!oc) return;
   let d = doc.getDict(oc, 'D');
   if (!d) { d = new Dict(); oc.set('D', d); }
-  const off = (doc.getArray(d, 'OFF') || []).filter((x) => !(x instanceof Ref && x.num === layer.ref.num));
-  if (!on) off.push(layer.ref);
+  // The layer is taken out of both lists and put back in the one that says what is wanted: /OFF when
+  // layers are on by default, /ON when the base state is /OFF. (Left in the other list it would be
+  // switched back, since /ON and /OFF are applied after the base state.)
+  const baseOff = doc.getName(d, 'BaseState') === 'OFF';
+  const others = (key: string) => (doc.getArray(d!, key) || []).filter((x) => !(x instanceof Ref && x.num === layer.ref.num));
+  const off = others('OFF'), onList = others('ON');
+  if (!on && !baseOff) off.push(layer.ref);
+  if (on && baseOff) onList.push(layer.ref);
   d.set('OFF', off);
-  // A layer listed in /ON would be switched back on after /OFF is applied.
-  const onList = doc.getArray(d, 'ON');
-  if (!on && onList?.some((x) => x instanceof Ref && x.num === layer.ref.num)) d.set('ON', onList.filter((x) => !(x instanceof Ref && x.num === layer.ref.num)));
+  if (d.has('ON') || onList.length) d.set('ON', onList);
   // Mark whichever objects hold what was changed: /D and /OCProperties may each be their own object.
   const dRef = oc.get('D'), ocRef = doc.catalog.get('OCProperties');
   if (dRef instanceof Ref) doc.touch(dRef);

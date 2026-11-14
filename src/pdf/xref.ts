@@ -3,7 +3,7 @@
  * bytes of a damaged file.
  */
 import { Dict, PdfObj, PdfStream, Ref, isName, latin1 } from './objects';
-import { Lexer, Parser, isRegular, isWhite } from './lexer';
+import { Lexer, Parser, isWhite } from './lexer';
 import { decodeStream } from './filters';
 
 export interface XrefEntry { offset: number; gen: number; /** 1 = in file, 2 = in an object stream (offset = stream object number, idx = index). */ type: 1 | 2; idx?: number }
@@ -164,7 +164,8 @@ export function scanObjectHeaders(buf: Uint8Array): ObjectHeader[] {
     const at = Lexer.find(buf, 'obj', from);
     if (at < 0) break;
     from = at + 3;
-    if (at + 3 < buf.length && isRegular(buf[at + 3])) continue;
+    const after = at + 3 < buf.length ? buf[at + 3] : 32;
+    if (digit(after) || (after >= 0x41 && after <= 0x5a) || (after >= 0x61 && after <= 0x7a) || after === 0x5f) continue; // "objx", "object"
     let p = at - 1;
     if (p < 0 || !isWhite(buf[p])) continue; // also rules out "endobj"
     while (p >= 0 && isWhite(buf[p])) p--;

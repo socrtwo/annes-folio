@@ -428,15 +428,28 @@ export class PdfDocument {
     if (p.ref) this.touch(p.ref);
   }
 
-  /** Resources dictionary of a page, created (and made direct on the page) when missing. */
+  /**
+   * The page's own /Resources dictionary, ready to be changed. A page whose resources are a separate
+   * object, or come down from the page tree, gets a copy of them first (with a copy of each category
+   * dictionary inside, such as /Font): those may be shared with other pages, which must not change, and
+   * an empty dictionary in their place would cut the page off from the fonts and images it already uses.
+   */
   pageResources(p: PageInfo): Dict {
-    let res = this.getDict(p.dict, 'Resources');
-    if (!res) { res = new Dict(); p.dict.set('Resources', res); }
-    else if (!(p.dict.get('Resources') instanceof Dict)) {
-      // Inherited or indirect: copy so that changes affect this page only.
-      const own = res.clone();
-      p.dict.set('Resources', own);
-      res = own;
+    const own = p.dict.get('Resources');
+    let res: Dict;
+    if (own instanceof Dict) res = own;
+    else {
+      let from = own !== undefined ? dictOf(this.resolve(own)) : null;
+      // Not on the page: the nearest ancestor in the page tree that has one.
+      const seen = new Set<Dict>([p.dict]);
+      for (let node = own === undefined ? dictOf(this.resolve(p.dict.get('Parent'))) : null; node && !from && !seen.has(node); node = dictOf(this.resolve(node.get('Parent')))) {
+        seen.add(node);
+        if (node.has('Resources')) from = dictOf(this.resolve(node.get('Resources')));
+      }
+      res = from ? from.clone() : new Dict();
+      for (const [k, v] of res.map) if (v instanceof Dict) res.set(k, v.clone());
+      p.dict.set('Resources', res);
+      p.resources = res;
     }
     if (p.ref) this.touch(p.ref);
     return res;

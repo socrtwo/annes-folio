@@ -16,8 +16,8 @@ The approach descends from the author's recovery tools: [Immortal Zip](https://s
 | **Cross-reference rebuild** | Scans the whole file for `N G obj`, trailers and `/Type /Catalog`; when no catalog resolves, collects loose `/Type /Page` objects in file order and synthesizes a page tree | `success` when pages are reachable |
 | **Trailer and catalog** | Picks the trailer whose `/Root` resolves to a catalog with a usable `/Pages` | `partial` when the catalog was synthesized |
 | **Content streams** | Decodes every page's content; damaged Flate streams keep their readable prefix (ImmortalInflate); wrong `/Length` values are recovered by searching for `endstream` | `partial` when some were damaged |
-| **Segments** | A PDF fused with other data (a mail message, a Word document, another PDF): each PDF segment is tried on its own | `partial` when a segment was better than the whole |
-| **ZIP** | A PDF inside a damaged ZIP (portfolio, archive): byte-level salvage of the entries | `partial` when one was found |
+| **Segments** | A PDF fused with other data (a mail message, a Word document, another PDF): each PDF segment is tried on its own. JPEG, PNG or ZIP signatures inside a PDF's own streams do not count as separate pieces | `partial` when a segment was better than the whole |
+| **ZIP** | A PDF inside a damaged ZIP (portfolio, archive): byte-level salvage of the PDF entries only, with a cap on the total decoded size | `partial` when one was found |
 | **Attachments** | Embedded files that survive are kept with the document | |
 | **Text scan** | When no usable structure survives: text found in decoded streams, rebuilt as a text-only PDF | `partial`; the document is marked *text only* |
 | **Strings scan** | Last resort: loose readable strings as a text-only PDF | `partial` |

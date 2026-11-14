@@ -27,6 +27,67 @@ describe('changes reached through a reference are written (finding 7)', () => {
   });
 });
 
+describe('layers and /BaseState (reported by OPS)', () => {
+  const load = (d: string) => PdfDocument.load(rawPdf(onePage({ 4: '<< /Type /OCG /Name (A) >>', 5: '<< /Type /OCG /Name (B) >>' }, '', `/OCProperties << /OCGs [4 0 R 5 0 R] /D ${d} >>`), '/Root 1 0 R'));
+  const state = (doc: PdfDocument) => readLayers(doc).map((l) => `${l.name}:${l.on ? 'on' : 'off'}`).join(' ');
+  const list = (doc: PdfDocument, key: string) => (doc.getArray(doc.getDict(doc.getDict(doc.catalog, 'OCProperties'), 'D'), key) || []).map((r) => (r as Ref).num);
+  it('with /BaseState /OFF a layer is on only when /ON lists it', () => {
+    const doc = load('<< /BaseState /OFF /ON [5 0 R] >>');
+    expect(state(doc)).toBe('A:off B:on');
+    setLayerVisible(doc, readLayers(doc)[0], true);
+    setLayerVisible(doc, readLayers(doc)[1], false);
+    expect(state(doc)).toBe('A:on B:off');
+    expect(list(doc, 'ON')).toEqual([4]);
+    const back = PdfDocument.load(doc.save({ incremental: true }));
+    expect(state(back)).toBe('A:on B:off');
+  });
+  it('with the default base state a layer is off only when /OFF lists it', () => {
+    const doc = load('<< /OFF [4 0 R] >>');
+    expect(state(doc)).toBe('A:off B:on');
+    setLayerVisible(doc, readLayers(doc)[0], true);
+    setLayerVisible(doc, readLayers(doc)[1], false);
+    expect(state(doc)).toBe('A:on B:off');
+    expect(list(doc, 'OFF')).toEqual([5]);
+    expect(doc.getDict(doc.getDict(doc.catalog, 'OCProperties'), 'D')!.has('ON')).toBe(false);
+    expect(state(PdfDocument.load(doc.save({ incremental: true })))).toBe('A:on B:off');
+  });
+});
+
+describe('page resources that are inherited or shared (reported by OPS)', () => {
+  const font = (name: string) => `<< /Type /Font /Subtype /Type1 /BaseFont /${name} /Encoding /WinAnsiEncoding >>`;
+  it('a page that inherits /Resources keeps what it inherited when a font is added', () => {
+    const objs = {
+      1: '<< /Type /Catalog /Pages 2 0 R >>', 2: '<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> /XObject 7 0 R >> >>',
+      3: '<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>', 4: '<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>',
+      5: font('Helvetica'), 6: stream('', 'BT /F1 12 Tf 72 700 Td (kept) Tj ET'), 7: '<< >>',
+    };
+    const doc = PdfDocument.load(rawPdf(objs, '/Root 1 0 R'));
+    const name = ensureFont(doc, doc.pages[0], 'Times-Bold');
+    for (const d of [doc, PdfDocument.load(doc.save({ incremental: true })), PdfDocument.load(doc.save({ incremental: false }))]) {
+      const mine = d.getDict(d.pages[0].resources, 'Font')!;
+      expect(d.getName(d.getDict(mine, 'F1'), 'BaseFont')).toBe('Helvetica');
+      expect(d.getName(d.getDict(mine, name), 'BaseFont')).toBe('Times-Bold');
+      expect(d.pages[0].dict.get('Resources')).toBeInstanceOf(Dict);
+      expect(d.pages[0].resources!.has('XObject')).toBe(true);
+      // the sibling still inherits, and what it inherits was not touched
+      expect(d.pages[1].dict.has('Resources')).toBe(false);
+      expect(d.getDict(d.pages[1].resources, 'Font')!.keys()).toEqual(['F1']);
+    }
+  });
+  it('a page whose /Resources is a shared object gets its own copy', () => {
+    const objs = {
+      1: '<< /Type /Catalog /Pages 2 0 R >>', 2: '<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 612 792] >>',
+      3: '<< /Type /Page /Parent 2 0 R /Resources 8 0 R >>', 4: '<< /Type /Page /Parent 2 0 R /Resources 8 0 R >>',
+      5: font('Helvetica'), 8: '<< /Font << /F1 5 0 R >> >>',
+    };
+    const doc = PdfDocument.load(rawPdf(objs, '/Root 1 0 R'));
+    const name = ensureFont(doc, doc.pages[0], 'Courier');
+    expect(doc.getDict(doc.pages[0].resources, 'Font')!.keys().sort()).toEqual(['F1', name].sort());
+    expect(doc.getDict(doc.pages[1].resources, 'Font')!.keys()).toEqual(['F1']);
+    expect(doc.getDict(doc.resolve<Dict>(new Ref(8, 0)), 'Font')!.keys()).toEqual(['F1']);
+  });
+});
+
 describe('attachments and name trees (lower-priority list)', () => {
   it('writes the MIME type as the name itself, escaped once', () => {
     const doc = PdfDocument.load(makeTextPdf(['x']));
