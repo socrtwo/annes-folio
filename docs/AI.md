@@ -39,7 +39,7 @@ Every command sends only the text it needs, shows the answer for review, and app
 
 **Write:** Translate (`ai.translate`), Rewrite Comment and Draft Reply (`ai.rewriteComment`, `ai.replyComment`, on the selected annotation), Clean OCR Text (`ai.cleanOcr`, corrections to the recognized text layer of the current page, applied word by word), Alt Text for Images (`ai.altText`, the page's pictures are sent to a vision-capable provider; the text is stored on each image object).
 
-**Review:** Suggest Redactions (`ai.suggestRedactions`, patterns plus the AI's reading, merged into a checklist that marks the pages), Describe Page (`ai.describePage`), Suggest Bookmarks (`ai.suggestBookmarks`).
+**Review:** Suggest Redactions (`ai.suggestRedactions`: patterns run on every page, and the AI reads the whole text in several requests; above four requests you choose all of it, the beginning, or patterns only. The results are merged into a checklist that marks the pages, and the dialog says which pages were read), Describe Page (`ai.describePage`), Suggest Bookmarks (`ai.suggestBookmarks`).
 
 **More:** AI Assistant (`ai.assistant`, a conversation with the document text sent once), Prompt Library (`ai.prompts`, your own prompts on the selection, the page or the document).
 

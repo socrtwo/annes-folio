@@ -286,7 +286,7 @@ Fill & Sign (drawn, typed or picture signatures, initials, date, check marks), s
 - `sign.manageSignatures` — Saved Signatures…
 - `sign.requestSignatures` — Request Signatures…
 - `sign.signature` — Sign
-- `sign.verify` — Verify Signatures
+- `sign.verify` — Signature Details (what a signature claims and covers; certificates are not validated)
 
 Planned, not yet implemented:
 

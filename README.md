@@ -6,7 +6,7 @@ An original, open-source PDF app for Android, iOS, Windows, macOS, Linux, Chrome
 
 > **Status: first working version (0.1.0, milestone M1 with much of M2 and M3).** The app builds for the web, Android, iOS and desktop with the same CI and release workflows as the sister apps. What works today:
 >
-> - **354 commands**; 359 of the 379 ids in the plan are implemented, and the rest are listed in [docs/COMMANDS.md](docs/COMMANDS.md). A command is registered only when it works.
+> - **355 commands**; 359 of the 379 ids in the plan are implemented, and the rest are listed in [docs/COMMANDS.md](docs/COMMANDS.md). A command is registered only when it works.
 > - **Engine:** a clean-room ISO 32000 object model with a tolerant parser, every standard filter except the image codecs, cross-reference tables and streams, object streams, RC4 and AES decryption, AES-256 encryption, incremental updates and full rewrites, and a reconstruction path for damaged files. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 > - **Viewing:** continuous, single, facing and book layouts, zoom and fit modes, rotation, thumbnails with drag reordering, an Organize Pages grid, search with highlights, text selection, read, presentation and full-screen modes, night mode and grayscale, side-by-side windows, panes for bookmarks, attachments, layers, comments, signatures, fields, search and a structure inspector.
 > - **Commenting:** highlight, underline, strikeout, squiggly, notes with replies and status, text boxes and callouts, pen, highlighter, shapes and clouds, stamps (text and picture), file and audio attachments, measurements with a drawing scale, properties, flatten, XFDF in and out.

@@ -1,8 +1,8 @@
 # Anne's Folio Command Reference
 
-Anne's Folio ships **354 commands**. Every one can be placed on the Quick Access Bar, added to a custom tab, bound to a keyboard shortcut, recorded in a macro, or found with command search (Alt+Q).
+Anne's Folio ships **355 commands**. Every one can be placed on the Quick Access Bar, added to a custom tab, bound to a keyboard shortcut, recorded in a macro, or found with command search (Alt+Q).
 
-78 of them are "Commands Not in the Tabs" — reachable through the Quick Access Bar chooser, Customize Tabs, the command search, or menus — so nothing the app can do is hidden.
+77 of them are "Commands Not in the Tabs" — reachable through the Quick Access Bar chooser, Customize Tabs, the command search, or menus — so nothing the app can do is hidden.
 
 Of the 379 command ids named in [COMMANDS-PLAN.md](COMMANDS-PLAN.md), 359 are implemented and 20 are not yet; they are listed at the end of this file.
 
@@ -70,7 +70,7 @@ This file is generated from the source by `npm run catalog`; a unit test fails w
 | Save | Save | Ctrl+s, Shift+F12 | `file.save` | not in tabs |
 | Save a Copy… | Save |  | `file.saveCopy` | not in tabs |
 | Save All | Save |  | `file.saveAll` | not in tabs |
-| Save As | Save | F12 | `file.saveAs` | not in tabs |
+| Save As | Save | F12, Ctrl+Shift+s | `file.saveAs` | not in tabs |
 | Save As Rewritten PDF | Save |  | `file.saveRewrite` | not in tabs |
 | Save Flattened Copy | Save |  | `file.saveFlat` | not in tabs |
 | Save Review Package (.qfr) | Save |  | `file.saveReviewPackage` | not in tabs |
@@ -103,7 +103,7 @@ This file is generated from the source by `npm run catalog`; a unit test fails w
 | Select | Tools | Escape, v | `home.select` |  |
 | Snapshot | Tools |  | `home.snapshot` |  |
 | Redo | Undo | Ctrl+y, Ctrl+Shift+z | `edit.redo` |  |
-| Repeat Last Command | Undo | F4, Ctrl+Shift+y | `edit.repeat` | not in tabs |
+| Repeat Last Command | Undo | Ctrl+Shift+y | `edit.repeat` | not in tabs |
 | Undo | Undo | Ctrl+z | `edit.undo` |  |
 
 ## Edit (10)
@@ -284,10 +284,10 @@ This file is generated from the source by `npm run catalog`; a unit test fails w
 | Date | Fill & Sign |  | `sign.dateStamp` |  |
 | Initials | Fill & Sign |  | `sign.initials` |  |
 | Saved Signatures… | Fill & Sign |  | `sign.manageSignatures` |  |
-| Sign | Fill & Sign | Ctrl+Shift+s | `sign.signature` |  |
+| Sign | Fill & Sign | Ctrl+Alt+g | `sign.signature` |  |
 | Clear Signature Field | Signature Fields |  | `sign.clearSignatureField` | not in tabs |
 | Request Signatures… | Signature Fields |  | `sign.requestSignatures` |  |
-| Verify Signatures | Signature Fields |  | `sign.verify` |  |
+| Signature Details | Signature Fields |  | `sign.verify` |  |
 
 ## Organize Pages (35)
 
@@ -429,16 +429,17 @@ This file is generated from the source by `npm run catalog`; a unit test fails w
 | Rewrite Comment | Write |  | `ai.rewriteComment` |  |
 | Translate | Write |  | `ai.translate` |  |
 
-## Developer (9)
+## Developer (10)
 
 | Command | Group | Shortcut | ID | Notes |
 |---|---|---|---|---|
 | Macro Editor | Code |  | `dev.macroEditor` |  |
 | Macro Security | Code |  | `dev.macroSecurity` |  |
 | Macros | Code | Alt+F8 | `dev.macros` |  |
+| Pause Recording | Code |  | `dev.pauseRecording` |  |
 | Record Macro | Code |  | `dev.recordMacro` |  |
 | Scripts in This Document | Code |  | `dev.javaScriptInfo` |  |
-| Stop Recording | Code |  | `dev.stopRecording` | not in tabs |
+| Stop Recording | Code |  | `dev.stopRecording` |  |
 | Export Structure JSON | Data |  | `dev.exportStructure` |  |
 | Raw Object… | Data |  | `dev.rawObject` |  |
 | Tag Structure | Data |  | `dev.tags` |  |
