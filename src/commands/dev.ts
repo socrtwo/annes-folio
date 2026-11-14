@@ -5,7 +5,7 @@ import type { Macro } from '../prefs';
 import { getCommand } from './registry';
 import { openDialog, toast, confirmDialog, promptDialog } from '../ui/dialog';
 import { h } from '../ui/dom';
-import { Dict, PdfStream, Ref, Name, PdfString, type PdfObj } from '../pdf/objects';
+import { Dict, PdfStream, Ref, Name, PdfString, nameText, type PdfObj } from '../pdf/objects';
 import { serialize } from '../pdf/writer';
 import { saveBytes, baseName } from './util';
 
@@ -69,7 +69,7 @@ function stepsLabel(m: Macro): string {
 /** A JSON-friendly dump of an object graph (depth-limited; streams as summaries). */
 export function toJsonish(doc: App['doc'], o: PdfObj, depth: number, seen = new Set<number>()): unknown {
   if (o instanceof Ref) { if (depth <= 0 || seen.has(o.num)) return `${o.num} ${o.gen} R`; seen.add(o.num); return { $ref: `${o.num} ${o.gen} R`, value: toJsonish(doc, doc.fetch(o), depth - 1, seen) }; }
-  if (o instanceof Name) return `/${o.name}`;
+  if (o instanceof Name) return `/${nameText(o.name)}`;
   if (o instanceof PdfString) return o.toText();
   if (o instanceof PdfStream) return { $stream: o.raw.length, dict: toJsonish(doc, o.dict, depth, seen) };
   if (o instanceof Dict) { const out: Record<string, unknown> = {}; for (const k of o.keys()) out[k] = depth > 0 ? toJsonish(doc, o.get(k)!, depth - 1, seen) : String(o.get(k)); return out; }

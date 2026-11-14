@@ -13,12 +13,15 @@ src/
   pdf/               the engine (document of record)
     objects.ts       Name, Ref, PdfString (PDFDocEncoding/UTF-16), Dict, PdfStream, dates, helpers
     lexer.ts         tokens, object parser, streams with /Length recovery
-    filters.ts       Flate (own inflate with damage tolerance, own deflate), LZW, ASCIIHex, ASCII85, RunLength, predictors
-    hash.ts          MD5, SHA-256/384/512, RC4, AES (pure JS, synchronous)
+    filters.ts       Flate (own inflate with damage tolerance; deflate with dynamic, fixed or stored blocks), LZW, ASCIIHex,
+                     ASCII85, RunLength, PNG and TIFF predictors at every bit depth
+    hash.ts          MD5, SHA-256/384/512, RC4, table-driven AES (pure JS, synchronous, no BigInt)
     crypt.ts         standard security handler: RC4 40/128, AES-128, AES-256 (R2–R6); AES-256 creation
-    xref.ts          tables, xref streams, /Prev chains, hybrid files, object streams; reconstruction by scanning
+    xref.ts          tables, xref streams, /Prev chains, free entries, hybrid files, object streams; reconstruction by
+                     scanning in three passes (objects, security, object streams)
     document.ts      PdfDocument: load/create, resolve, overlay of changed objects, page tree, content, save
-    writer.ts        serialization, full rewrite (renumber, object streams, encrypt), incremental update
+    writer.ts        serialization, full rewrite (renumber, object streams, encrypt), incremental update; raises the
+                     header version to what the file uses
     content.ts       content-stream parser/serializer, matrices, fonts and encodings, text runs and image boxes
     stdfonts.ts      metrics of the standard 14 fonts, WinAnsi, wrapping
     build.ts         blank, text and image pages; fonts, XObjects, ExtGStates in resources
@@ -55,7 +58,7 @@ tests/e2e/smoke.mjs  Playwright smoke test against the build
 
 ## Document of record and rendering
 
-A tab holds a `PdfDocument` (the engine's object graph) and `bytes`, the PDF the viewer renders. After every edit the tab regenerates `bytes` with an incremental update and pdf.js reloads it. Two cases rewrite the whole file instead: the save preference "rewrite" (not for an encrypted document, whose edits are always appended as an incremental update), and any edit after a command that removed content (applying redactions, sanitizing), so that the removed bytes do not stay in the file. pdf.js never writes; it only rasterizes and extracts text. Saving writes the same bytes to disk and reloads the document from them, so the next save is again a small incremental update.
+A tab holds a `PdfDocument` (the engine's object graph) and `bytes`, the PDF the viewer renders. After every edit the tab regenerates `bytes` with an incremental update and pdf.js reloads it. Two cases rewrite the whole file instead: the save preference "rewrite" (not for an encrypted document, whose edits are always appended as an incremental update), and any edit after a command that removed content (applying redactions, sanitizing), so that the removed bytes do not stay in the file. pdf.js never writes; it only rasterizes and extracts text. Saving writes the same bytes to disk and reloads the document from them, so the next save is again a small incremental update. A document that had to be rebuilt on opening (damaged cross-reference data) is always written in full.
 
 ## Undo
 

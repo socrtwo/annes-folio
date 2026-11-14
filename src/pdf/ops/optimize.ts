@@ -5,7 +5,7 @@
  * conformance. Unused-object removal and stream recompression are the writer's full rewrite
  * (src/pdf/writer.ts); image downsampling is in src/commands/tools.ts.
  */
-import { Dict, Name, PdfObj, PdfStream, PdfString, Ref, isName, nameObj } from '../objects';
+import { Dict, Name, PdfObj, PdfStream, PdfString, Ref, isName, nameObj, nameText } from '../objects';
 import { PdfDocument } from '../document';
 import { readAttachments, readLayers, readMetadata, pageAnnotations, readFields, readOutlines, removeAnnotation } from '../structure';
 import { IMAGE_FILTERS } from '../filters';
@@ -64,7 +64,7 @@ export function listFonts(doc: PdfDocument): FontUse[] {
       const enc = doc.get(f, 'Encoding');
       const cur = map.get(key);
       if (cur) { if (!cur.pages.includes(page)) cur.pages.push(page); continue; }
-      map.set(key, { name: base, subtype: sub, embedded: !!fd && (fd.has('FontFile') || fd.has('FontFile2') || fd.has('FontFile3')), encoding: isName(enc) ? enc.name : enc instanceof Dict ? 'Custom' : enc instanceof PdfStream ? 'CMap' : '', pages: [page], ref: ref instanceof Ref ? ref : null, type3: sub === 'Type3' });
+      map.set(key, { name: nameText(base), subtype: sub, embedded: !!fd && (fd.has('FontFile') || fd.has('FontFile2') || fd.has('FontFile3')), encoding: isName(enc) ? enc.name : enc instanceof Dict ? 'Custom' : enc instanceof PdfStream ? 'CMap' : '', pages: [page], ref: ref instanceof Ref ? ref : null, type3: sub === 'Type3' });
     }
     const xo = doc.getDict(res, 'XObject');
     if (xo) for (const k of xo.keys()) { const s = doc.resolve<PdfStream | null>(xo.get(k)); if (s instanceof PdfStream && doc.getName(s, 'Subtype') === 'Form') walk(doc.getDict(s, 'Resources'), page, depth + 1); }

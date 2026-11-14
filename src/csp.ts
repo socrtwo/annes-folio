@@ -42,7 +42,8 @@ export function shouldApplyCsp(userAgent: string, isElectron: boolean): boolean 
   // Every browser on iOS and iPadOS uses the system WebKit, whatever its name.
   const ios = num(/\b(?:iPhone|iPad|iPod)\b.*?\bOS (\d+)[_.]/);
   if (!Number.isNaN(ios)) return ios >= 16;
-  const chromium = num(/\b(?:Chrome|Chromium)\/(\d+)/);
+  // HeadlessChrome is what automated browsers report: it is included so the tests run under the policy too.
+  const chromium = num(/\b(?:Headless)?(?:Chrome|Chromium)\/(\d+)/);
   if (!Number.isNaN(chromium)) return chromium >= 97;
   const firefox = num(/\bFirefox\/(\d+)/);
   if (!Number.isNaN(firefox)) return firefox >= 102;

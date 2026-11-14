@@ -8,7 +8,7 @@ import { h, icon, clear, download } from './dom';
 import { toast, confirmDialog, promptDialog, openDialog } from './dialog';
 import { kvKeys, kvGet, kvDel } from '../util/store';
 import { readOutlines, readAttachments, readLayers, setLayerVisible, pageAnnotations, readFields, readSignatures, allAnnotations, removeAttachment, type OutlineItem, type AnnotInfo } from '../pdf/structure';
-import { Dict, PdfStream, PdfString, Ref, Name, PdfObj, isName } from '../pdf/objects';
+import { Dict, PdfStream, PdfString, Ref, Name, PdfObj, isName, nameText } from '../pdf/objects';
 import { serialize } from '../pdf/writer';
 import type { CheckItem } from '../pdf/ops/optimize';
 import { PdfDocument, PasswordNeeded } from '../pdf/document';
@@ -251,7 +251,7 @@ function objSummary(o: PdfObj): string {
   if (Array.isArray(o)) return `[ ${o.length} items ]`;
   if (o instanceof PdfString) return JSON.stringify(o.toText().slice(0, 60));
   if (o instanceof Ref) return o.toString();
-  if (o instanceof Name) return '/' + o.name;
+  if (o instanceof Name) return '/' + nameText(o.name);
   return String(o);
 }
 

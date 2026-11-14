@@ -1,4 +1,5 @@
 /** Edit tab: undo/redo, clipboard, find, page content editing (text runs and images). */
+import { nameText } from '../pdf/objects';
 import { def } from './registry';
 import type { App, DocTab } from '../app';
 import { openDialog, toast, confirmDialog } from '../ui/dialog';
@@ -32,7 +33,7 @@ async function editRun(app: App, tab: DocTab, page: number, index: number): Prom
   const r = await openDialog({ title: 'Edit Text', fields: [
     { key: 't', label: 'Text', type: 'textarea', rows: 3, value: run.text, autofocus: true },
     // The font name comes from the file: it is text, never markup.
-    { key: 'i', type: 'info', html: `<p class="ql-help">Font ${esc(run.font)}, ${run.size.toFixed(1)} pt. ${run.editable ? 'The text is re-encoded in the same font.' : 'This font cannot encode new text: the old text is covered and the new text is drawn in Helvetica.'}</p>` },
+    { key: 'i', type: 'info', html: `<p class="ql-help">Font ${esc(nameText(run.font))}, ${run.size.toFixed(1)} pt. ${run.editable ? 'The text is re-encoded in the same font.' : 'This font cannot encode new text: the old text is covered and the new text is drawn in Helvetica.'}</p>` },
   ], ok: 'Replace' });
   if (!r || r.t === run.text || !app.stillOpen(tab, rev)) return;
   const res = app.editTab(tab,'Edit Text', (doc) => replaceRunText(doc, pageOf(tab, page), run, String(r.t)));
