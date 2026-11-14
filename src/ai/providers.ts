@@ -39,7 +39,7 @@ export interface ProviderDef {
   /** Keys can be viewed again later (otherwise they are shown once, at creation). */
   keyViewable: boolean;
   models: { fast: string; quality: string };
-  /** Browser CORS: 'yes' works from the web build; 'no' needs the Android native HTTP path. */
+  /** Browser CORS: 'yes' works from the web build; 'no' needs native HTTP (the Android, iOS or desktop app). */
   cors: 'yes' | 'no' | 'unknown' | 'local';
   /** One-click sign-in that returns a key (no copy/paste). */
   oauth?: 'openrouter';
@@ -58,7 +58,7 @@ export const PROVIDERS: ProviderDef[] = [
   {
     id: 'device', name: 'On-device model (Anne\'s Folio Local AI)', kind: 'local', baseUrl: '', needsKey: false,
     links: { docs: 'https://huggingface.co/docs/transformers.js' },
-    free: 'device', freeNote: 'Free, private, no account. Downloads a small open model once (about 270 MB to 1 GB) and runs it on this device; works offline afterwards. Slower and less capable than cloud models.',
+    free: 'device', freeNote: 'Free, private, no account. Downloads a small open model once (about 270 MB to 1.3 GB) and runs it on this device; works offline afterwards. Slower and less capable than cloud models.',
     keyViewable: true, models: { fast: 'onnx-community/Qwen2.5-0.5B-Instruct', quality: 'onnx-community/Qwen2.5-0.5B-Instruct' }, cors: 'local',
   },
   {
@@ -74,7 +74,7 @@ export const PROVIDERS: ProviderDef[] = [
     links: { signup: 'https://openrouter.ai/', keys: 'https://openrouter.ai/settings/keys', billing: 'https://openrouter.ai/settings/credits', free: 'https://openrouter.ai/models?max_price=0', docs: 'https://openrouter.ai/docs' },
     free: 'free', freeNote: 'Free models (":free" and the openrouter/free router): 20 requests per minute, 50 per day (1,000 per day after a one-time $10 credit purchase). One-click sign-in returns a key automatically. Paid models from every major lab with credits.',
     keyViewable: false, models: { fast: 'openrouter/free', quality: 'openrouter/auto' }, cors: 'yes', vision: true,
-    extraHeaders: { 'HTTP-Referer': 'https://github.com/socrtwo/QuillFolio', 'X-Title': 'Anne\'s Folio' },
+    extraHeaders: { 'HTTP-Referer': 'https://github.com/socrtwo/annes-folio', 'X-Title': 'Anne\'s Folio' },
   },
   {
     id: 'gemini', name: 'Google Gemini API', kind: 'gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta', needsKey: true,

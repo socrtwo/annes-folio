@@ -87,9 +87,11 @@ prevents adoption).
    `{"stance":"unite"|"stand-aside"|"block","reason":"…","suggested_change":"…"}`
    (prompt: "Unite if the minute is a correct, complete answer you can support. Stand aside if you
    prefer something different but the minute is acceptable; give your concern. Block only if the
-   minute is wrong or harmful; explain exactly what must change.") Unparseable replies count as
-   "unite" with a note; failed members are left out of the round.
-4. No blocks → adopt the minute. Outcome `unity` or `unity-with-stand-asides`.
+   minute is wrong or harmful; explain exactly what must change.") A reply that cannot be read as
+   that JSON, or that was cut off at the output limit, is not agreement: that member is left out of
+   the round, as a failed member is. If no member gives a readable reply, the outcome is `no-unity`
+   and the clerk's minute is returned as it stands.
+4. No blocks (and at least one readable reply) → adopt the minute. Outcome `unity` or `unity-with-stand-asides`.
 5. Blocks → the clerk revises the minute, given the blocks and stand-aside concerns ("Revise the
    minute to meet these objections where they are right; keep the original format requirements").
    Next round.
@@ -103,8 +105,8 @@ prevents adoption).
 When `showDeliberation` is on, the AI pane (or result dialog) shows below the answer a collapsible
 "How the AIs answered" section: each member's answer (provider · model · seconds, or the error),
 then for consensus each round's minute and the stances with reasons, and the outcome line:
-"Synthesized by <master>", "United (n of n)", "United; <k> stood aside", or "No unity after <r>
-rounds: <k> objections". Commands that apply results (insert a formula, fill a column, replace
+"Synthesized by <master>", "United (n of n)", "United; <k> stood aside", "No unity after <r>
+rounds: <k> objections", or "Not agreed: no AI gave a readable reply on the minute". Commands that apply results (insert a formula, fill a column, replace
 text) apply only the final answer; the discussion is never inserted into documents.
 
 ## 6. Tests (each app)
@@ -112,5 +114,6 @@ text) apply only the final answer; the discussion is never inserted into documen
 Mock providers (deterministic fake answers): master mode calls every member then the master once
 with shuffled, labeled responses; a failing member is skipped and reported; consensus reaches
 unity in round 1 when all unite; a block triggers a revision and a second round; maxRounds with a
-persistent block yields `no-unity` and still returns the minute; abort cancels all calls; key tests
-and model lists bypass the ensemble; settings export never contains keys.
+persistent block yields `no-unity` and still returns the minute; unreadable or cut-off replies are
+left out and never produce unity (`tests/unit/fix-plat-ensemble.test.ts`); abort cancels all calls;
+key tests and model lists bypass the ensemble; settings export never contains keys.

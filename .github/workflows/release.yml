@@ -8,12 +8,15 @@ name: Release
 # Run it from the Actions tab (any branch: published as a prerelease v<version>-build.<run>),
 # push a tag v<version>, or push a commit whose message contains [release] (prerelease).
 # The last option exists for environments that may push branches but not tags.
+#
+# The first job type-checks, runs the unit tests and the browser smoke test, and checks the requested
+# tag; nothing is built for release unless it passes. Only the last job can write to the repository.
 
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to create, e.g. v0.5.0 (for sessions that can push branches but not tags). Empty: v<version>-build.<run>'
+        description: 'Release tag to create, e.g. v0.5.0 (for sessions that can push branches but not tags). Must be v<version in package.json>, optionally with a -suffix, and must not exist yet. Empty: v<version>-build.<run>'
         type: string
         default: ''
       prerelease:
@@ -33,26 +36,79 @@ concurrency:
 
 jobs:
   web:
-    name: Web
+    name: Checks and web build
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[release]')
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     outputs:
-      version: ${{ steps.v.outputs.version }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with: { node-version: 22, cache: npm }
+      # Workflow inputs and event fields reach the shell only as environment variables, never as script text.
+      - name: Plan the release (version, tag, prerelease)
+        id: plan
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+          PRERELEASE_INPUT: ${{ inputs.prerelease }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          V=$(node -p "require('./package.json').version")
+          if [[ -n "$TAG_INPUT" ]]; then
+            if [[ ! "$TAG_INPUT" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+              echo "::error::The tag must look like v1.2.3 or v1.2.3-beta.1."
+              exit 1
+            fi
+            if [[ "$TAG_INPUT" != "v$V" && "$TAG_INPUT" != "v$V"-* ]]; then
+              echo "::error::Tag $TAG_INPUT does not match the version in package.json ($V). Set the version first: the files in the release are named after it."
+              exit 1
+            fi
+            # An existing tag or release is never reused: the action would replace that release's files.
+            if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG_INPUT" > /dev/null 2>&1 || gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG_INPUT" > /dev/null 2>&1; then
+              echo "::error::Tag or release $TAG_INPUT already exists. Choose a new tag."
+              exit 1
+            fi
+            TAG="$TAG_INPUT"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            if [[ "$TAG" != "v$V" && "$TAG" != "v$V"-* ]]; then
+              echo "::warning::Tag $TAG does not match package.json version $V; the files in the release are named after $V."
+            fi
+          else
+            TAG="v$V-build.$RUN_NUMBER"
+          fi
+          # Tags: prerelease when the version has a suffix (v1.0.0-beta.1). Manual runs: the checkbox.
+          # [release] commits: always a prerelease.
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then [[ "$TAG" == *-* ]] && PRE=true || PRE=false
+          elif [[ "$EVENT_NAME" == workflow_dispatch ]]; then [[ "$PRERELEASE_INPUT" == false ]] && PRE=false || PRE=true
+          else PRE=true; fi
+          {
+            echo "version=$V"
+            echo "tag=$TAG"
+            echo "prerelease=$PRE"
+          } >> "$GITHUB_OUTPUT"
+          echo "Version $V, tag $TAG, prerelease $PRE"
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
-      - id: v
-        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+      - name: Browser smoke test
+        run: |
+          npx playwright install --with-deps chromium
+          npm run e2e
       - name: Package
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
         run: |
           mkdir -p out
-          (cd dist && zip -qr "../out/QuillFolio-${{ steps.v.outputs.version }}-web.zip" .)
+          (cd dist && zip -qr "../out/QuillFolio-$VERSION-web.zip" .)
       - uses: actions/upload-artifact@v4
         with:
           name: QuillFolio-web
@@ -73,6 +129,8 @@ jobs:
           - { name: macOS, os: macos-latest, args: --mac }
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with: { node-version: 22, cache: npm }
       - run: npm ci
@@ -88,7 +146,8 @@ jobs:
         shell: bash
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-        run: npx electron-builder --config electron-builder.config.cjs ${{ matrix.args }} --publish never
+          TARGET: ${{ matrix.args }}
+        run: npx electron-builder --config electron-builder.config.cjs "$TARGET" --publish never
       - uses: actions/upload-artifact@v4
         with:
           name: QuillFolio-desktop-${{ matrix.name }}
@@ -107,18 +166,22 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with: { node-version: 22, cache: npm }
       - run: npm ci
       - run: npm run build
       - run: npx cap sync ios
       - name: Build
+        env:
+          V: ${{ needs.web.outputs.version }}
+          BUILD: ${{ github.run_number }}
         run: |
-          V='${{ needs.web.outputs.version }}'
           xcodebuild -project ios/App/App.xcodeproj -scheme App -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build/ios \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            MARKETING_VERSION="$V" CURRENT_PROJECT_VERSION="${{ github.run_number }}" build
+            MARKETING_VERSION="$V" CURRENT_PROJECT_VERSION="$BUILD" build
           mkdir -p out/Payload
           cp -R build/ios/Build/Products/Release-iphoneos/App.app out/Payload/
           (cd out && zip -qry "QuillFolio-$V-ios-unsigned.ipa" Payload && rm -rf Payload)
@@ -131,11 +194,18 @@ jobs:
   android:
     name: Android
     needs: web
-    uses: ./.github/workflows/android.yml
+    uses: ./.github/workflows/android-build.yml
     with:
-      prerelease: false
-    permissions:
-      contents: write
+      # The checks ran in the first job.
+      checks: false
+      # Without the keystore secrets the build is signed with a debug key and the release notes say so.
+      # Set this to true to make a release fail instead once the secrets are configured.
+      require_release_key: false
+    secrets:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
 
   publish:
     name: Publish release
@@ -143,6 +213,7 @@ jobs:
     # Publish whatever built, as long as the tested web build did; the notes list any failures.
     if: ${{ !cancelled() && needs.web.result == 'success' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -157,29 +228,29 @@ jobs:
           ls -la
           sha256sum QuillFolio-* > SHA256SUMS.txt
       - id: meta
+        env:
+          DESKTOP: ${{ needs.desktop.result }}
+          IOS: ${{ needs.ios.result }}
+          ANDROID: ${{ needs.android.result }}
+          ANDROID_SIGNING: ${{ needs.android.outputs.signing }}
         run: |
-          V='${{ needs.web.outputs.version }}'
-          if [[ -n "${{ inputs.tag }}" ]]; then TAG="${{ inputs.tag }}"
-          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then TAG="${GITHUB_REF#refs/tags/}"; else TAG="v$V-build.${{ github.run_number }}"; fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          # Tags: prerelease when the version has a suffix (v1.0.0-beta.1). Manual runs: the checkbox.
-          # [release] commits: always a prerelease.
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then [[ "$TAG" == *-* ]] && PRE=true || PRE=false
-          elif [[ "${{ github.event_name }}" == workflow_dispatch ]]; then PRE='${{ inputs.prerelease }}'
-          else PRE=true; fi
-          echo "prerelease=$PRE" >> "$GITHUB_OUTPUT"
           FAILED=""
-          for j in "desktop:${{ needs.desktop.result }}" "ios:${{ needs.ios.result }}" "android:${{ needs.android.result }}"; do
+          for j in "desktop:$DESKTOP" "ios:$IOS" "android:$ANDROID"; do
             [[ "${j#*:}" == success ]] || FAILED="$FAILED ${j%%:*}"
           done
           echo "failed=$FAILED" >> "$GITHUB_OUTPUT"
-      - uses: softprops/action-gh-release@v2
+          NOTE=""
+          if [[ "$ANDROID" == success && "$ANDROID_SIGNING" == debug ]]; then
+            NOTE="**Android:** this build is signed with a throwaway debug key (the release keystore secrets are not set), so the .aab cannot be uploaded to Play Console. It cannot update an installed copy signed with another key, and a later release cannot update it (uninstall first)."
+          fi
+          echo "android_note=$NOTE" >> "$GITHUB_OUTPUT"
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          tag_name: ${{ steps.meta.outputs.tag }}
+          tag_name: ${{ needs.web.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: Anne's Folio ${{ steps.meta.outputs.tag }}
-          prerelease: ${{ steps.meta.outputs.prerelease == 'true' }}
-          make_latest: ${{ steps.meta.outputs.prerelease != 'true' }}
+          name: Anne's Folio ${{ needs.web.outputs.tag }}
+          prerelease: ${{ needs.web.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.web.outputs.prerelease != 'true' }}
           generate_release_notes: true
           body: |
             Built from `${{ github.ref_name }}` at ${{ github.sha }}. Installation for each platform: docs/INSTALL.md.
@@ -187,13 +258,15 @@ jobs:
             | Platform | File |
             |---|---|
             | Windows 10/11 | `*-windows-x64-setup.exe`, `*-windows-arm64-setup.exe`, or `*-windows-portable.exe` (no install) |
-            | macOS 11+ (Apple silicon and Intel) | `*-mac-universal.dmg` (unsigned: right-click ▸ Open the first time) |
+            | macOS 12+ (Apple silicon and Intel) | `*-mac-universal.dmg` (unsigned: right-click ▸ Open the first time) |
             | Linux | `*-linux-x86_64.AppImage` or `*-linux-amd64.deb` |
             | Raspberry Pi OS | 64-bit: `*-linux-arm64.deb` / `*-linux-arm64.AppImage`; 32-bit: `*-linux-armv7l.deb` |
             | ChromeOS | the Android `.apk`, the Linux `.deb` (Linux development environment), or install the web app from the browser |
             | Android 7+ | `*.apk` (sideload) or `*.aab` (Play Console) |
             | iOS / iPadOS 15+ | `*-ios-unsigned.ipa`: must be signed with your own Apple ID (e.g. Sideloadly, AltStore) |
             | Web | `*-web.zip`: put the files on any static web server (HTTPS for offline use and installing) |
+
+            ${{ steps.meta.outputs.android_note }}
 
             ${{ steps.meta.outputs.failed && format('**Not in this release (build failed):**{0}', steps.meta.outputs.failed) || '' }}
           files: |

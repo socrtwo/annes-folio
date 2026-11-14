@@ -17,10 +17,15 @@ function resolvePkg(name, from) {
   }
 }
 
+// Dependencies of Transformers.js that only its Node.js build uses; the app bundles the browser build, so
+// these (and what only they depend on) are not in the web build or the apps.
+const NOT_SHIPPED = new Set(['onnxruntime-node', 'sharp']);
+
 const seen = new Map(); // directory -> package.json
 const queue = Object.keys(rootPkg.dependencies || {}).map((n) => [n, root]);
 while (queue.length) {
   const [name, from] = queue.shift();
+  if (NOT_SHIPPED.has(name)) continue;
   const dir = resolvePkg(name, from);
   if (!dir || seen.has(dir)) continue;
   const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));

@@ -6,7 +6,7 @@ import { commandCount } from './registry';
 
 declare const __APP_VERSION__: string;
 const VERSION = typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : 'dev';
-const REPO = 'https://github.com/socrtwo/QuillFolio';
+const REPO = 'https://github.com/socrtwo/annes-folio';
 
 async function open(url: string): Promise<void> {
   const { openExternal } = await import('../platform/native');

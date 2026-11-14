@@ -1,5 +1,5 @@
 // electron-builder configuration for the desktop releases.
-// Windows: NSIS installer (x64, arm64) and a portable .exe (x64).
+// Windows: one NSIS installer per architecture (x64, arm64) and a portable .exe (x64).
 // macOS: universal (Apple silicon + Intel) .dmg and .zip, ad-hoc signed.
 // Linux: AppImage and .deb for x64, arm64 (Raspberry Pi OS 64-bit, ChromeOS Linux on ARM) and
 // armv7l (Raspberry Pi OS 32-bit).
@@ -12,6 +12,14 @@ module.exports = {
   directories: { app: 'build/desktop-app', output: 'release', buildResources: 'resources' },
   artifactName: 'QuillFolio-${version}-${os}-${arch}.${ext}',
   asar: true,
+  // The packaged program cannot be turned into a general Node.js runtime, and loads its code only from the archive.
+  electronFuses: {
+    runAsNode: false,
+    enableNodeOptionsEnvironmentVariable: false,
+    enableNodeCliInspectArguments: false,
+    onlyLoadAppFromAsar: true,
+    grantFileProtocolExtraPrivileges: false, // the app is served from app://, never file://
+  },
   // Everything the app needs is bundled into dist/ by Vite; ship no node_modules.
   files: ['dist/**/*', 'electron/**/*', 'package.json', '!**/node_modules/**'],
   icon: 'resources/icon-1024.png',
@@ -24,12 +32,13 @@ module.exports = {
   win: {
     target: [{ target: 'nsis', arch: ['x64', 'arm64'] }, { target: 'portable', arch: ['x64'] }],
   },
-  nsis: { oneClick: false, perMachine: false, allowToChangeInstallationDirectory: true, artifactName: 'QuillFolio-${version}-windows-${arch}-setup.${ext}' },
+  // buildUniversalInstaller: false: otherwise a third, double-size installer holding both architectures is built too.
+  nsis: { oneClick: false, perMachine: false, allowToChangeInstallationDirectory: true, buildUniversalInstaller: false, artifactName: 'QuillFolio-${version}-windows-${arch}-setup.${ext}' },
   portable: { artifactName: 'QuillFolio-${version}-windows-portable.${ext}' },
   mac: {
     target: [{ target: 'dmg', arch: ['universal'] }, { target: 'zip', arch: ['universal'] }],
     category: 'public.app-category.productivity',
-    extendInfo: { CFBundleDisplayName: 'Anne\'s Folio' },
+    extendInfo: { CFBundleDisplayName: 'Anne\'s Folio', NSMicrophoneUsageDescription: 'Anne\'s Folio records sound only while you record an Audio Comment.' },
     // Ad-hoc signature: runs on Apple silicon without a paid Developer ID, but is not notarized,
     // so Gatekeeper asks once (docs/INSTALL.md). Hardened runtime would reject Electron's own signature.
     identity: '-',

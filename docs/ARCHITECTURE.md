@@ -35,12 +35,12 @@ src/
   io/                formats table, sniffing, openAsPdf (PDF, images, text, ZIP, review packages), TIFF decoder
     recover/         file identification, ZIP salvage, ImmortalInflate (shared with the suite)
   ui/                shell, ribbon layout, backstage, panes, dialogs, customize, recovery report, wizards
-  ai/                providers, client, ensemble, local model, OAuth, store; folio.ts holds the prompts
+  ai/                providers, client, ensemble, local model (local.ts and its worker, local.worker.ts), OAuth, store; folio.ts holds the prompts
   proof/             spelling worker and dictionaries; proofing.ts walks annotation and field text
   platform/          Capacitor/Electron bridge: open, save, write back, print, share, launch files
   templates/         new-document templates built in code
   export/print.ts    printing through rendered pages
-electron/            desktop main and preload (app:// origin, file grants)
+electron/            desktop main and preload (app:// origin, file grants, permission and content policy)
 android/, ios/       Capacitor projects (native plugin for files, print, share on Android)
 scripts/             catalog generation, icons, notices, pdf.js and tesseract asset copying, desktop packaging
 tests/unit           engine, operations, repair, registry/catalog tests (vitest)
@@ -49,7 +49,7 @@ tests/e2e/smoke.mjs  Playwright smoke test against the build
 
 ## Document of record and rendering
 
-A tab holds a `PdfDocument` (the engine's object graph) and `bytes`, the PDF the viewer renders. After every edit the tab regenerates `bytes` with an incremental update (or a full rewrite when the document is encrypted or the preference says so) and pdf.js reloads it. pdf.js never writes; it only rasterizes and extracts text. Saving writes the same bytes to disk and reloads the document from them, so the next save is again a small incremental update.
+A tab holds a `PdfDocument` (the engine's object graph) and `bytes`, the PDF the viewer renders. After every edit the tab regenerates `bytes` with an incremental update and pdf.js reloads it. Two cases rewrite the whole file instead: the save preference "rewrite" (not for an encrypted document, whose edits are always appended as an incremental update), and any edit after a command that removed content (applying redactions, sanitizing), so that the removed bytes do not stay in the file. pdf.js never writes; it only rasterizes and extracts text. Saving writes the same bytes to disk and reloads the document from them, so the next save is again a small incremental update.
 
 ## Undo
 

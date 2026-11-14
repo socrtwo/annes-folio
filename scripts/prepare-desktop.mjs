@@ -20,7 +20,7 @@ writeFileSync(join(out, 'package.json'), JSON.stringify({
   productName: 'Anne\'s Folio',
   version: pkg.version,
   description: pkg.description,
-  homepage: 'https://github.com/socrtwo/QuillFolio',
+  homepage: 'https://github.com/socrtwo/annes-folio',
   author: { name: 'socrtwo', email: 'socrtwo@users.noreply.github.com' },
   license: pkg.license,
   main: 'electron/main.cjs',

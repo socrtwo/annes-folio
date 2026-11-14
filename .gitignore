@@ -194,3 +194,5 @@ desktop.ini
 # Renderer and OCR assets copied from node_modules by scripts/copy-pdfjs.mjs
 public/pdfjs/
 public/tesseract/
+# ONNX Runtime files for the on-device AI model, copied by the same script
+public/ort/

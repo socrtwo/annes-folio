@@ -3,6 +3,9 @@
 
     <application
         android:allowBackup="true"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:largeHeap="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
@@ -24,8 +27,9 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- "Open with Anne's Folio" for PDFs (and the files it turns into PDFs) identified by MIME type
-                 (a mimeType-only <data> matches content: and file: URIs). -->
+            <!-- "Open with" / "Edit with Anne's Folio" for PDFs (and the files it turns into PDFs) identified by
+                 MIME type. A mimeType-only <data> matches content: and file: URIs; QuillNativePlugin reads
+                 content: URIs only. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <action android:name="android.intent.action.EDIT" />
@@ -54,7 +58,6 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:scheme="content" />
-                <data android:scheme="file" />
                 <data android:host="*" />
                 <data android:mimeType="application/octet-stream" />
                 <data android:mimeType="application/zip" />
@@ -169,7 +172,7 @@
                 <data android:pathPattern=".*\\..*\\..*\\.ZIP" />
             </intent-filter>
 
-            <!-- Receive PDFs, pictures and text shared from other apps. -->
+            <!-- Receive PDFs, pictures and text shared from other apps (one file, or several at once). -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <action android:name="android.intent.action.SEND_MULTIPLE" />
@@ -203,17 +206,11 @@
         </provider>
     </application>
 
-    <!-- The Anne's Office apps this one can hand documents to (Android 11+ package visibility). -->
-    <queries>
-        <package android:name="io.github.socrtwo.quillpen" />
-        <package android:name="io.github.socrtwo.quillpost" />
-        <package android:name="io.github.socrtwo.quillgrid" />
-        <package android:name="io.github.socrtwo.quillstage" />
-        <package android:name="io.github.socrtwo.quillloom" />
-        <package android:name="io.github.socrtwo.quillpress" />
-    </queries>
-
     <!-- Permissions -->
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Recorded audio comments (Comment ▸ Audio Comment). Asked for when the user first records. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
 </manifest>

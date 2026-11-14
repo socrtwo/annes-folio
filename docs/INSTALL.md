@@ -1,24 +1,24 @@
 # Installing Anne's Folio
 
-Every release on the [Releases](https://github.com/socrtwo/QuillFolio/releases) page has a build for each platform, plus `SHA256SUMS.txt` to check the downloads. The builds are not signed with paid store certificates, so each system asks once whether to trust them. The steps are below.
+Every release on the [Releases](https://github.com/socrtwo/annes-folio/releases) page has a build for each platform, plus `SHA256SUMS.txt` to check the downloads. The builds are not signed with paid store certificates, so each system asks once whether to trust them. The steps are below.
 
 | Platform | File | Notes |
 |---|---|---|
 | Windows 10/11 (x64) | `QuillFolio-<v>-windows-x64-setup.exe` | Installer; per-user, no admin rights needed |
 | Windows on ARM | `QuillFolio-<v>-windows-arm64-setup.exe` | |
 | Windows, no install | `QuillFolio-<v>-windows-portable.exe` | Runs from a USB stick or any folder |
-| macOS 11+ | `QuillFolio-<v>-mac-universal.dmg` (or `.zip`) | One app for Apple silicon and Intel |
+| macOS 12+ | `QuillFolio-<v>-mac-universal.dmg` (or `.zip`) | One app for Apple silicon and Intel |
 | Linux x64 | `QuillFolio-<v>-linux-x86_64.AppImage` or `QuillFolio-<v>-linux-amd64.deb` | |
 | Raspberry Pi OS 64-bit (Pi 3/4/5) | `QuillFolio-<v>-linux-arm64.deb` or `QuillFolio-<v>-linux-arm64.AppImage` | |
 | Raspberry Pi OS 32-bit | `QuillFolio-<v>-linux-armv7l.deb` | Pi 2 and later. A Pi 4 or 5 runs it much faster. |
 | ChromeOS | APK, Linux `.deb`, or the web app | See below |
-| Android 7+ | `QuillFolio-<v>.apk` | |
+| Android 7+ | `QuillFolio-<v>.apk` | Releases made from a tag or started by hand carry the project's release signature (the release workflow does not publish an Android build without it), so a newer release installs over an older one. Test builds from `[release]` commits and the Android workflow's prereleases may be signed with a throwaway key: their notes say so, and such a build has to be uninstalled before another one is installed |
 | iOS / iPadOS 15+ | `QuillFolio-<v>-ios-unsigned.ipa` | Must be signed with your Apple ID; see below |
 | Web | `QuillFolio-<v>-web.zip` | Static files for any web server |
 
 ## Windows
 
-Run the setup file. SmartScreen may say "Windows protected your PC": choose **More info ▸ Run anyway**. The warning appears because the installer is not signed with a paid code-signing certificate. PDFs (and .fdf, .xfdf and .qfr files) get **Open with ▸ Anne's Folio**.
+Run the setup file for your processor: `x64` for Intel and AMD, `arm64` for Windows on ARM. SmartScreen may say "Windows protected your PC": choose **More info ▸ Run anyway**. The warning appears because the installer is not signed with a paid code-signing certificate. PDFs (and .fdf, .xfdf and .qfr files) get **Open with ▸ Anne's Folio**.
 
 ## macOS
 
@@ -57,7 +57,7 @@ Pick one:
 
 ## Android
 
-Download the `.apk` and open it. Allow "Install unknown apps" for your browser or file manager when asked. To build the APK on the phone itself, see [BUILD.md](BUILD.md#android-on-the-device-termux).
+Download the `.apk` and open it. Allow "Install unknown apps" for your browser or file manager when asked. Android asks for the microphone only when you record an audio comment. To build the APK on the phone itself, see [BUILD.md](BUILD.md#android-on-the-device-termux).
 
 ## iOS and iPadOS
 
@@ -66,7 +66,7 @@ Apple only allows apps from the App Store or apps signed for your own devices. T
 - **Sideloadly** or **AltStore** (Windows/macOS): drag in the `.ipa` and sign in with your Apple ID. A free Apple ID signs for 7 days at a time; a paid developer account signs for a year.
 - **Xcode** (macOS): build from source with `npm run ios:sync`, open `ios/App/App.xcodeproj`, pick your team under *Signing & Capabilities*, and run on your device.
 
-On iOS, PDFs appear in the Files app's **Open in** and **Share** menus. **Save** writes to **Files ▸ On My iPhone ▸ Anne's Folio**, and **Open** uses the system file picker. **Share** offers the share sheet. The iOS build uses the web versions of these functions; Android has a native plugin with more features (writing back to a file opened from another app, **Open with** from other apps, printing through the system service).
+On iOS, PDFs appear in the Files app's **Open in** and **Share** menus, and **Open** uses the system file picker. **Save** writes to the app's own Documents folder on the device: the app can reopen the file from its recent list, and Finder shows the folder under the device's **Files** tab when it is connected to a Mac, but the Files app on the device does not list it. To put a copy in Files, iCloud Drive or another app, use **Share** (the share sheet has **Save to Files**). The iOS build uses the web versions of these functions; Android has a native plugin with more features (writing back to a file opened from another app, **Open with** from other apps, printing through the system service). API keys for AI providers are not kept in the iOS Keychain; see [AI.md](AI.md).
 
 ## Web
 

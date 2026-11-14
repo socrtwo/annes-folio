@@ -6,8 +6,8 @@
  *
  * What each directive is for:
  *   script-src   the app's own modules; WebAssembly (pdf.js decoders, Hunspell, tesseract, the on-device model);
- *                blob: for the on-device model's worker and the modules its runtime loads through blob URLs;
- *                cdn.jsdelivr.net for the on-device model library, the only script not shipped with the app.
+ *                blob: for the modules the on-device model's runtime loads through blob URLs. Every script
+ *                ships with the app: no CDN is allowed.
  *   worker-src   pdf.js, spelling and tesseract workers (same origin) and the on-device model worker (blob:).
  *   connect-src  AI services, dictionary and OCR language downloads (https); local model servers on this device
  *                (localhost, 127.0.0.1, and 10.0.2.2, which is "this computer" inside the Android emulator).
@@ -17,7 +17,7 @@
  */
 export const CSP_POLICY = [
   "default-src 'self'",
-  "script-src 'self' 'wasm-unsafe-eval' blob: https://cdn.jsdelivr.net",
+  "script-src 'self' 'wasm-unsafe-eval' blob:",
   "worker-src 'self' blob:",
   "connect-src 'self' https: http://localhost:* http://127.0.0.1:* http://10.0.2.2:* data: blob:",
   "img-src 'self' data: blob: https:",

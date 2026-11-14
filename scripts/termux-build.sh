@@ -2,7 +2,7 @@
 # Build the Anne's Folio Android APK on an Android device with Termux (https://termux.dev, the
 # F-Droid or GitHub build; the Play Store build is outdated).
 #
-#   curl -fsSLO https://raw.githubusercontent.com/socrtwo/QuillFolio/main/scripts/termux-build.sh
+#   curl -fsSLO https://raw.githubusercontent.com/socrtwo/annes-folio/main/scripts/termux-build.sh
 #   bash termux-build.sh            # first run installs everything (about 2.5 GB, 20-40 minutes)
 #   bash termux-build.sh --web      # only the web build (dist/), no Android SDK needed
 #
@@ -35,7 +35,7 @@ if [[ -d "$QL_DIR/.git" ]]; then
   git -C "$QL_DIR" fetch --depth 1 origin "$QL_BRANCH"
   git -C "$QL_DIR" checkout -q FETCH_HEAD
 else
-  git clone --depth 1 --branch "$QL_BRANCH" https://github.com/socrtwo/QuillFolio "$QL_DIR"
+  git clone --depth 1 --branch "$QL_BRANCH" https://github.com/socrtwo/annes-folio "$QL_DIR"
 fi
 cd "$QL_DIR"
 

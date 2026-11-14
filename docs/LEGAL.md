@@ -57,13 +57,13 @@ Generated into `third-party-notices.txt` at build time from `package.json`. Only
 | Electron, electron-builder | Desktop shells | MIT |
 | Vite, TypeScript, vitest, Playwright | Build and test tooling (not shipped) | MIT, Apache 2.0 |
 | nspell and the SCOWL dictionaries; downloaded Hunspell dictionaries | Spelling | MIT; various permissive licenses listed in the dictionary catalog |
-| Transformers.js and the on-device model | Optional on-device AI | Apache 2.0; model licenses shown in the setup wizard |
+| Transformers.js, ONNX Runtime Web and the on-device model | Optional on-device AI. The library and the runtime are part of the app; the model is downloaded | Apache 2.0 (Transformers.js), MIT (ONNX Runtime); model licenses shown in the setup wizard |
 
 ## Online services
 
 Anne's Folio has no server. It reaches the network only when you ask it to:
 
-- **AI providers** you set up (your own key), and the on-device model download on first use;
+- **AI providers** you set up (your own key), and the on-device model's files, downloaded from huggingface.co on first use (the program that runs the model is part of the app; nothing is loaded from a code CDN);
 - **Spelling dictionaries** downloaded from the catalog's sources;
 - **OCR language data** downloaded from the tessdata mirror on first use of each language, after a consent dialog;
 - **Look Up** opens the dictionary, encyclopedia or search page you choose in the browser;

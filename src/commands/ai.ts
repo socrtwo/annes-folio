@@ -8,7 +8,7 @@ import { def, type MenuEntry } from './registry';
 import { NO_CHANGE, type App, type DocTab } from '../app';
 import { aiSettings, saveAiSettings, resolveProvider } from '../ai/store';
 import { providerById } from '../ai/providers';
-import { chat, activeEnsemble, type ChatMessage, type ContentPart } from '../ai/client';
+import { chat, activeEnsemble, inputBudgetChars, type ChatMessage, type ContentPart } from '../ai/client';
 import { outcomeLine, type EnsembleMode } from '../ai/ensemble';
 import { FOLIO_SYSTEM, TASKS, cleanText, linesOf, parseJsonLoose, fenced } from '../ai/folio';
 import { openDialog, toast, confirmDialog, promptDialog } from '../ui/dialog';
@@ -81,6 +81,8 @@ export async function ask(app: App, prompt: string | ContentPart[], opts: { tier
 
 /** The document's text, page by page, with page markers (truncated to maxChars). */
 async function docText(tab: DocTab, maxChars = 24000, pages?: number[]): Promise<string> {
+  // A model running on this device gets less text than a cloud model, so an answer arrives in reasonable time.
+  maxChars = Math.min(maxChars, inputBudgetChars());
   const v = viewer(tab);
   const idx = pages || tab.doc.pages.map((_, i) => i);
   const parts: string[] = [];

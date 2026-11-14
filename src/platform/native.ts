@@ -6,34 +6,42 @@
  * - Desktop (Windows, macOS, Linux, Raspberry Pi OS): the Electron preload (electron/preload.cjs)
  *   exposes the same interface as `window.quillDesktop`, backed by native file dialogs and the file system.
  * - Browser and iOS: <input type=file>, the File System Access API or downloads, and window.print().
- *   On iOS, saved files go to the app's Documents folder (Files ▸ On My iPhone ▸ Anne's Folio).
+ *   On iOS, saved files go to the app's own Documents folder. iOS shows that folder in Finder's file
+ *   sharing, not in the Files app, so Share is the way to put a copy in Files or another app.
+ *
+ * File contents cross the Android bridge as base64 strings (`data`); the desktop bridge passes bytes
+ * (`bytes`), which needs a third of the memory and has no string-length limit.
  */
 import { Capacitor, registerPlugin } from '@capacitor/core';
 import { download, pickFile } from '../ui/dom';
 
 export interface OpenedFile { name: string; data: ArrayBuffer; uri: string | null; mime?: string }
 
+/** File contents on the bridge: base64 (`data`, Android) or bytes (`bytes`, desktop). */
+interface Payload { data?: string; bytes?: Uint8Array }
+interface FileResult extends Payload { uri?: string; name?: string; mime?: string }
+
 interface QuillNativePlugin {
   /** ACTION_OPEN_DOCUMENT. Resolves {canceled:true} when dismissed. */
-  openDocument(opts: { mimeTypes: string[] }): Promise<{ canceled?: boolean; uri?: string; name?: string; mime?: string; data?: string /* base64 */ }>;
+  openDocument(opts: { mimeTypes: string[] }): Promise<FileResult & { canceled?: boolean }>;
   /** ACTION_CREATE_DOCUMENT then write. */
-  saveAs(opts: { name: string; mime: string; data: string /* base64 */ }): Promise<{ canceled?: boolean; uri?: string; name?: string }>;
+  saveAs(opts: { name: string; mime: string } & Payload): Promise<{ canceled?: boolean; uri?: string; name?: string }>;
   /** Overwrite an existing document URI obtained from openDocument/saveAs (persisted permission). */
-  writeUri(opts: { uri: string; data: string /* base64 */ }): Promise<{ ok: boolean }>;
+  writeUri(opts: { uri: string } & Payload): Promise<{ ok: boolean }>;
   /** Read a URI again (recent files). */
-  readUri(opts: { uri: string }): Promise<{ name?: string; mime?: string; data: string }>;
+  readUri(opts: { uri: string }): Promise<FileResult>;
   /** Print the current WebView through PrintManager. */
   print(opts: { jobName: string }): Promise<void>;
   /** Share a file through ACTION_SEND. */
-  share(opts: { name: string; mime: string; data: string; title?: string }): Promise<void>;
-  /** File the app was launched with (ACTION_VIEW / ACTION_SEND), consumed once. */
-  getLaunchFile(): Promise<{ uri?: string; name?: string; mime?: string; data?: string }>;
+  share(opts: { name: string; mime: string; title?: string } & Payload): Promise<void>;
+  /** File the app was launched with (ACTION_VIEW / ACTION_EDIT / ACTION_SEND), consumed once. */
+  getLaunchFile(): Promise<FileResult>;
   /** Keep the screen awake (read-aloud, teleprompter). */
   keepAwake(opts: { on: boolean }): Promise<void>;
-  addListener(event: 'fileOpened', cb: (f: { uri?: string; name?: string; mime?: string; data?: string }) => void): Promise<{ remove: () => void }>;
+  addListener(event: 'fileOpened', cb: (f: FileResult) => void): Promise<{ remove: () => void }>;
   addListener(event: 'oauthCallback', cb: (r: { url: string }) => void): Promise<{ remove: () => void }>;
-  /** Android Keystore-backed encrypted preferences (API keys). */
-  secureSet(opts: { key: string; value: string }): Promise<void>;
+  /** Android Keystore-backed encrypted preferences (API keys). The desktop answers how well the value is protected. */
+  secureSet(opts: { key: string; value: string }): Promise<void | { encrypted?: boolean }>;
   secureGet(opts: { key: string }): Promise<{ value?: string | null }>;
   secureRemove(opts: { key: string }): Promise<void>;
   /** ClipboardManager text (foreground app only; Android 12+ shows a "pasted" notice). */
@@ -42,8 +50,6 @@ interface QuillNativePlugin {
   /** One-shot http://127.0.0.1:<port>/ listener for OAuth redirects (OpenRouter PKCE); only requests for `path` count. */
   startLoopback(opts: { timeoutMs: number; successHtml?: string; path?: string }): Promise<{ port: number }>;
   stopLoopback(): Promise<void>;
-  /** Android: hand a document to a sibling Anne's Office app (ACTION_VIEW with its package). */
-  openInApp?(opts: { packageName: string; name: string; mime: string; data: string }): Promise<{ opened: boolean; reason?: string }>;
 }
 
 /** The desktop bridge adds what Android gets from Capacitor itself. */
@@ -52,9 +58,9 @@ interface DesktopBridge extends QuillNativePlugin {
   platform: string;
   openExternal(opts: { url: string }): Promise<void>;
   /** HTTP from the main process (no CORS), for AI providers that block browsers. */
-  http(opts: { url: string; method: string; headers: Record<string, string>; data?: unknown }): Promise<{ status: number; text: string }>;
-  /** Write the document to a temporary file and open it with the program registered for its type. */
-  openWith?(opts: { name: string; data: string }): Promise<{ ok: boolean; error?: string }>;
+  http(opts: { url: string; method: string; headers: Record<string, string>; data?: unknown }): Promise<{ status: number; text: string; retryAfter?: string }>;
+  /** Whether saved keys are encrypted by the system keychain (false: no keyring, the key file is readable). */
+  secureInfo?(): Promise<{ encrypted: boolean; available: boolean; backend: string }>;
 }
 
 const desktop: DesktopBridge | undefined = typeof window !== 'undefined' ? (window as any).quillDesktop : undefined;
@@ -107,11 +113,36 @@ export function bufferFromB64(b64: string): ArrayBuffer {
   return u8.buffer;
 }
 
+/** The contents of a file the bridge handed over, or null when it carries none. */
+function received(r: Payload | null | undefined): ArrayBuffer | null {
+  if (r?.bytes) { const b = r.bytes; return b.byteOffset === 0 && b.byteLength === b.buffer.byteLength ? (b.buffer as ArrayBuffer) : (b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer); }
+  return r?.data ? bufferFromB64(r.data) : null;
+}
+/** A blob in the form this platform's bridge takes. */
+async function outgoing(blob: Blob): Promise<Payload> {
+  const buf = await blob.arrayBuffer();
+  return desktop ? { bytes: new Uint8Array(buf) } : { data: b64FromBuffer(buf) };
+}
+const opened = (r: FileResult, data: ArrayBuffer, uri: string | null = r.uri || null): OpenedFile => ({ name: r.name || 'document', data, uri, mime: r.mime });
+
 export async function openDocument(accept: string, mimeTypes: string[]): Promise<OpenedFile | null> {
   if (isNative()) {
     const r = await Native.openDocument({ mimeTypes });
-    if (r.canceled || !r.data) return null;
-    return { name: r.name || 'document', data: bufferFromB64(r.data), uri: r.uri || null, mime: r.mime };
+    const data = r.canceled ? null : received(r);
+    return data ? opened(r, data) : null;
+  }
+  // Chromium browsers: a file handle, so that Save can write back to the file that was opened.
+  const anyWin = window as any;
+  if (anyWin.showOpenFilePicker && !isCapacitor()) {
+    try {
+      const exts = accept.split(',').map((x) => x.trim()).filter((x) => /^\.\w{1,16}$/.test(x));
+      const [handle] = await anyWin.showOpenFilePicker(exts.length ? { types: [{ description: 'Supported files', accept: { 'application/octet-stream': exts } }] } : {});
+      const f: File = await handle.getFile();
+      return { name: f.name, data: await f.arrayBuffer(), uri: 'fsa:' + (await handleId(handle)), mime: f.type };
+    } catch (e: any) {
+      if (e?.name === 'AbortError') return null;
+      // Not allowed here (an embedded frame, a browser policy): the classic file input below.
+    }
   }
   const files = await pickFile(accept);
   if (!files.length) return null;
@@ -119,12 +150,12 @@ export async function openDocument(accept: string, mimeTypes: string[]): Promise
 }
 
 function toastSaved(name: string): void {
-  import('../ui/dialog').then(({ toast }) => toast(`Saved "${name}" to Files ▸ On My iPhone ▸ Anne's Folio`)).catch(() => undefined);
+  import('../ui/dialog').then(({ toast }) => toast(`Saved "${name}" in Anne's Folio on this device. To put a copy in Files or another app, use Share.`)).catch(() => undefined);
 }
 
 export async function saveAs(blob: Blob, name: string): Promise<{ uri: string | null; name: string } | null> {
   if (isNative()) {
-    const r = await Native.saveAs({ name, mime: blob.type || 'application/octet-stream', data: b64FromBuffer(await blob.arrayBuffer()) });
+    const r = await Native.saveAs({ name, mime: blob.type || 'application/octet-stream', ...(await outgoing(blob)) });
     if (r.canceled) return null;
     return { uri: r.uri || null, name: r.name || name };
   }
@@ -167,6 +198,8 @@ export async function writeBack(uri: string, blob: Blob): Promise<boolean> {
   if (uri.startsWith('fsa:')) {
     const h = handles.get(uri.slice(4));
     if (!h) return false;
+    // A file that was opened (not saved) here is readable only until the browser's "Save changes?" prompt is answered.
+    if (h.queryPermission && (await h.queryPermission({ mode: 'readwrite' })) !== 'granted' && (await h.requestPermission({ mode: 'readwrite' })) !== 'granted') return false;
     const w = await h.createWritable();
     await w.write(blob);
     await w.close();
@@ -174,7 +207,7 @@ export async function writeBack(uri: string, blob: Blob): Promise<boolean> {
   }
   if (uri.startsWith(IOS_PREFIX)) { await iosWrite(blob, uri.slice(IOS_PREFIX.length)); return true; }
   if (!isNative()) return false;
-  const r = await Native.writeUri({ uri, data: b64FromBuffer(await blob.arrayBuffer()) });
+  const r = await Native.writeUri({ uri, ...(await outgoing(blob)) });
   return !!r.ok;
 }
 
@@ -189,7 +222,8 @@ export async function readUri(uri: string): Promise<OpenedFile | null> {
   if (!isNative()) return null;
   try {
     const r = await Native.readUri({ uri });
-    return { name: r.name || 'document', data: bufferFromB64(r.data), uri, mime: r.mime };
+    const data = received(r);
+    return data ? opened(r, data, uri) : null;
   } catch {
     return null;
   }
@@ -202,7 +236,7 @@ export async function printDocument(jobName: string): Promise<void> {
 
 export async function shareFile(blob: Blob, name: string, title?: string): Promise<void> {
   if (isNative()) {
-    await Native.share({ name, mime: blob.type || 'application/octet-stream', data: b64FromBuffer(await blob.arrayBuffer()), title });
+    await Native.share({ name, mime: blob.type || 'application/octet-stream', title, ...(await outgoing(blob)) });
     return;
   }
   if (isIOS()) {
@@ -234,6 +268,8 @@ async function readIosUrl(url: string): Promise<OpenedFile | null> {
     const data = typeof r.data === 'string' ? bufferFromB64(r.data) : await (r.data as Blob).arrayBuffer();
     let name = url.split(/[?#]/)[0].split('/').pop() || 'document';
     try { name = decodeURIComponent(name); } catch { /* keep the raw name */ }
+    // iOS put this copy in the app's Inbox for us; once read it is only taking up space.
+    if (/\/Documents\/Inbox\//.test(url)) void Filesystem.deleteFile({ path: url }).catch(() => undefined);
     return { name, data, uri: null };
   } catch {
     return null;
@@ -253,8 +289,8 @@ export async function launchFile(): Promise<OpenedFile | null> {
   if (!isNative()) return null;
   try {
     const r = await Native.getLaunchFile();
-    if (!r || !r.data) return null;
-    return { name: r.name || 'document', data: bufferFromB64(r.data), uri: r.uri || null, mime: r.mime };
+    const data = received(r);
+    return data ? opened(r, data) : null;
   } catch {
     return null;
   }
@@ -266,7 +302,7 @@ export function onFileOpened(cb: (f: OpenedFile) => void): void {
     return;
   }
   if (!isNative()) return;
-  Native.addListener('fileOpened', (r) => { if (r.data) cb({ name: r.name || 'document', data: bufferFromB64(r.data), uri: r.uri || null, mime: r.mime }); });
+  void Native.addListener('fileOpened', (r) => { const data = received(r); if (data) cb(opened(r, data)); });
 }
 
 export async function keepAwake(on: boolean): Promise<void> {
@@ -300,39 +336,20 @@ export const OPEN_MIMES = [
 ];
 
 // ------------------------------------------------------------------------------------------
-// Sibling Anne's Office apps
-
-export type QuillApp = 'Anne\'s Pen' | 'Anne\'s Post' | 'Anne\'s Grid' | 'Anne\'s Stage' | 'Anne\'s Loom' | 'Anne\'s Press';
-export const QUILL_APP_IDS: Record<QuillApp, string> = {
-  'Anne\'s Pen': 'io.github.socrtwo.quillpen', 'Anne\'s Post': 'io.github.socrtwo.quillpost', 'Anne\'s Grid': 'io.github.socrtwo.quillgrid',
-  'Anne\'s Stage': 'io.github.socrtwo.quillstage', 'Anne\'s Loom': 'io.github.socrtwo.quillloom', 'Anne\'s Press': 'io.github.socrtwo.quillpress',
-};
-
-/**
- * Opens a document in a sibling app: on Android the app itself (by package), on the desktop the
- * program registered for the file type. Browsers and iOS cannot hand files to other apps.
- */
-export async function openInQuillApp(app: QuillApp, data: ArrayBuffer, name: string, mime: string): Promise<{ opened: boolean; reason: 'not-installed' | 'unsupported' | 'error' | ''; message?: string }> {
-  try {
-    if (desktop?.openWith) {
-      const r = await desktop.openWith({ name, data: b64FromBuffer(data) });
-      return r.ok ? { opened: true, reason: '' } : { opened: false, reason: 'not-installed', message: r.error };
-    }
-    if (isNative() && Native.openInApp) {
-      const r = await Native.openInApp({ packageName: QUILL_APP_IDS[app], name, mime, data: b64FromBuffer(data) });
-      return r.opened ? { opened: true, reason: '' } : { opened: false, reason: 'not-installed' };
-    }
-  } catch (e: any) {
-    return { opened: false, reason: 'error', message: e?.message || String(e) };
-  }
-  return { opened: false, reason: 'unsupported' };
-}
-
-// ------------------------------------------------------------------------------------------
 // Secure storage, clipboard, OAuth loopback, app resume (AI setup)
 
 export async function secureSet(key: string, value: string): Promise<void> {
   await Native.secureSet({ key, value });
+}
+/**
+ * How the native bridge protects saved secrets: the Android Keystore, or on the desktop the system
+ * keychain (macOS Keychain, Windows DPAPI, a Linux keyring). `encrypted: false` means a Linux desktop
+ * without a keyring, where the key file can be read by anything running as the user.
+ */
+export async function secureStorageInfo(): Promise<{ encrypted: boolean; backend: string }> {
+  if (!desktop) return { encrypted: true, backend: 'android-keystore' };
+  try { const r = await desktop.secureInfo?.(); if (r) return { encrypted: !!r.encrypted, backend: String(r.backend || 'unknown') }; } catch { /* an older desktop shell */ }
+  return { encrypted: false, backend: 'unknown' };
 }
 export async function secureGet(key: string): Promise<string | null> {
   return (await Native.secureGet({ key })).value ?? null;
