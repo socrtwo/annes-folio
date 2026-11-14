@@ -56,8 +56,10 @@ async function ensureLoaded(id: string): Promise<boolean> {
   if (inWorker.has(id) && worker) return true;
   const d = await loadDictionary(id);
   if (!d) return false;
+  if (!(d.aff instanceof Uint8Array) || !(d.dic instanceof Uint8Array)) return false;
   const r = await call({ type: 'load', dialect: 'dict:' + id, aff: d.aff, dic: d.dic });
-  if (r.failed || r.error) return false;
+  // Only an explicit acknowledgement counts: any other answer means the worker did not load it.
+  if (r.failed || r.error || !r.ok) return false;
   inWorker.add(id);
   return true;
 }
@@ -144,8 +146,11 @@ export async function addWord(word: string): Promise<void> { await workerChecker
 // --------------------------------------------------------------------------------------------
 // Words in text
 
-const WORD_RE = /[\p{L}][\p{L}\p{M}'’]*[\p{L}\p{M}]|[\p{L}]/gu;
-const URL_RE = /\b(?:https?:\/\/|www\.)\S+|\S+@\S+\.\w+|\b[\w-]+(?:\.[\w-]+)+\/\S*/gi;
+// Inside a word: apostrophes, the Catalan middle dot (col·legi), zero-width (non-)joiners (Persian, Indic scripts)
+// and soft hyphens, which mark a possible line break and are not part of the spelling.
+const WORD_RE = /[\p{L}][\p{L}\p{M}'’·‌‍­]*[\p{L}\p{M}]|[\p{L}]/gu;
+// Every repetition is bounded so that one very long unbroken token costs linear, not quadratic, time.
+const URL_RE = /\b(?:https?:\/\/|www\.)\S+|[^\s@]{1,64}@[^\s@]{1,255}\.\w+|\b[\w-]{1,253}(?:\.[\w-]{1,253})+\/\S*/gi;
 
 export interface SpellOptions {
   ignoreUpper: boolean;
@@ -169,7 +174,8 @@ export function wordsIn(text: string, opts: SpellOptions = DEFAULT_SPELL_OPTIONS
     // Words glued to digits ("A4", "2nd", "Q3x") are codes, not words.
     const before = text[start - 1] || '', after = text[end] || '';
     if (opts.ignoreDigits && (/\d/.test(before) || /\d/.test(after))) continue;
-    let w = m[0].replace(/’/g, "'");
+    // Offsets stay those of the text; the word handed to the dictionary has no soft hyphens.
+    let w = m[0].replace(/’/g, "'").replace(/­/g, '');
     let s = start, e = end;
     if (/'s$/i.test(w)) { w = w.slice(0, -2); e -= 2; }
     while (w.startsWith("'")) { w = w.slice(1); s++; }

@@ -14,6 +14,13 @@ export function keyName(e: KeyboardEvent): string | null {
   if (e.code === 'Comma') base = ',';
   if (e.code === 'Equal') base = '=';
   if (e.code === 'Minus') base = '-';
+  // With Alt/Option held the key reports the character that modifier types (macOS Cmd+Option+H is "˙", Option+Space
+  // a no-break space, AltGr+Q "@"): name the binding by the physical key when the key is not a plain letter or digit.
+  if (e.altKey && e.code && (e.key === 'Dead' || (e.key.length === 1 && !/^[a-z0-9 ]$/i.test(e.key)))) {
+    if (/^Key[A-Z]$/.test(e.code)) base = e.code.slice(3).toLowerCase();
+    else if (/^Digit\d$/.test(e.code)) base = e.code.slice(5);
+    else if (e.code === 'Space') base = 'Space';
+  }
   const mac = isMac();
   // AltGr (reported as Ctrl+Alt on Windows) and macOS Option type characters such as \ ] } @ ≠:
   // when the key produced something other than its layout-stable base, it is text, not a shortcut.

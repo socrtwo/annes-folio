@@ -10,7 +10,7 @@
  * Australian English are bundled with the app.
  */
 import catalogJson from './dictionary-catalog.json';
-import { kvGet, kvSet, kvDel, kvKeys } from '../util/store';
+import { kvGet, kvSet, kvDel, kvKeys, toBase64 } from '../util/store';
 
 export interface DictInfo {
   id: string;
@@ -51,6 +51,16 @@ export async function loadDictionary(id: string): Promise<Stored | null> {
   return ((await kvGet(KEY(id))) as Stored | undefined) || null;
 }
 
+/**
+ * True when the installed copy of a dictionary is not the version the catalog lists (installing it again
+ * replaces it). False for dictionaries that are not installed or not in the catalog.
+ */
+export async function dictionaryUpdateAvailable(id: string): Promise<boolean> {
+  const d = dictById(id);
+  const stored = d ? await loadDictionary(id) : null;
+  return !!d && !!stored && stored.version !== d.version;
+}
+
 export async function removeDictionary(id: string): Promise<void> {
   await kvDel(KEY(id));
   installedP = null;
@@ -58,7 +68,8 @@ export async function removeDictionary(id: string): Promise<void> {
 
 export type Progress = (p: { phase: 'download' | 'verify' | 'save'; loaded: number; total: number }) => void;
 
-async function fetchBytes(url: string, total: number, onProgress: Progress | undefined, base: number, all: number, signal?: AbortSignal): Promise<Uint8Array> {
+/** Downloads a file, giving up as soon as it is larger than `max` bytes (the catalog knows every size). */
+async function fetchBytes(url: string, total: number, onProgress: Progress | undefined, base: number, all: number, signal: AbortSignal | undefined, max: number): Promise<Uint8Array> {
   const res = await fetch(url, { signal, cache: 'no-store' });
   if (!res.ok || !res.body) throw new Error(`${new URL(url).host} answered ${res.status}`);
   const reader = res.body.getReader();
@@ -69,6 +80,7 @@ async function fetchBytes(url: string, total: number, onProgress: Progress | und
     if (done) break;
     chunks.push(value);
     got += value.length;
+    if (got > max) { void reader.cancel().catch(() => undefined); throw new Error(`${new URL(url).host} sent more data than this dictionary has`); }
     onProgress?.({ phase: 'download', loaded: base + Math.min(got, total || got), total: all });
   }
   const out = new Uint8Array(got);
@@ -83,7 +95,7 @@ async function digest(algo: 'SHA-256' | 'SHA-512', data: Uint8Array): Promise<Ui
   throw new Error('This device cannot verify the download (no Web Crypto).');
 }
 const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
-const b64 = (b: Uint8Array) => btoa(String.fromCharCode(...b));
+const b64 = toBase64;
 
 /** Plain SHA-256 for platforms without crypto.subtle in this context. */
 export function sha256(data: Uint8Array): Uint8Array {
@@ -150,14 +162,15 @@ export async function installDictionary(id: string, onProgress?: Progress, signa
   let aff: Uint8Array, dic: Uint8Array;
   try {
     const base = `https://cdn.jsdelivr.net/npm/${d.pkg}@${d.version}/`;
-    aff = await fetchBytes(base + 'index.aff', d.aff.size, onProgress, 0, all, signal);
-    dic = await fetchBytes(base + 'index.dic', d.dic.size, onProgress, d.aff.size, all, signal);
+    aff = await fetchBytes(base + 'index.aff', d.aff.size, onProgress, 0, all, signal, d.aff.size);
+    dic = await fetchBytes(base + 'index.dic', d.dic.size, onProgress, d.aff.size, all, signal, d.dic.size);
     onProgress?.({ phase: 'verify', loaded: all, total: all });
     if (hex(await digest('SHA-256', aff)) !== d.aff.sha256 || hex(await digest('SHA-256', dic)) !== d.dic.sha256) throw new Error('checksum mismatch');
   } catch (e) {
     if ((e as Error)?.name === 'AbortError') throw e;
     // Second source: the package itself from the npm registry, checked against npm's own hash.
-    const tgz = await fetchBytes(d.tarball, 0, onProgress ? (p) => onProgress({ ...p, total: Math.max(p.total, p.loaded) }) : undefined, 0, all, signal);
+    // The compressed package cannot be larger than the two files it carries plus its small extras.
+    const tgz = await fetchBytes(d.tarball, 0, onProgress ? (p) => onProgress({ ...p, total: Math.max(p.total, p.loaded) }) : undefined, 0, all, signal, all + (1 << 20));
     onProgress?.({ phase: 'verify', loaded: all, total: all });
     const [algo, want] = d.integrity.split('-');
     if (algo !== 'sha512' || b64(await digest('SHA-512', tgz)) !== want) throw new Error('The downloaded dictionary failed its integrity check. Nothing was installed.');
@@ -166,7 +179,8 @@ export async function installDictionary(id: string, onProgress?: Progress, signa
     dic = untar(tar, 'package/index.dic');
   }
   onProgress?.({ phase: 'save', loaded: all, total: all });
-  await kvSet(KEY(id), { version: d.version, aff: aff.slice(), dic: dic.slice() } satisfies Stored);
+  try { await kvSet(KEY(id), { version: d.version, aff: aff.slice(), dic: dic.slice() } satisfies Stored); }
+  catch { throw new Error('The dictionary could not be stored (storage full or unavailable).'); }
   if (!(await kvGet(KEY(id)))) throw new Error('The dictionary could not be stored (storage full or unavailable).');
   installedP = null;
 }

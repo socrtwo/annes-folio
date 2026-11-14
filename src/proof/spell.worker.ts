@@ -23,7 +23,7 @@ import nspell from 'nspell';
 
 export type Dialect = 'any' | 'en-US' | 'en-GB' | 'en-CA' | 'en-AU' | `dict:${string}`;
 /** What the worker needs from a dictionary: nspell objects, or the Hunspell adapter below. */
-interface Speller { correct(w: string): boolean; suggest(w: string): string[]; add(w: string): unknown; remove(w: string): unknown }
+interface Speller { correct(w: string): boolean; suggest(w: string): string[]; add(w: string): unknown; remove(w: string): unknown; dispose?(): void }
 
 let hunspellFactory: Promise<import('hunspell-asm').HunspellFactory> | null = null;
 async function hunspell(id: string, aff: Uint8Array, dic: Uint8Array): Promise<Speller> {
@@ -35,7 +35,7 @@ async function hunspell(id: string, aff: Uint8Array, dic: Uint8Array): Promise<S
   const h = f.create(a, d);
   f.unmount(a);
   f.unmount(d);
-  return { correct: (w) => h.spell(w), suggest: (w) => h.suggest(w), add: (w) => h.addWord(w), remove: (w) => h.removeWord(w) };
+  return { correct: (w) => h.spell(w), suggest: (w) => h.suggest(w), add: (w) => h.addWord(w), remove: (w) => h.removeWord(w), dispose: () => h.dispose() };
 }
 type Single = 'en-US' | 'en-GB' | 'en-CA' | 'en-AU';
 
@@ -95,20 +95,24 @@ self.onmessage = async (e: MessageEvent) => {
   const reply = (v: Record<string, unknown>) => (self as any).postMessage({ id: msg.id, ...v });
   try {
     const d: Dialect = msg.dialect && (DIALECTS.has(msg.dialect) || msg.dialect.startsWith('dict:')) ? (msg.dialect as Dialect) : 'any';
-    if (msg.type === 'load' && d.startsWith('dict:') && msg.aff && msg.dic) {
+    // Frees the Hunspell instance (WebAssembly memory) a downloaded dictionary held.
+    const drop = async (key: string) => { const old = loaded.get(key); loaded.delete(key); cache.delete(key as Dialect); try { (await old)?.dispose?.(); } catch { /* already gone */ } };
+    if (msg.type === 'load') {
+      if (!d.startsWith('dict:') || !(msg.aff instanceof Uint8Array) || !(msg.dic instanceof Uint8Array)) throw new Error('The dictionary files are missing or damaged.');
       const sp = await hunspell(d.slice(5), msg.aff, msg.dic);
       for (const w of personal) sp.add(w);
+      await drop(d);
       loaded.set(d, Promise.resolve(sp));
-      cache.delete(d);
       reply({ ok: true });
       return;
     }
-    if (msg.type === 'unload' && d.startsWith('dict:')) {
-      loaded.delete(d);
-      cache.delete(d);
+    if (msg.type === 'unload') {
+      if (d.startsWith('dict:')) await drop(d);
       reply({ ok: true });
       return;
     }
+    // Anything but a complete request of a known kind is an error, never an empty "all words are fine".
+    if (msg.type === 'check' ? !Array.isArray(msg.words) : !(['add', 'remove', 'suggest'].includes(msg.type) && typeof msg.word === 'string' && msg.word)) throw new Error(`Bad spelling request (${String(msg.type)}).`);
     if (msg.type === 'add' && msg.word) {
       personal.add(msg.word);
       for (const p of loaded.values()) (await p).add(msg.word);

@@ -1,6 +1,6 @@
 /** Home tab tools: select, hand, marquee zoom, snapshot. */
 import { def } from './registry';
-import type { App, Tool } from '../app';
+import type { App, DocTab, Tool } from '../app';
 import { toast, openDialog } from '../ui/dialog';
 import { download } from '../ui/dom';
 import { saveBytes, viewer, type Rect } from './util';
@@ -18,8 +18,8 @@ def([
 ]);
 
 /** Marquee zoom: fit the dragged rectangle to the view. */
-export function zoomToRect(app: App, page: number, rect: Rect, click: boolean, shift = false): void {
-  const v = viewer(app);
+export function zoomToRect(app: App, page: number, rect: Rect, click: boolean, shift = false, tab: DocTab = app.tab): void {
+  const v = viewer(tab);
   if (click) { v.setZoom(Math.min(8, Math.max(0.1, v.zoom * (shift ? 1 / 1.5 : 1.5)))); v.goToPage(page, rect[3]); return; }
   const w = rect[2] - rect[0], hh = rect[3] - rect[1];
   if (w < 4 || hh < 4) return;
@@ -30,16 +30,19 @@ export function zoomToRect(app: App, page: number, rect: Rect, click: boolean, s
   v.goToPage(page, rect[3]);
 }
 
-export async function snapshotRect(app: App, page: number, rect: Rect): Promise<void> {
-  const v = viewer(app);
-  if (rect[2] - rect[0] < 2 || rect[3] - rect[1] < 2) { const p = app.doc.pages[page]; rect = [p.cropBox[0], p.cropBox[1], p.cropBox[2], p.cropBox[3]]; }
+export async function snapshotRect(app: App, page: number, rect: Rect, tab: DocTab = app.tab): Promise<void> {
+  const v = viewer(tab);
+  if (rect[2] - rect[0] < 2 || rect[3] - rect[1] < 2) { const p = tab.doc.pages[page]; if (!p) return; rect = [p.cropBox[0], p.cropBox[1], p.cropBox[2], p.cropBox[3]]; }
   const blob = await v.renderRegion(page, rect, 200);
   app.clip = { image: { data: new Uint8Array(await blob.arrayBuffer()), mime: 'image/png', width: 0, height: 0 } };
   let copied = false;
   try { await (navigator.clipboard as any).write?.([new (window as any).ClipboardItem({ 'image/png': blob })]); copied = true; } catch { /* no image clipboard */ }
-  const r = await openDialog({ title: 'Snapshot', content: Object.assign(document.createElement('img'), { src: URL.createObjectURL(blob), style: 'max-width:100%;max-height:50vh;border:1px solid #ccc' }), help: copied ? 'Copied to the clipboard. You can also save it, or paste it into another page with Edit ▸ Paste.' : 'Save the picture, or paste it into another page with Edit ▸ Paste.', ok: 'Save as PNG…', cancel: 'Close' });
-  if (r) await saveBytes(new Uint8Array(await blob.arrayBuffer()), `${(app.tab.title || 'snapshot')} page ${page + 1} snapshot.png`, 'image/png');
-  app.tab.ui.setTool('select');
+  const url = URL.createObjectURL(blob);
+  try {
+    const r = await openDialog({ title: 'Snapshot', content: Object.assign(document.createElement('img'), { src: url, style: 'max-width:100%;max-height:50vh;border:1px solid #ccc' }), help: copied ? 'Copied to the clipboard. You can also save it, or paste it into another page with Edit ▸ Paste.' : 'Save the picture, or paste it into another page with Edit ▸ Paste.', ok: 'Save as PNG…', cancel: 'Close' });
+    if (r) await saveBytes(new Uint8Array(await blob.arrayBuffer()), `${(tab.title || 'snapshot')} page ${page + 1} snapshot.png`, 'image/png');
+  } finally { URL.revokeObjectURL(url); }
+  if (app.docs.includes(tab)) tab.ui.setTool('select');
 }
 
 export { toast, download };

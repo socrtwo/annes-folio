@@ -1,11 +1,19 @@
 /** View commands: page layout, panes, zoom, rotation, modes, display, windows, Quick Access Bar and ribbon. */
 import { def } from './registry';
-import type { App, ViewMode } from '../app';
-import { openDialog, toast } from '../ui/dialog';
+import type { App, DocTab, ViewMode } from '../app';
+import { openDialog, toast, inDialog } from '../ui/dialog';
 import { addAllQatChoices } from '../prefs';
 import { getCommand } from './registry';
 import { PdfDocument } from '../pdf/document';
 import { keepAwake } from '../platform/native';
+import type { Viewer } from '../view/viewer';
+
+const viewerOf = (tab: DocTab): Viewer => tab.ui as unknown as Viewer;
+/** Moves by one page without the "not available" notice at either end (presentation keys and taps). */
+function stepPage(_app: App, dir: 1 | -1, tab: DocTab): void {
+  const i = tab.ui.page + dir;
+  if (i >= 0 && i < tab.doc.pageCount) tab.ui.goToPage(i);
+}
 
 function setView(app: App, v: ViewMode): void {
   const t = app.tab;
@@ -33,39 +41,68 @@ const paneCmd = (id: string, pane: string, label: string, icon: string, tip: str
 
 const ZOOMS = [25, 50, 75, 100, 125, 150, 200, 300, 400];
 
+/** The running presentation: the tab it runs on (not whichever is active later) and what to put back when it ends. */
+let presenting: { tab: DocTab; view: ViewMode; zoom: number | 'fit-width' | 'fit-page'; off: () => void } | null = null;
+let fullscreenWatched = false;
+
+/** Leaving the browser's full screen (its own Esc, a gesture) ends presentation and full-screen mode with it. */
+function watchFullscreen(app: App): void {
+  if (fullscreenWatched) return;
+  fullscreenWatched = true;
+  document.addEventListener('fullscreenchange', () => {
+    if (document.fullscreenElement) return;
+    if (presenting) stopPresentation(app);
+    else if (document.body.classList.contains('ql-fullscreen')) { document.body.classList.remove('ql-fullscreen'); app.refresh(); }
+  });
+}
+
 /** Presentation mode: full screen, one page at a time, arrow keys and taps to move. */
-function presentation(app: App, on: boolean): void {
-  const v = app.viewer;
-  v.presenting = on;
-  document.body.classList.toggle('ql-fullscreen', on);
-  document.body.classList.toggle('qf-presenting', on);
-  if (on) {
-    (app.tab as any).prevView = app.tab.view;
-    app.tab.view = 'single';
+function startPresentation(app: App): void {
+  const tab = app.tab;
+  const v = viewerOf(tab);
+  watchFullscreen(app);
+  const keys = (e: KeyboardEvent) => {
+    if (!presenting) return;
+    // Another document came to the front, or the presented one was closed: the presentation is over.
+    if (app.tab !== tab || !app.docs.includes(tab)) { stopPresentation(app); return; }
+    const t = e.target as HTMLElement | null;
+    if (inDialog() || document.querySelector('.ql-menu') || (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable))) return;
+    if (e.key === 'Escape') { stopPresentation(app); e.preventDefault(); e.stopPropagation(); }
+    else if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ' || e.key === 'Enter') { stepPage(app, 1, tab); e.preventDefault(); e.stopPropagation(); }
+    else if (e.key === 'ArrowLeft' || e.key === 'PageUp' || e.key === 'Backspace') { stepPage(app, -1, tab); e.preventDefault(); e.stopPropagation(); }
+    else if (e.key === 'Home') tab.ui.goToPage(0);
+    else if (e.key === 'End') tab.ui.goToPage(tab.doc.pageCount - 1);
+  };
+  const click = (e: MouseEvent) => { if ((e.target as HTMLElement).closest('.qf-page')) { const r = v.el.getBoundingClientRect(); stepPage(app, e.clientX < r.left + r.width / 3 ? -1 : 1, tab); } };
+  presenting = { tab, view: tab.view, zoom: (v as any).fit || v.zoom, off: () => { document.removeEventListener('keydown', keys, true); v.el.removeEventListener('click', click); } };
+  v.presenting = true;
+  document.body.classList.add('ql-fullscreen', 'qf-presenting');
+  tab.view = 'single';
+  v.layout();
+  v.setZoom('fit-page');
+  try { void document.documentElement.requestFullscreen?.()?.catch?.(() => undefined); } catch { /* not allowed */ }
+  void keepAwake(true);
+  document.addEventListener('keydown', keys, true);
+  v.el.addEventListener('click', click);
+  toast('Presenting: arrow keys or tap to move, Esc to stop.', { ms: 4000 });
+  app.refresh();
+}
+
+function stopPresentation(app: App): void {
+  const p = presenting;
+  if (!p) return;
+  presenting = null;
+  p.off();
+  document.body.classList.remove('ql-fullscreen', 'qf-presenting');
+  if (app.docs.includes(p.tab)) {
+    const v = viewerOf(p.tab);
+    v.presenting = false;
+    p.tab.view = p.view;
     v.layout();
-    v.setZoom('fit-page');
-    try { void document.documentElement.requestFullscreen?.(); } catch { /* not allowed */ }
-    void keepAwake(true);
-    const keys = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') { app.exec('view.presentation'); e.preventDefault(); }
-      else if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ' || e.key === 'Enter') { app.exec('nav.next'); e.preventDefault(); }
-      else if (e.key === 'ArrowLeft' || e.key === 'PageUp' || e.key === 'Backspace') { app.exec('nav.prev'); e.preventDefault(); }
-      else if (e.key === 'Home') app.exec('nav.first');
-      else if (e.key === 'End') app.exec('nav.last');
-    };
-    const click = (e: MouseEvent) => { if ((e.target as HTMLElement).closest('.qf-page')) { const r = app.viewer.el.getBoundingClientRect(); app.exec(e.clientX < r.left + r.width / 3 ? 'nav.prev' : 'nav.next'); } };
-    document.addEventListener('keydown', keys, true);
-    app.viewer.el.addEventListener('click', click);
-    (app.tab as any).presentOff = () => { document.removeEventListener('keydown', keys, true); app.viewer.el.removeEventListener('click', click); };
-    toast('Presenting: arrow keys or tap to move, Esc to stop.', { ms: 4000 });
-  } else {
-    (app.tab as any).presentOff?.();
-    app.tab.view = (app.tab as any).prevView || app.prefs.viewMode;
-    v.layout();
-    v.setZoom(app.prefs.defaultZoom);
-    try { if (document.fullscreenElement) void document.exitFullscreen(); } catch { /* */ }
-    void keepAwake(false);
+    v.setZoom(p.zoom);
   }
+  try { if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined); } catch { /* */ }
+  void keepAwake(false);
   app.refresh();
 }
 
@@ -88,9 +125,12 @@ def([
     run: async (app, z?: number | string) => {
       if (typeof z === 'number') { app.tab.ui.setZoom(z); return; }
       if (z === 'fit-width' || z === 'fit-page' || z === 'actual') { app.tab.ui.setZoom(z); return; }
-      const r = await openDialog({ title: 'Zoom', fields: [{ key: 'z', label: 'Zoom to', type: 'radio', options: [{ value: 'fit-width', label: 'Fit width' }, { value: 'fit-page', label: 'Fit page' }, ...ZOOMS.map((x) => ({ value: String(x), label: `${x}%` }))], value: 'fit-width' }, { key: 'pct', label: 'Percent', type: 'number', min: 10, max: 800, value: Math.round(app.tab.ui.zoom * 100) }], onChange: (v, ctl, k) => { if (k === 'z' && !v.z.startsWith('fit')) ctl.set('pct', +v.z); } });
-      if (!r) return;
-      app.tab.ui.setZoom(r.z.startsWith('fit') ? r.z : (+r.pct || 100) / 100);
+      const tab = app.tab;
+      const now = Math.round(tab.ui.zoom * 100);
+      // The choice starts on the current zoom, and typing a percent selects "Custom", so OK applies what is shown.
+      const r = await openDialog({ title: 'Zoom', fields: [{ key: 'z', label: 'Zoom to', type: 'radio', options: [{ value: 'fit-width', label: 'Fit width' }, { value: 'fit-page', label: 'Fit page' }, ...ZOOMS.map((x) => ({ value: String(x), label: `${x}%` })), { value: 'custom', label: 'Custom (the percent below)' }], value: ZOOMS.includes(now) ? String(now) : 'custom' }, { key: 'pct', label: 'Percent', type: 'number', min: 10, max: 800, value: now }], onChange: (v, ctl, k) => { if (k === 'z' && /^\d+$/.test(v.z)) ctl.set('pct', +v.z); else if (k === 'pct' && v.z !== 'custom') ctl.set('z', 'custom'); } });
+      if (!r || !app.docs.includes(tab)) return;
+      tab.ui.setZoom(String(r.z).startsWith('fit') ? r.z : Math.min(8, Math.max(0.1, (+r.pct || 100) / 100)));
     },
   },
   {
@@ -115,14 +155,20 @@ def([
   {
     id: 'view.presentation', label: 'Presentation Mode', icon: 'slideshow', tab: 'View', group: 'Modes', kind: 'toggle', noRecord: true, edits: false, keys: ['F5'],
     tip: 'Full screen, one page at a time: arrow keys or taps move, Esc ends',
-    isActive: (app) => !!app.viewer?.presenting,
-    run: (app) => presentation(app, !app.viewer.presenting),
+    isActive: () => !!presenting,
+    run: (app) => { if (presenting) stopPresentation(app); else startPresentation(app); },
   },
   {
     id: 'view.fullScreen', label: 'Full Screen', icon: 'fullscreen', tab: 'View', group: 'Modes', kind: 'toggle', noRecord: true, edits: false, keys: ['F11'],
     tip: 'Hide the ribbon and use the whole screen (Esc returns)',
     isActive: () => document.body.classList.contains('ql-fullscreen'),
-    run: () => { const on = !document.body.classList.contains('ql-fullscreen'); document.body.classList.toggle('ql-fullscreen', on); try { if (on) void document.documentElement.requestFullscreen?.(); else if (document.fullscreenElement) void document.exitFullscreen(); } catch { /* */ } },
+    run: (app) => {
+      if (presenting) { stopPresentation(app); return; }
+      watchFullscreen(app);
+      const on = !document.body.classList.contains('ql-fullscreen');
+      document.body.classList.toggle('ql-fullscreen', on);
+      try { if (on) void document.documentElement.requestFullscreen?.()?.catch?.(() => undefined); else if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined); } catch { /* */ }
+    },
   },
   {
     id: 'view.organize', label: 'Organize Pages', icon: 'grid_view', tab: 'View', group: 'Modes', kind: 'toggle', noRecord: true, edits: false,
@@ -154,21 +200,23 @@ def([
   {
     id: 'view.compareSideBySide', label: 'Side by Side', icon: 'vertical_split', tab: 'View', group: 'Window', kind: 'toggle', noRecord: true, edits: false,
     tip: 'Show another open document beside this one (Review ▸ Compare lists the text differences)',
-    isActive: (app) => !!(app as any).split,
+    isActive: (app) => !!app.split,
     run: async (app, otherId?: string) => {
-      const cur = (app as any).split as string | undefined;
-      if (cur) { (app as any).split = undefined; for (const d of app.docs) d.el.classList.remove('ql-split-pane'); app.ui.workspace.classList.remove('ql-split'); app.activate(app.tab); return; }
-      const others = app.docs.filter((d) => d !== app.tab);
+      if (app.split) { app.endSplit(); app.activate(app.tab); return; }
+      const tab = app.tab;
+      const others = app.docs.filter((d) => d !== tab);
       if (!others.length) { toast('Open another document first (or View ▸ New Window for a second view of this one).'); return; }
       let other = others.find((d) => d.id === otherId);
       if (!other) {
         if (others.length === 1) other = others[0];
-        else { const r = await openDialog({ title: 'Side by Side', fields: [{ key: 'd', label: 'Show beside this document', type: 'select', options: others.map((d) => ({ value: d.id, label: d.displayName })), value: others[0].id }] }); if (!r) return; other = others.find((d) => d.id === r.d)!; }
+        else { const r = await openDialog({ title: 'Side by Side', fields: [{ key: 'd', label: 'Show beside this document', type: 'select', options: others.map((d) => ({ value: d.id, label: d.displayName })), value: others[0].id }] }); if (!r) return; other = others.find((d) => d.id === r.d); }
       }
-      (app as any).split = other.id;
+      // Either document may have been closed, or another brought to the front, while the dialog was open.
+      if (!other || !app.docs.includes(other) || app.tab !== tab || other === tab) return;
+      app.split = other.id;
       other.el.classList.add('ql-split-pane');
       app.ui.workspace.classList.add('ql-split');
-      other.ui.layout(); app.tab.ui.layout();
+      other.ui.layout(); tab.ui.layout();
       app.refresh();
     },
   },
