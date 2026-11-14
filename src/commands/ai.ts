@@ -18,7 +18,7 @@ import type { PdfDocument, PageInfo } from '../pdf/document';
 import { setFieldProps } from '../pdf/ops/forms';
 import { setAnnotationProps, addReply, addNote, addRedactMark } from '../pdf/ops/annots';
 import { listImages, type ImageInfo } from '../pdf/ops/optimize';
-import { PdfString, Ref } from '../pdf/objects';
+import { PdfString, Ref, nameText } from '../pdf/objects';
 import { toBase64 } from '../util/store';
 import { selectedText, selectedAnnotation, viewer, pageOf, saveBytes, baseName, esc } from './util';
 import { invisibleRuns, ocrLayerText, applyOcrCorrections } from './ocrlayer';
@@ -423,7 +423,7 @@ def([
         results.push({ im, alt: cleanText(a).replace(/^"|"$/g, ''), sent: !!url });
       }
       const unsent = results.filter((x) => !x.sent).length;
-      const r = await openDialog({ title: 'Alt Text', wide: true, fields: results.map((x, i) => ({ key: String(i), label: `${x.im.name} (${x.im.width}×${x.im.height})${x.sent ? '' : ' — picture not sent, written from the nearby text'}`, type: 'text' as const, value: x.alt })), ok: 'Store', help: `${all.length > imgs.length ? `The page has ${all.length} pictures; only the first ${imgs.length} are described. ` : ''}${unsent ? `${unsent} picture(s) could not be decoded here and were not sent: their text is a guess from the words around them, so check it. ` : ''}Stored as /Alt on each image object. Screen readers use structure tags, which Anne's Folio cannot create for existing content; the text is kept for tools that read it from the image.` });
+      const r = await openDialog({ title: 'Alt Text', wide: true, fields: results.map((x, i) => ({ key: String(i), label: `${nameText(x.im.name)} (${x.im.width}×${x.im.height})${x.sent ? '' : ' — picture not sent, written from the nearby text'}`, type: 'text' as const, value: x.alt })), ok: 'Store', help: `${all.length > imgs.length ? `The page has ${all.length} pictures; only the first ${imgs.length} are described. ` : ''}${unsent ? `${unsent} picture(s) could not be decoded here and were not sent: their text is a guess from the words around them, so check it. ` : ''}Stored as /Alt on each image object. Screen readers use structure tags, which Anne's Folio cannot create for existing content; the text is kept for tools that read it from the image.` });
       if (!r || !app.stillOpen(tab, rev)) return;
       app.editTab(tab, 'Alt Text', (doc) => { let n = 0; results.forEach((x, i) => { const text = String(r[String(i)] ?? '').trim(); if (!text) return; const s = doc.resolve(x.im.ref!) as any; if (s?.dict) { s.dict.set('Alt', PdfString.fromText(text)); doc.update(x.im.ref!, s); n++; } }); return n || NO_CHANGE; });
     },

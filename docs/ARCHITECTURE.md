@@ -10,6 +10,7 @@ src/
     file.ts edit.ts nav.ts home.ts view.ts comment.ts forms.ts protect.ts sign.ts organize.ts
     scan.ts review.ts tools.ts ai.ts dev.ts help.ts
     ocrlayer.ts      the recognized-text layer (placement, Unicode font, corrections) and scan image math
+    zipstream.ts     a streaming ZIP writer (Split writes each part as soon as it is built)
   pdf/               the engine (document of record)
     objects.ts       Name, Ref, PdfString (PDFDocEncoding/UTF-16), Dict, PdfStream, dates, helpers
     lexer.ts         tokens, object parser, streams with /Length recovery
@@ -40,6 +41,7 @@ src/
     pdfjs.ts         pdf.js (legacy build, bundled worker, CMaps/fonts/wasm copied to public/pdfjs)
     viewer.ts        the TabView: pages, text layer, overlay, tools and gestures, search, thumbnails, grid
     viewutil.ts      pure helpers for the viewer: rotation, zoom steps, bitmap budget, page search, reload coalescing
+    pagechange.ts    which pages an edit changed (per-page tokens for canvases and thumbnails)
   io/                formats table, sniffing, openAsPdf (PDF, images, text, ZIP, review packages), TIFF decoder
     recover/         file identification, ZIP salvage, ImmortalInflate (shared with the suite)
   ui/                shell, ribbon layout, backstage, panes, dialogs, customize, recovery report, wizards
@@ -49,7 +51,9 @@ src/
   templates/         new-document templates built in code
   export/print.ts    printing through rendered pages
 electron/            desktop main and preload (app:// origin, file grants, permission and content policy)
-android/, ios/       Capacitor projects (native plugin for files, print, share on Android)
+android/, ios/       Capacitor projects: on Android the QuillNative plugin (files streamed through the app cache,
+                     print, share, the OAuth listener in a short foreground service); on iOS the QuillIOS plugin
+                     (Keychain, export to Files, print), registered by QuillBridgeViewController
 scripts/             catalog generation, icons, notices, pdf.js and tesseract asset copying, desktop packaging,
                      the service worker's precache list (gen-sw-precache.mjs, run after every build)
 tests/unit           engine, operations, repair, registry/catalog tests (vitest)
@@ -77,6 +81,8 @@ A tab holds a `PdfDocument` (the engine's object graph) and `bytes`, the PDF the
 ## Viewer
 
 One pdf.js worker is shared by all tabs. Reload requests made while a load is running are folded into one trailing load. Pages far from the viewport release their bitmap and text layer, and a page bitmap is capped (16 megapixels on touch devices, 48 elsewhere) with CSS stretching the rest. Every viewport combines the page's own `/Rotate` with the view rotation. HTML that reaches a dialog through `Field.html` is rebuilt from an allow-list (`util/sanitize.ts`), so text from a document cannot become markup that runs.
+
+After an edit only the pages it touched are drawn again: each tab records the object numbers an edit, undo or redo really changed (`DocTab.takeChanges`), `view/pagechange.ts` turns them into per-page tokens, and canvases and thumbnails are keyed by those tokens. Files over 8 MB reach pdf.js through a range transport, so the document bytes are neither copied whole nor handed away. The incremental writer passes stream data to the output without an intermediate copy.
 
 ## Commands and gestures
 
